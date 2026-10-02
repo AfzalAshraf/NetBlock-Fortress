@@ -285,11 +285,14 @@ sudo adquit site list
 
 # 2. one port for all of them: the fortress writes the vhosts, your web server does the serving
 sudo apt install nginx            # or caddy / apache2 - adquit detects which one you have
-sudo adquit proxy install --server nginx --port 80
-sudo adquit proxy status          # what is enabled, which file owns it, what it points at
+sudo adquit proxy install --server nginx --port 80      # --no-catchall if :80 already serves other sites
+sudo adquit proxy status          # which server was found, what is enabled, what it points at
+                                  # (only one server can hold the port - if you already run caddy
+                                  #  on :80, install for caddy, not nginx)
 
 # 3. names you do not own: hand them to the router instead of NXDOMAIN
-sudo adquit lan-zone add .lan 192.168.1.1     # usually your router/gateway address
+sudo adquit lan-zone add .lan                 # no address = the gateway this box already uses
+sudo adquit lan-zone add .lan 10.0.0.1        # ...or name it; an address off your subnet is warned about
 ```
 
 Then point the devices (or the router's DNS) at the fortress and `http://media.lan/` works from
@@ -303,8 +306,12 @@ answered.
 | `site add NAME --port P` | `local_records[NAME] = {"port": P, "host": "127.0.0.1"}` — the name answers with this box's LAN address, the vhost targets the local port |
 | `site add NAME --ip A --no-proxy` | DNS only: a name that should point elsewhere and get no vhost |
 | `site add NAME --port P --ws` | vhost gets the websocket upgrade headers (websockets, SSE, streams) |
-| `lan-zone add .lan ROUTER-IP` | names under `.lan` that you did **not** publish are forwarded to the router |
+| `lan-zone add .lan ROUTER-IP` | names under `.lan` that you did **not** publish are forwarded to the router; with no address it uses the box's own default gateway, and a resolver that is not on any network this machine has is refused-or-warned (a name is refused outright: this box *is* the DNS, so asking it to resolve its own upstream would loop) |
 | `proxy install [--port 80] [--server nginx]` | one managed file of vhosts, validated, reverted if it fails |
+
+If a site lives on another box, `--ip` takes that box's **LAN address** (not an example from a
+README): `adquit lan` prints the subnet you are on, and publishing an address outside it prints a
+warning, because an unreachable target makes those names time out instead of answering.
 
 `adquit.lan`, `adquit.local` and `<hostname>.local/.lan` resolve to the fortress by design (that
 is the URL `adquit lan` prints); `sudo adquit --set answer_fortress_names false` if you want them
@@ -330,6 +337,14 @@ blocker and the web server are the same box on purpose.
   config if the new one would not start.
 * Caddy is the one server it cannot wire up silently: the rendered `/etc/caddy/adquit.caddyfile`
   needs one line in your Caddyfile (`import adquit.caddyfile`), which `proxy install` prints.
+* If the web server you picked already listens on that port (caddy on :80 is the common case),
+  that is not a conflict: `proxy install` adds vhosts to the server that owns the port and only
+  refuses when a *different* server holds it. Caddy allows exactly one global options block per
+  Caddyfile, so when yours exists the rendered file explains which two options to add there
+  instead of opening a second block.
+* `--no-catchall` is for a box that already serves other things on that port: the fortress then
+  publishes only its own names and leaves every other `Host` to your existing sites — at the cost
+  of the ad splash page on that port (blocked domains keep resolving to the box either way).
 
 ---
 

@@ -42,6 +42,36 @@
   (`trust_proxy`, on by default), so per-client stats, the query log and rate limits stay honest
   and a LAN client cannot impersonate one.
 
+### Sharing a port with a web server that is already running
+- `proxy install --port 80` used to die with "`:80` is already taken by something else" on exactly
+  the boxes where it should have worked: one where caddy already listens there and merely needs
+  another vhost. The check now asks *who* holds the port (`ss -ltnp`) — the same server is
+  welcomed (`caddy already listens on :80 - adding these vhosts to it`), a *different* one is told
+  plainly (`:80 is held by caddy, not nginx - generate for it instead: --server caddy`), and an
+  unidentifiable holder falls through to validation, which is the real safety net.
+- **Caddy allows one global options block per Caddyfile.** An imported fragment that opened a
+  second `{ … }` would have failed validation on any box with existing caddy config, so the render
+  now looks first (`ADQUIT_CADDYFILE` overrides where it looks) and, when a global block already
+  exists, comments the two directives it needs there instead of writing them.
+- **`--no-catchall`** for a port that already serves other sites: no `default_server` vhost, no
+  Apache catch-all, no caddy `handle {}`. Published names and the dashboard still get their
+  vhosts; every other `Host` keeps being answered by whatever was answering it before.
+
+### Fixes from the first real box running this
+- **`say`/`warn`/`die` are not printf.** They join their arguments, so `say 'firewall: tcp/%s open'
+  "$p"` printed the percent sign literally and tacked the number on the end
+  (`==> firewall: tcp/%s open 8080`). Both `lan open` messages are pre-expanded now, the rule is
+  documented at the helper, and a CLI check greps the file so no new one slips in.
+- The example IPs in the docs are now generic (`10.0.0.0/24`), because an example copied literally
+  is the most likely way for a LAN name to point at a network the box is not on.
+- **Publishing an address you cannot reach is now argued with.** Docs show example networks, and an
+  example copied literally (`--ip 192.168.1.40` on a LAN that is actually `10.0.0.0/24`) silently turns every lookup for those names into a timeout. `site add --ip` and
+  `lan-zone add` compare the address against every network the box actually has (multi-homed hosts
+  included, via `ip -4 -o addr show`) and warn with the command that fixes it; with no address at
+  all, `lan-zone add .lan` now just uses the box's default gateway.
+- **A LAN zone must be an address, not a name.** `lan-zone add .lan router.lan` is refused: this box
+  answers DNS, so resolving its own upstream would ask DNS how to reach DNS.
+
 ### Fixes found while proving the above
 - dnslib: `DNSRecord.q` is read-only, so forwarding a LAN answer means copying `add_answer`/
   `add_auth`/`add_ar` and the rcode onto `question.reply()` — assigning the upstream record
@@ -56,9 +86,10 @@
 - 80 engine tests (was 66): record/zone lookup precedence, the four reply shapes, "a LAN name must
   never reach a public resolver", zone forwarding carrying our question id, a dead router not
   hanging the resolver, `--set` with a JSON object, and all four `ProxyAware` header rules.
-- 30 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
+- 34 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
   nginx render (dashboard vhost, per-site vhost, upgrade map, balanced braces, no `ServerName *`),
-  and the "refuses when not installed / bad flag" negatives.
+  the "refuses when not installed / bad flag" negatives, and the off-subnet guards - exercised
+  against a stubbed `ip` so a CI runner's own network never decides the outcome.
 
 ## v19.0 "Omni-Shield" — the micro + macro release
 

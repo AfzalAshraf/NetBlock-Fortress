@@ -35,6 +35,18 @@ check() { # check <label> <cmd...>  - time-bounded, timed, and self-reporting
     fi
 }
 
+# A deterministic `ip` for the subnet-sanity checks: CI runners vary, this does not.
+mkdir -p "$TMP/stub"
+cat > "$TMP/stub/ip" <<'STUBIP'
+#!/bin/sh
+case "$1" in
+  -4)    echo '2: eth0    inet 192.0.2.5/24 brd 192.0.2.255 scope global eth0\' ;;
+  route) echo 'default via 192.0.2.1 dev eth0 metric 100' ;;
+  *)     command ip "$@" ;;
+esac
+STUBIP
+chmod +x "$TMP/stub/ip"
+
 printf '\n\033[1m  adquit CLI contract\033[0m\n'
 check "help renders"              bash -c "$BIN help | grep -q 'START / STOP'"
 VER="$(sed -n 's/^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$REPO/app.py" | head -n1)"
@@ -106,7 +118,8 @@ grep -q 'adquit lan-zone add' "$REPO/bin/adquit"                              # 
 grep -q 'site|lan-zone|proxy)' "$REPO/bin/adquit"                             # both elevate centrally
 grep -q 'adquit-managed' "$REPO/bin/adquit"                                    # only our own files
 grep -q 'answer_fortress_names' "$REPO/app.py"                                 # fortress names resolve
-grep -q 'local_records' "$REPO/app.py"                                          # ...and so do sites
+grep -q 'local_records' "$REPO/app.py"                                          # ...and sites do too
+! grep -qE "(say|warn|die)[[:space:]]+'[^']*%s" "$REPO/bin/adquit"               # say() is not printf                                          # ...and so do sites
 grep -q "refusing to install app.py" "$REPO/install.sh"
 grep -q 'bg_run "$STATE_DIR/gravity.log"' "$BIN"                   # gravity must not own the pidfile
 # a 5M-rule warm-up is not an outage: the probe waits, status says so, stop does not lie
@@ -163,9 +176,35 @@ check "adquit proxy renders nginx vhosts for the effective web port" bash -c "
     cmp -s '$TMP/ob' '$TMP/cb'
     '$BIN' site rm media.lan >/dev/null
 "
+check "adquit proxy --no-catchall leaves other hosts to the box's own sites" bash -c "
+    '$BIN' proxy install --server nginx --port 80 --dry-run --no-catchall > '$TMP/nocat.conf' 2>&1
+    ! grep -q 'default_server' '$TMP/nocat.conf'
+    '$BIN' proxy install --server nginx --port 80 --dry-run > '$TMP/cat.conf' 2>&1
+    grep -q 'default_server' '$TMP/cat.conf'
+"
+check "adquit will not open a second caddy global block" bash -c "
+    printf '{\n\tskip_install\n}\n' > '$TMP/Caddyfile'
+    ADQUIT_CADDYFILE='$TMP/Caddyfile' '$BIN' proxy install --server caddy --port 80 --dry-run 2>&1 \
+        | grep -q 'already opens a global block'
+    '$BIN' proxy install --server caddy --port 80 --dry-run --no-catchall 2>&1 | grep -q 'no-catchall'
+"
 check "adquit proxy refuses a bad port and an unknown server" bash -c "
     '$BIN' proxy install --port eight --dry-run >/dev/null 2>&1; test \$? -ne 0
     '$BIN' proxy install --server tomcat --dry-run >/dev/null 2>&1; test \$? -ne 0
+"
+check "adquit refuses to point a LAN name at an address it cannot reach" bash -c "
+    export PATH='$TMP/stub':\$PATH
+    '$BIN' lan-zone add lan 240.0.0.1 2>&1 | grep -q 'not on any network' &&
+    '$BIN' lan-zone rm lan >/dev/null &&
+    '$BIN' site add probe.lan --ip 240.0.0.9 --no-proxy 2>&1 | grep -q 'not on any network' &&
+    '$BIN' site rm probe.lan >/dev/null
+"
+check "adquit finds the router itself and refuses a name as a resolver" bash -c "
+    export PATH='$TMP/stub':\$PATH
+    '$BIN' lan-zone add lan 2>&1 | grep -q 'resolves through 192.0.2.1' &&
+    '$BIN' lan-zone rm lan >/dev/null &&
+    '$BIN' lan-zone add lan router.lan 2>&1 | grep -Eq 'needs an address, not a name' &&
+    '$BIN' lan-zone list 2>&1 | grep -q '192.0.2.1'
 "
 check "adquit lan open validates every port it is given" bash -c "
     '$BIN' lan open abc >/dev/null 2>&1; test \$? -ne 0
