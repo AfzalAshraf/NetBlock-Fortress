@@ -158,7 +158,9 @@ check "adquit proxy renders nginx vhosts for the effective web port" bash -c "
     grep -q 'listen 80 default_server;' '$TMP/nginx.conf'
     grep -q 'map \$http_upgrade' '$TMP/nginx.conf'
     ! grep -q 'ServerName \*' '$TMP/nginx.conf'
-    awk 'BEGIN{d=0}{for(i=1;i<=length($0);i++){c=substr($0,i,1);if(c=="{")d++;else if(c=="}")d--}}END{exit d==0?0:1}' '$TMP/nginx.conf'
+    tr -cd '{' < '$TMP/nginx.conf' | wc -c > '$TMP/ob'
+    tr -cd '}' < '$TMP/nginx.conf' | wc -c > '$TMP/cb'
+    cmp -s '$TMP/ob' '$TMP/cb'
     '$BIN' site rm media.lan >/dev/null
 "
 check "adquit proxy refuses a bad port and an unknown server" bash -c "
@@ -173,7 +175,7 @@ check "adquit lan open validates every port it is given" bash -c "
 check "adquit lan-zone add/list/rm round-trip" bash -c "
     '$BIN' lan-zone add lan 127.0.0.1:5399 >/dev/null &&
     '$BIN' lan-zone list | grep -q 'lan' &&
-    grep -q '"lan_zones"' '$ADQUIT_HOME/data/config.json' &&
+    grep -q 'lan_zones' '$ADQUIT_HOME/data/config.json' &&
     '$BIN' lan-zone rm lan >/dev/null &&
     ! '$BIN' lan-zone list | grep -q '127.0.0.1:5399'
 "

@@ -1116,10 +1116,14 @@ cmd_proxy() {
 
     say "proxy live: these names answer on :$port from this box"
     printf '  http://%s:%s   (dashboard; :%s direct still works too)\n' "$(lan_ip | head -n1)" "$port" "$PWEB"
-    local s3 n3 p3 h3 w3 x3
+    local s3 n3 p3 h3 w3 x3 tag
     for s3 in "${PSITES[@]}"; do
         IFS='|' read -r n3 p3 h3 w3 x3 <<<"$s3"
-        [ -n "$p3" ] && [ "$x3" = 1 ] && printf '  http://%s:%s   -> %s:%s\n' "$n3" "$port" "$h3" "$p3"
+        [ -n "$p3" ] || continue
+        [ "$x3" = "1" ] || continue          # --no-proxy names are DNS-only, no vhost
+        tag=""
+        [ "$w3" = "1" ] && tag="  (websocket upgrade)"
+        printf '  http://%s:%s   -> %s:%s%s\n' "$n3" "$port" "$h3" "$p3" "$tag"
     done
     printf '  %sopen it on the firewall:%s sudo adquit lan open %s\n' "$D" "$N" "$port"
 }
