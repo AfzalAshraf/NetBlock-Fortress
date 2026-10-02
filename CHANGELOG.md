@@ -76,8 +76,30 @@
   and `nostamp` (v18 / not-Python channel); version maths is pure shell arithmetic, and the
   installed `app.py` is restored whenever a refusal happens. Engine/CLI/installer are stamped
   19.1, and a contract test asserts the three agree.
-  (five new CLI contract checks pin the decision table, the `--force` wiring and the self-heal marker).
-- **`--force`, because `sudo` eats environment variables.** `ADQUIT_FORCE=1 sudo adquit update`
+  (eight new CLI contract checks pin the decision table, the `--force` wiring and the self-heal marker).
+- **Boot stops rebuilding the world.** `main()` ran `rebuild_master_blocklist()` on *every*
+  start, even after restoring a valid `gravity.cache` - so a 5.1M-rule box spent tens of seconds
+  re-reading 131 feeds before it could bind port 53/8080, while `adquit`'s 15-second health probe
+  gave up, declared the service dead and restarted it from zero (their log: `gravity cache
+  restored` at +6s, `error: service did not become healthy` at +17s). Boot now trusts the cache,
+  stores the per-vector/category tallies inside it (no 5M-rule recount), folds a changed
+  `custom_blocked.txt` in via `apply_custom_overrides()` (a set diff of hand-written lines, with a
+  sidecar tally in `data/meta/gravity.custom` so entries added *or removed* while the service was
+  down are honoured without a rebuild), and logs `ready in Ns`. Only an unverifiable cache falls
+  back to a rebuild.
+- **`_sync_legacy_views()` is lazy.** `BLOCKED_DOMAINS` and `DOMAIN_CATEGORIES` were two more full
+  copies of the blocklist built on every boot (~1.5 GB on a 5M-rule box, which is where the
+  3.2 GB RSS peak came from); they are now `_LazyView` objects built on first touch, while the two
+  small sets the dashboard reads per request stay eager - and cheaper, since the custom tally now
+  comes from the user's own file instead of a scan of every rule.
+- **`adquit` no longer misreads a warm-up as an outage.** The health wait sizes itself from the
+  gravity cache (`30s + MB/2`, capped at 10min, override with `ADQUIT_START_WAIT`), announces what
+  it is doing, and returns early when the process dies or systemd marks the unit failed. If the
+  unit is up but not answering, `start` says "still loading" instead of `die`-ing and stopping a
+  service that was about to come good. `cmd_stop` asks systemd whether the unit was running
+  (the port is closed during a warm-up, so it used to answer "not running" and skip the stop that
+  `restart` then raced), `cmd_restart` waits for :53/:8080 to be released, and `cmd_status` has a
+  third state - `warming up`, with the pid, RSS and peak from `/proc`. `ADQUIT_FORCE=1 sudo adquit update`
   silently failed the hint (env_reset drops it, and `set ADQUIT_FORCE=1` is csh syntax - bash's
   `set` assigns positional parameters). `adquit update [--force]` now rides in argv, is re-read
   after elevation, and `elevate_for` forwards `ADQUIT_FORCE` for anyone who still uses the env form.
@@ -117,7 +139,7 @@
 - **Colours**: `printf '...%s...' "$C"` printed literal `\033[32m` because printf only expands
   escapes in its *format*; all prompt/control colours now use ANSI-C quoting.
 - Tests: 59 offline (payload-regression class, subscription export, RDAP intel with a stubbed
-  network) + 22 CLI contract checks; `tests/test_cli.sh` now times each check, keeps its output
+  network) + 23 CLI contract checks; `tests/test_cli.sh` now times each check, keeps its output
   on failure and raises `::error::` annotations + a step summary on GitHub Actions.
 
 ### Robustness at the edges (post-release hardening)

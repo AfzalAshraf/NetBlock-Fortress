@@ -349,6 +349,19 @@ health_ok() {
     curl -fsS --max-time 2 "http://127.0.0.1:$p/api/health" >/dev/null 2>&1
 }
 
+unit_active() { # systemd says the unit is up (unprivileged queries work for any user)
+    using_systemd || return 1
+    systemctl is-active --quiet "$SERVICE" 2>/dev/null && return 0
+    [ "$NEEDS_SUDO" = "1" ] && $SUDO systemctl is-active --quiet "$SERVICE" 2>/dev/null
+}
+
+cache_mb() { # size of the compiled blocklist, in MB - a proxy for warm-up cost
+    local f="$STATE_DIR/gravity.cache" sz=0
+    [ -f "$f" ] || { printf '0'; return; }
+    sz=$(( $(wc -c < "$f" 2>/dev/null || echo 0) / 1048576 ))
+    printf '%s' "${sz:-0}"
+}
+
 running() {
     if using_systemd; then
         systemctl is-active --quiet "$SERVICE" && return 0
@@ -361,13 +374,30 @@ running() {
     health_ok
 }
 
-wait_healthy() { # up to ~15s
-    for _ in $(seq 1 30); do
+wait_healthy() { # budget grows with the gravity cache: 5M rules take real time to load
+    local budget="${ADQUIT_START_WAIT:-}" waited=0 mb reason
+    case "${budget:-}" in (''|*[!0-9]*) budget=0 ;; esac
+    if [ "$budget" -eq 0 ]; then
+        mb="$(cache_mb)"
+        # unpickling hundreds of MB plus the DNS bind is not a 15-second job; the old
+        # fixed 30x0.5s loop declared a healthy machine dead and stopped it mid-boot
+        budget=$(( 30 + mb / 2 ))
+        [ "$budget" -gt 600 ] && budget=600
+    fi
+    printf '  warming up the engine (%s MB gravity cache, allowing up to %ss)\n' "$(cache_mb)" "$budget"
+    while [ "$waited" -lt "$budget" ]; do
         health_ok && return 0
-        [ -f "$PIDFILE" ] && ! kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && return 1
-        sleep 0.5
+        if [ -f "$PIDFILE" ] && ! kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+            reason="the process exited"; break
+        fi
+        if using_systemd && systemctl is-failed --quiet "$SERVICE" 2>/dev/null; then
+            reason="systemd reports the unit as failed"; break
+        fi
+        sleep 1; waited=$((waited + 1))
     done
-    health_ok
+    if health_ok; then return 0; fi
+    [ -n "${reason:-}" ] && printf '  %s%s%s\n' "$R" "$reason" "$N"
+    return 1
 }
 
 bg_run() { # background a side task (gravity pull, feed update) - never touches the pidfile
@@ -433,7 +463,18 @@ cmd_start() {
     mkdir -p "$STATE_DIR"
     if using_systemd; then
         $SUDO systemctl start "$SERVICE"
-        wait_healthy || { $SUDO journalctl -u "$SERVICE" -n 20 --no-pager; die "service did not become healthy"; }
+        if ! wait_healthy; then
+            if unit_active; then
+                # Do not call this a failure: the unit is up, the tables are still
+                # loading. Killing/restarting here would restart the load from zero.
+                warn "still loading blocklists after the wait above - the unit is active and working"
+                printf '  watch it: %ssudo journalctl -u %s -f%s   (or: adquit status)\n' "$B" "$SERVICE" "$N"
+                printf '  if it never finishes, a smaller profile is enough: adquit mode strict\n'
+                return 0
+            fi
+            $SUDO journalctl -u "$SERVICE" -n 25 --no-pager
+            die "service did not become healthy"
+        fi
         printf '%s✔ fortress live%s  dns :%s  dashboard http://127.0.0.1:%s  (systemd unit: %s)\n' \
             "$C" "$N" "$(dns_port)" "$(web_port)" "$SERVICE"
         printf '%s  reachable from your other devices:%s\n' "$D" "$N"
@@ -464,7 +505,12 @@ cmd_start() {
 }
 
 cmd_stop() {
+    # Whether a stop is needed is systemd's business, not the dashboard port's: during a
+    # warm-up the port is closed while the process is very much alive, and claiming
+    # "not running" there hides a stop that a later start then raced against.
+    local was_unit=0
     if using_systemd; then
+        unit_active && was_unit=1
         $SUDO systemctl stop "$SERVICE" 2>/dev/null || true
     fi
     if [ -f "$PIDFILE" ]; then
@@ -482,20 +528,53 @@ cmd_stop() {
     if health_ok; then
         pkill -f "$APP --serve" 2>/dev/null || true
         printf '%sstopped%s\n' "$Y" "$N"
+    elif [ "$was_unit" = "1" ]; then
+        printf '%sstopped%s (systemd unit)\n' "$Y" "$N"
     else
         warn "not running"
     fi
 }
 
-cmd_restart() { cmd_stop; sleep 1; cmd_start; }
+cmd_restart() {
+    cmd_stop
+    # the old process must let go of :53/:8080 before the new one binds, or the start
+    # fails with "Address already in use" while both are technically mid-transition
+    local _ wp dp
+    wp="$(web_port)"; dp="$(dns_port)"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        port_busy "$wp" || port_busy "$dp" || break
+        sleep 0.5
+    done
+    cmd_start
+}
 
 cmd_status() {
     printf '%sNetBlock Fortress %s%s\n' "$B" "$VERSION_TAG" "$N"
     printf '  home     %s\n' "$HOME_DIR"
     printf '  python   %s\n' "$PY"
     printf '  runner   %s\n' "$(using_systemd && echo systemd || echo 'pid file')"
-    if running; then
-        printf '  state    %slive%s  dashboard http://127.0.0.1:%s\n' "$C" "$N" "$(web_port)"
+    if health_ok; then
+        printf '  state    %slive%s  dashboard http://127.0.0.1:%s  dns :%s\n' \
+            "$C" "$N" "$(web_port)" "$(dns_port)"
+    elif unit_active || { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }; then
+        # active unit, port not answering yet - that is a warm-up, not an outage, and
+        # saying "down" here is what made a healthy box look broken
+        local pid="" rss="" hwm=""
+        if unit_active && have systemctl; then
+            pid="$(systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)"
+        elif [ -f "$PIDFILE" ]; then
+            pid="$(cat "$PIDFILE" 2>/dev/null)"
+        fi
+        if [ -n "$pid" ] && [ -r "/proc/$pid/status" ]; then
+            rss="$(awk '/VmRSS/{print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
+            hwm="$(awk '/VmHWM/{print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
+        fi
+        local whence="process alive"
+        unit_active && whence="systemd unit active"
+        printf '  state    %swarming up%s (%s, %s MB of blocklists to load)\n' \
+            "$Y" "$N" "$whence" "$(cache_mb)"
+        [ -n "$pid" ] && printf '  process  pid %s  rss %s  peak %s\n' "$pid" "${rss:-?}" "${hwm:-?}"
+        printf '  check    %sadquit status%s again in a moment, or: journalctl -u %s -f\n' "$B" "$N" "$SERVICE"
     else
         printf '  state    %sdown%s\n' "$R" "$N"
     fi

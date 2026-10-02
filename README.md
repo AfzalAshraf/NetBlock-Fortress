@@ -298,6 +298,8 @@ wire the fortress into home automation or a dashboard.
 | `adquit: command not found` | The install never ran (row above), or the CLI is off `PATH`: `/usr/local/bin/adquit` for a root install, `~/.local/bin/adquit` for `ADQUIT_USER=1`. |
 | `ModuleNotFoundError: No module named 'flask'` (or `dnslib`, `requests`) | You ran `python3 app.py` with a bare interpreter. `adquit doctor` says exactly this and how to fix it; the installer builds a private venv so you never hand-install anything. |
 | `refusing to install app.py v18.0 …` / `no version stamp` | The installer noticed the ref is behind itself and stopped rather than half-installing. Pass `ADQUIT_REF=<branch>` or merge. |
+| `service did not become healthy`, or `state down` while `journalctl` shows the unit running | Almost always a **warm-up**, not a crash: loading a 5M-rule gravity cache takes tens of seconds on a small box, and the health probe used to give up at 15s and stop the service mid-boot. v19.1 sizes the wait from the cache and reports `warming up`. Raise it with `ADQUIT_START_WAIT=<seconds>` (e.g. `sudo env ADQUIT_START_WAIT=300 adquit restart`). |
+| Restart takes as long as a first install | It shouldn't any more: a boot with a valid gravity cache used to rebuild every feed from disk before binding the port. `adquit logs` now says `gravity cache restored ... ready in Ns` instead of `building gravity from 99 enabled feeds`. |
 | `already up to date - engine vX is byte-identical` | Not an error: your channel has no newer commit. Blocklists are updated separately with `adquit gravity`. |
 | `refusing to downgrade vA -> vB` | The channel genuinely holds an **older** engine than you run (v19.1+ compares content, not just the stamp, so same-version commits update normally). Point `ADQUIT_REF` at the right branch, or `sudo adquit update --force` to allow it. `ADQUIT_FORCE=1` alone does nothing through `sudo` - the environment is reset. |
 | `adquit update` refuses, and the refusal makes no sense | If the CLI on your box predates v19.1 it has no escape hatch of its own: the guard that is misfiring is the one you are running. Re-install in place instead - it refreshes `app.py` **and** the CLI and leaves `data/` (config, custom blocks, allows, lists) alone: `curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/<your-ref>/install.sh \| sudo env ADQUIT_REF=<your-ref> bash` |
@@ -327,7 +329,7 @@ wire the fortress into home automation or a dashboard.
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline suite (59 engine/API/UI/gate tests) + CLI contract
+make test      # offline suite (66 engine/API/UI/gate/boot tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 

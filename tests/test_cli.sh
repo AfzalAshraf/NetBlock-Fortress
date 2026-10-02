@@ -102,6 +102,14 @@ grep -q 'restarting the update with it' "$REPO/bin/adquit"                  # ha
 grep -q 'restore_update "$origin"' "$REPO/bin/adquit"                       # engine restored on every refusal
 grep -q "refusing to install app.py" "$REPO/install.sh"
 grep -q 'bg_run "$STATE_DIR/gravity.log"' "$BIN"                   # gravity must not own the pidfile
+# a 5M-rule warm-up is not an outage: the probe waits, status says so, stop does not lie
+grep -q 'ADQUIT_START_WAIT' "$REPO/bin/adquit"                      # operator override
+grep -q 'warming up the engine' "$REPO/bin/adquit"                  # budget announced, sized by cache
+grep -q 'still loading blocklists' "$REPO/bin/adquit"               # slow boot != failure
+grep -q 'cache_mb' "$REPO/bin/adquit"                                # where the budget comes from
+sed -n '/^cmd_stop()/,/^}/p' "$REPO/bin/adquit" | grep -q 'was_unit'          # systemd is the truth
+sed -n '/^cmd_status()/,/^}/p' "$REPO/bin/adquit" | grep -q 'warming up'      # three states, not two
+sed -n '/^cmd_restart()/,/^}/p' "$REPO/bin/adquit" | grep -q 'port_busy'       # wait for :53/:8080 release
 [ "$(grep -c start_detached "$BIN")" -eq 2 ]                       # definition + the one service call site
 HELPERTEST
 mkdir -p "$TMP/home"
@@ -122,6 +130,7 @@ check "adquit --version answers with no install at all" bash -c "
 "
 check "adquit update rejects an unknown flag" bash -c "'$BIN' update --frorce 2>&1 | grep -q 'unknown option'"
 check "adquit test (offline, no live)"      "$BIN" test --no-live
+check "adquit status answers with a state line"  bash -c "'$BIN' status | grep -Eq 'state +(live|down|warming up)'"
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
 "$BIN" stop >/dev/null 2>&1

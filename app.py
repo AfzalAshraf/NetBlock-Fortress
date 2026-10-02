@@ -840,12 +840,56 @@ BLOCKED_DOMAINS = set()
 DOMAIN_CATEGORIES = {}
 
 
-def _sync_legacy_views():
+class _LazyView(object):
+    """A set/dict built the first time someone actually touches it.
+
+    The v18 compatibility names below used to be materialised on every boot - two more
+    full copies of a 5M-rule table, about 1.5 GB and a couple of seconds before the
+    dashboard could even bind its port. Nobody reads them unless a v18 template or API
+    is used, so the big ones wait."""
+
+    __slots__ = ("_build", "_obj")
+
+    def __init__(self, build):
+        self._build = build
+        self._obj = None
+
+    def _real(self):
+        if self._obj is None:
+            self._obj = self._build()
+        return self._obj
+
+    def __contains__(self, item):
+        return item in self._real()
+
+    def __iter__(self):
+        return iter(self._real())
+
+    def __len__(self):
+        return len(self._real())
+
+    def __bool__(self):
+        return bool(self._real())
+
+    def __getitem__(self, key):
+        return self._real()[key]
+
+    def __repr__(self):
+        return repr(self._real())
+
+    def __getattr__(self, name):
+        return getattr(self._real(), name)
+
+
+def _sync_legacy_views(custom_blocked=None):
     """v18 templates/APIs read these names; keep them pointing at the v19 tables."""
     global BLOCKED_DOMAINS, DOMAIN_CATEGORIES, CUSTOM_BLOCKED, CUSTOM_WHITELIST
-    BLOCKED_DOMAINS = set(BLOCKED) | set(WILDCARDS)
-    DOMAIN_CATEGORIES = {d: v[0] for d, v in BLOCKED.items()}
-    CUSTOM_BLOCKED = {d for d, v in BLOCKED.items() if v[2] == "custom"}
+    BLOCKED_DOMAINS = _LazyView(lambda: set(BLOCKED) | set(WILDCARDS))
+    DOMAIN_CATEGORIES = _LazyView(lambda: {d: v[0] for d, v in BLOCKED.items()})
+    # the dashboard reads these two per request - keep them eager, and cheap: the
+    # custom sets come from the (tiny) user files, not from a scan of the feeds
+    CUSTOM_BLOCKED = set(custom_blocked) if custom_blocked is not None \
+        else {d for d, v in BLOCKED.items() if v[2] == "custom"}
     CUSTOM_WHITELIST = set(CUSTOM_WHITELIST_SET)
 
 
@@ -1419,9 +1463,12 @@ def rebuild_master_blocklist(persist=True):
         UNBREAK = unbreak
         stats = defaultdict(int), defaultdict(int)
         vcount, ccount = stats
+        custom = set()
         for d, (cat, vec, _src) in blocked.items():
             vcount[vec] += 1
             ccount[cat] += 1
+            if _src == "custom":
+                custom.add(d)
         for d, (cat, vec, _src) in wildcards.items():
             vcount[vec] += 1
         VECTOR_COUNTS.clear()
@@ -1429,13 +1476,13 @@ def rebuild_master_blocklist(persist=True):
         CAT_COUNTS.clear()
         CAT_COUNTS.update(ccount)
         if persist:
-            save_gravity_cache()
+            save_gravity_cache(custom=custom)
         LOG.info("gravity rebuilt: %s exact + %s wildcard rules from %s feeds",
                  "{:,}".format(len(blocked)), "{:,}".format(len(wildcards)), len(srcs))
         return len(blocked)
 
 
-def save_gravity_cache():
+def save_gravity_cache(custom=None):
     try:
         srcs = {}
         for lid in CFG.get("enabled_lists", []):
@@ -1445,14 +1492,31 @@ def save_gravity_cache():
                 srcs[lid] = (st.st_mtime_ns, st.st_size)
         with open(GRAVITY_CACHE, "wb") as fh:
             pickle.dump({"v": CONFIG_VERSION, "srcs": srcs, "blocked": BLOCKED,
-                         "wild": WILDCARDS, "unbreak": UNBREAK}, fh, protocol=4)
+                         "wild": WILDCARDS, "unbreak": UNBREAK,
+                         "vcounts": dict(VECTOR_COUNTS), "ccounts": dict(CAT_COUNTS)},
+                        fh, protocol=4)
+        # The custom tally goes in a sidecar: the main cache is hundreds of MB, and
+        # rewriting it because one line was added to custom.block is not worth it.
+        try:
+            mark = None
+            if CUSTOM_BLOCK.exists():
+                st = CUSTOM_BLOCK.stat()
+                mark = (st.st_mtime_ns, st.st_size)
+            with open(META_DIR / "gravity.custom", "wb") as fh:
+                pickle.dump({"mark": mark, "custom": set(custom or [])}, fh, protocol=4)
+        except Exception:
+            pass
     except Exception as exc:
         LOG.debug("gravity cache save skipped: %s", exc)
+
+
+GRAVITY_CUSTOM = None
 
 
 def load_gravity_cache():
     """Load the compiled blocklist so protection starts in milliseconds."""
     global BLOCKED, WILDCARDS, UNBREAK
+    _t0 = time.time()
     if not GRAVITY_CACHE.exists():
         return False
     try:
@@ -1473,19 +1537,79 @@ def load_gravity_cache():
         BLOCKED = data["blocked"]
         WILDCARDS = data["wild"]
         UNBREAK = data["unbreak"]
-        vcount, ccount = defaultdict(int), defaultdict(int)
-        for d, (cat, vec, _s) in BLOCKED.items():
-            vcount[vec] += 1
-            ccount[cat] += 1
-        for d, (cat, vec, _s) in WILDCARDS.items():
-            vcount[vec] += 1
-        VECTOR_COUNTS.update(vcount)
-        CAT_COUNTS.update(ccount)
-        LOG.info("gravity cache restored: %s rules", "{:,}".format(len(BLOCKED)))
+        # The vector/category tallies are stored with the cache: recounting 5M rules at
+        # boot just to fill two small dicts was a second avoidable stall.
+        vc, cc = data.get("vcounts"), data.get("ccounts")
+        if vc is not None and cc is not None:
+            VECTOR_COUNTS.clear(); CAT_COUNTS.clear()
+            VECTOR_COUNTS.update(vc); CAT_COUNTS.update(cc)
+        else:
+            vcount, ccount = defaultdict(int), defaultdict(int)
+            for d, (cat, vec, _s) in BLOCKED.items():
+                vcount[vec] += 1
+                ccount[cat] += 1
+            for d, (cat, vec, _s) in WILDCARDS.items():
+                vcount[vec] += 1
+            VECTOR_COUNTS.clear(); CAT_COUNTS.clear()
+            VECTOR_COUNTS.update(vcount); CAT_COUNTS.update(ccount)
+        global GRAVITY_CUSTOM
+        # The sidecar holds the custom entries the cache was built with. The file
+        # itself is expected to differ - that is the whole point: whatever changed is
+        # a small set of hand-written lines, applied by apply_custom_overrides().
+        try:
+            with open(META_DIR / "gravity.custom", "rb") as fh:
+                side = pickle.load(fh)
+            GRAVITY_CUSTOM = set(side.get("custom") or ()) if side.get("custom") is not None else None
+        except Exception:
+            GRAVITY_CUSTOM = None
+        LOG.info("gravity cache restored: %s rules in %.1fs", "{:,}".format(len(BLOCKED)),
+                 time.time() - _t0)
         return True
     except Exception as exc:
         LOG.debug("gravity cache unusable: %s", exc)
         return False
+
+
+def apply_custom_overrides(custom_blocked):
+    """Fold the operator's own block file into a restored cache.
+
+    Rebuilding re-reads every feed: at 5M rules that is tens of seconds of silence
+    while the supervisor waits for a health endpoint that cannot bind yet - long
+    enough to look like a broken install, and it only ever has to learn about a
+    handful of hand-written lines. Returns False when the cache cannot be trusted
+    (no sidecar, or custom.block changed underneath it) so the caller rebuilds.
+    """
+    global GRAVITY_CUSTOM
+    if GRAVITY_CUSTOM is None:
+        return False
+    changed = False
+    for d in custom_blocked - GRAVITY_CUSTOM:
+        BLOCKED[d] = ("custom", "banner", "custom")
+        if d.count(".") > 1:
+            WILDCARDS.setdefault(d, ("custom", "banner", "custom"))
+        VECTOR_COUNTS["banner"] += 1
+        CAT_COUNTS["custom"] += 1
+        changed = True
+    for d in GRAVITY_CUSTOM - custom_blocked:
+        if BLOCKED.get(d, ("", "", ""))[2] == "custom":
+            BLOCKED.pop(d, None)
+            WILDCARDS.pop(d, None)
+            VECTOR_COUNTS["banner"] = max(0, VECTOR_COUNTS.get("banner", 0) - 1)
+            CAT_COUNTS["custom"] = max(0, CAT_COUNTS.get("custom", 0) - 1)
+            changed = True
+    if changed:
+        GRAVITY_CUSTOM = set(custom_blocked)
+        try:
+            mark = None
+            if CUSTOM_BLOCK.exists():
+                st = CUSTOM_BLOCK.stat()
+                mark = (st.st_mtime_ns, st.st_size)
+            with open(META_DIR / "gravity.custom", "wb") as fh:
+                pickle.dump({"mark": mark, "custom": GRAVITY_CUSTOM}, fh, protocol=4)
+        except Exception as exc:
+            LOG.debug("custom tally sidecar skipped: %s", exc)
+    flush_caches()
+    return True
 
 
 def load_custom_lists():
@@ -4073,7 +4197,7 @@ UBLOCK_COSMETIC = [
     "youtube.com###masthead-ad",
     "youtube.com##ytd-rich-item-renderer:has(ytd-ad-slot-renderer)",
     "youtube.com##ytd-item-section-renderer:has(> #sections > ytd-ad-slot-renderer)",
-    "twitter.com,x.com##.promoted-tweet, [data-testid\:cellInnerDiv] .css-175oi2r:has(.r-1pi4i0q)",
+    r"twitter.com,x.com##.promoted-tweet, [data-testid\:cellInnerDiv] .css-175oi2r:has(.r-1pi4i0q)",
     "reddit.com,forum.*##.promotedLink, [data-promotion-root]",
 ]
 
@@ -4718,16 +4842,22 @@ def main():
     argv = sys.argv[1:]
     if argv and argv[0].startswith("-") and argv[0] not in SERVE_FLAGS:
         sys.exit(cli(argv) or 0)
-    if not BLOCKED and not load_gravity_cache():
+    _boot_t0 = time.time()
+    cache_ok = bool(BLOCKED) or load_gravity_cache()
+    custom_blocked, _custom_allowed = load_custom_lists()
+    if cache_ok and not apply_custom_overrides(custom_blocked):
+        cache_ok = False
+    if not cache_ok:
+        LOG.info("building gravity from %s enabled feeds (no usable cache yet)",
+                 len(CFG.get("enabled_lists", [])))
         rebuild_master_blocklist()
-    _sync_legacy_views()
-    load_custom_lists()
-    rebuild_master_blocklist(persist=False)
+    _sync_legacy_views(custom_blocked)
     _write_banners()
     start_engine_threads()
     port = int(CFG.get("web_port", 8080))
-    LOG.info("dashboard on http://0.0.0.0:%s (user: %s) - rules: %s", port,
-             CFG.get("admin_username"), "{:,}".format(len(BLOCKED) + len(WILDCARDS)))
+    LOG.info("dashboard on http://0.0.0.0:%s (user: %s) - rules: %s, ready in %.1fs", port,
+             CFG.get("admin_username"), "{:,}".format(len(BLOCKED) + len(WILDCARDS)),
+             time.time() - _boot_t0)
     try:
         app.run(host="0.0.0.0", port=port, debug=False, threaded=True,
                 use_reloader=False)

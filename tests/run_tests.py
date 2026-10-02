@@ -626,6 +626,160 @@ class TestDomainIntel(unittest.TestCase):
         self.assertTrue(any("adquit block" in h for h in rep["hints"]))
 
 
+class TestBootFastPath(unittest.TestCase):
+    """A box with 5M rules must not re-read every feed on every start.
+
+    Real-world symptom: `adquit update` rebuilt 5.1M rules, then `systemctl start`
+    spent tens of seconds rebuilding them *again* before the dashboard could bind -
+    long enough that the 15-second health probe declared a perfectly healthy service
+    dead, stopped it, and restarted the load from zero. Boot must trust a fresh
+    cache, fold in the operator's own lines without a rebuild, and say how long it took.
+    """
+
+    TABLES = ("BLOCKED", "WILDCARDS", "UNBREAK", "GRAVITY_CUSTOM", "CUSTOM_WHITELIST_SET")
+
+    def setUp(self):
+        self.saved = {n: getattr(nb, n) for n in self.TABLES}
+        self.saved_counts = (dict(nb.VECTOR_COUNTS), dict(nb.CAT_COUNTS))
+        for p in (nb.GRAVITY_CACHE, nb.META_DIR / "gravity.custom"):
+            p.unlink(missing_ok=True)
+        nb.CUSTOM_BLOCK.unlink(missing_ok=True)
+        nb.BLOCKED = {"doubleclick.net": ("ads", "banner", "fx_plain"),
+                      "track.example": ("trackers", "pixel", "fx_plain")}
+        nb.WILDCARDS = {"network.example": ("ads", "banner", "fx_wildcard")}
+        nb.UNBREAK = set()
+        nb.VECTOR_COUNTS.clear(); nb.CAT_COUNTS.clear()
+        nb.VECTOR_COUNTS.update({"banner": 1, "pixel": 1})
+        nb.CAT_COUNTS.update({"ads": 1, "trackers": 1})
+
+    def tearDown(self):
+        for n, v in self.saved.items():
+            setattr(nb, n, v)
+        nb.VECTOR_COUNTS.clear(); nb.CAT_COUNTS.clear()
+        nb.VECTOR_COUNTS.update(self.saved_counts[0]); nb.CAT_COUNTS.update(self.saved_counts[1])
+        for p in (nb.GRAVITY_CACHE, nb.META_DIR / "gravity.custom"):
+            p.unlink(missing_ok=True)
+        nb.CUSTOM_BLOCK.unlink(missing_ok=True)
+
+    def test_cache_round_trip_carries_the_tallies(self):
+        nb.save_gravity_cache(custom=set())
+        nb.BLOCKED, nb.WILDCARDS = {}, {}
+        nb.VECTOR_COUNTS.clear(); nb.CAT_COUNTS.clear()
+        self.assertTrue(nb.load_gravity_cache(), "cache should load from a clean state")
+        self.assertEqual(len(nb.BLOCKED), 2)
+        # restored without scanning every rule: the counts came from the cache itself
+        self.assertEqual(nb.VECTOR_COUNTS.get("pixel"), 1)
+        self.assertEqual(nb.CAT_COUNTS.get("trackers"), 1)
+
+    def test_custom_lines_are_folded_in_without_a_rebuild(self):
+        nb.save_gravity_cache(custom={"old.example"})
+        nb.CUSTOM_BLOCK.write_text("old.example\nadded-while-down.net\n")
+        self.assertTrue(nb.load_gravity_cache())
+        blocked_now, _ = nb.load_custom_lists()
+        self.assertTrue(nb.apply_custom_overrides(blocked_now),
+                        "a 2-line custom file must not need a full rebuild")
+        self.assertIn("added-while-down.net", nb.BLOCKED)
+        self.assertEqual(nb.BLOCKED["added-while-down.net"][0], "custom")
+        self.assertNotIn("old.example", nb.BLOCKED, "removed while down must stay removed")
+        nb._sync_legacy_views(nb.load_custom_lists()[0])
+        self.assertIn("added-while-down.net", nb.CUSTOM_BLOCKED,
+                      "the dashboard's custom tally must follow the fold-in")
+        # a multi-label entry also gets its wildcard, exactly as the rebuild would
+        nb.CUSTOM_BLOCK.write_text("sub.zone.example\n")
+        self.assertTrue(nb.apply_custom_overrides(nb.load_custom_lists()[0]))
+        self.assertIn("sub.zone.example", nb.WILDCARDS)
+
+    def test_cache_that_cannot_be_verified_forces_a_rebuild(self):
+        nb.save_gravity_cache(custom={"a.example"})
+        (nb.META_DIR / "gravity.custom").unlink()      # cache from an older build
+        self.assertTrue(nb.load_gravity_cache())
+        self.assertFalse(nb.apply_custom_overrides(set()),
+                         "no custom tally -> the caller must rebuild, not guess")
+
+    def test_boot_does_not_rebuild_a_warm_cache(self):
+        src = (REPO / "app.py").read_text()
+        self.assertIn("cache_ok and not apply_custom_overrides(custom_blocked)", src,
+                      "boot lost its fast path")
+        self.assertNotIn("rebuild_master_blocklist(persist=False)\n    _sync_legacy_views", src,
+                        "boot rebuilds unconditionally again")
+        self.assertIn("ready in %.1fs", src, "boot must report how long it took")
+        self.assertIn("no usable cache yet", src, "a cold build must say so while it works")
+
+    def test_legacy_views_are_deferred_but_live(self):
+        nb._sync_legacy_views()
+        self.assertIsInstance(nb.BLOCKED_DOMAINS, nb._LazyView)
+        self.assertIsNone(nb.BLOCKED_DOMAINS._obj, "must not be built at boot")
+        self.assertEqual(len(nb.BLOCKED_DOMAINS), 3)     # 2 exact + 1 wildcard zone
+        self.assertIsNotNone(nb.BLOCKED_DOMAINS._obj, "materialises on first use")
+        nb._sync_legacy_views()
+        nb.BLOCKED["fresh.example"] = ("ads", "banner", "test")
+        self.assertIn("fresh.example", nb.BLOCKED_DOMAINS, "the view must follow the tables")
+        self.assertEqual(nb.DOMAIN_CATEGORIES["doubleclick.net"], "ads")
+
+    def test_source_has_no_invalid_escape_sequences(self):
+        """`"\:"` in a CSS selector was fine until Python 3.12 made it a SyntaxWarning and
+        it becomes a SyntaxError later - a single backslash can brick every start."""
+        import warnings
+        src = (REPO / "app.py").read_text()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            compile(src, "app.py", "exec")
+        bad = [str(w.message) for w in caught
+               if issubclass(w.category, (SyntaxWarning, DeprecationWarning))]
+        self.assertEqual(bad, [], "invalid escape sequence(s): %s" % bad[:3])
+        self.assertIn(r"[data-testid\:cellInnerDiv]", src,
+                      "the uBlock CSS rule must keep its escaped colon")
+
+    def test_module_globals_are_declared(self):
+        """A function that assigns a module name without `global` writes a local instead -
+        which is how the custom tally silently stayed None and every boot rebuilt 5M
+        rules. Same class of bug, once is enough."""
+        import ast
+
+        def stores(node):
+            """Names this function binds directly - ignoring comprehension/lambda/nested
+            scopes, where a name is legitimately local."""
+            out = set()
+
+            def visit(n):
+                if isinstance(n, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+                                  ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    out.add(n.id)
+                for _field, child in ast.iter_fields(n):
+                    if isinstance(child, list):
+                        for c in child:
+                            if isinstance(c, ast.AST):
+                                visit(c)
+                    elif isinstance(child, ast.AST):
+                        visit(child)
+            visit(node)
+            return out
+
+        tree = ast.parse((REPO / "app.py").read_text())
+        mod_names = set()
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                for tgt in targets:
+                    mod_names |= {t.id for t in ast.walk(tgt) if isinstance(t, ast.Name)}
+        offenders = []
+        for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+            declared = {g for stmt in ast.walk(fn) if isinstance(stmt, ast.Global)
+                        for g in stmt.names}
+            args = list(fn.args.args) + list(fn.args.kwonlyargs) + list(fn.args.posonlyargs)
+            params = {a.arg for a in args}
+            for extra in (fn.args.vararg, fn.args.kwarg):
+                if extra:
+                    params.add(extra.arg)
+            leaked = (stores(fn) & mod_names) - declared - params
+            if leaked:
+                offenders.append("%s(): %s" % (fn.name, sorted(leaked)))
+        self.assertEqual(offenders, [], "module globals assigned without `global`: %s"
+                         % offenders[:5])
+
+
 class TestDependencyGate(unittest.TestCase):
     """`--version` / `--doctor` must answer even on a box where flask/requests/dnslib
     are gone (wiped venv, bare `python3 app.py`), and starting the service must
