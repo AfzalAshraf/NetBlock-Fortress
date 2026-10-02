@@ -10,8 +10,8 @@ set -o pipefail
 SERVICE="adquit"
 KEEP=0
 [ "${1:-}" = "--keep-data" ] && KEEP=1
-R="\033[31m"; C="\033[32m"; B="\033[1m"; N="\033[0m"
-[ -t 1 ] || { C=""; R=""; B=""; N=""; }
+C="\033[32m"; B="\033[1m"; N="\033[0m"
+[ -t 1 ] || { C=""; B=""; N=""; }
 say() { printf "  ${B}>${N} %s\n" "$1"; }
 
 if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then

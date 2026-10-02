@@ -299,9 +299,19 @@ if [ "$NO_CLI" != "1" ]; then
         *":$HOME/.local/bin:"*) ;;
         *) [ "$IS_ROOT" = "0" ] && warn "add to PATH:  export PATH=\$HOME/.local/bin:\$PATH" ;;
     esac
-    for shell in bash zsh; do
-        [ -d "$HOME_DIR/completions" ] || mkdir -p "$HOME_DIR/completions"
-    done
+    mkdir -p "$HOME_DIR/completions" 2>/dev/null || true
+    cat > "$HOME_DIR/completions/adquit.bash" 2>/dev/null <<'CMP' || true
+# bash completion for adquit - enable with:
+#   source ~/.adquit/completions/adquit.bash      (or /opt/adquit/... for a root install)
+_adquit_completions() {
+    local cmds
+    cmds="start stop restart status logs watch run install update upgrade gravity mode"
+    cmds="$cmds block allow unblock blocklist test doctor verify-lists stats json top rules"
+    cmds="$cmds passwd protect uninstall help version"
+    COMPREPLY=( $(compgen -W "$cmds" -- "${COMP_WORDS[COMP_CWORD]}") )
+}
+complete -F _adquit_completions adquit
+CMP
     cat > "$HOME_DIR/completions/_adquit" 2>/dev/null <<'CMP' || true
 #compdef adquit
 _adquit() { _arguments '*:command:(start stop restart status logs watch run install update gravity mode block allow unblock blocklist test doctor verify-lists stats json top rules passwd protect uninstall help version)' ; }

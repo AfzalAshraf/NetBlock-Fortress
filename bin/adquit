@@ -143,7 +143,7 @@ install_cli_link() {
     mkdir -p "$(dirname "$target")"
     cp "$HOME_DIR/bin/adquit" "$target" 2>/dev/null || true
     chmod 0755 "$target" 2>/dev/null || true
-    printf '  %scommand:%N %sadquit%s now available at %s\n' "$D" "$B" "$N" "$target"
+    printf '  %scommand:%s %sadquit%s now available at %s\n' "$D" "$N" "$B" "$N" "$target"
 }
 
 write_unit() {
@@ -302,8 +302,7 @@ running() {
 }
 
 wait_healthy() { # up to ~15s
-    local i
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         health_ok && return 0
         [ -f "$PIDFILE" ] && ! kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && return 1
         sleep 0.5

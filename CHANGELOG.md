@@ -77,6 +77,12 @@
   engine, and records the channel in `.adquit/.channel`, which `adquit update` follows.
 - README: install-from-branch / install-from-checkout channels, and a troubleshooting table
   for the failures people actually hit (`bash: line 2: ---: command not found` etc).
+- `adquit`'s install-link message used `printf '…%N…'`, which bash rejects as an invalid
+  format (`printf: `N': invalid format character`) - it truncated the line *and* returned a
+  failing status from the helper. Fixed, and the shell files are now clean under
+  `shellcheck --severity=warning` (the level CI runs); the bash completion file the installer
+  wrote was a no-op loop, now it actually installs a working `complete -F` completion
+  alongside the zsh one.
 
 ### Packaging & QA
 - One-command `install.sh` (idempotent, sudo-aware, OS/package-manager detection, venv,
