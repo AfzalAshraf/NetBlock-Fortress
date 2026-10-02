@@ -388,8 +388,8 @@ app_version() { # the VERSION stamp inside an app.py, without running python
 
 ver_ge() { # ver_ge A B -> is A >= B?  Pure shell arithmetic on (major,minor,patch):
            # a `sort | head` pipeline here made equal versions fail (SIGPIPE/locale).
-    local a="$1" b="$2" pa pb i
-    for i in 1 2 3; do
+    local a="$1" b="$2" pa pb _
+    for _ in 1 2 3; do
         pa="${a%%.*}"; pb="${b%%.*}"
         pa="${pa%%[!0-9]*}"; pb="${pb%%[!0-9]*}"
         [ "${pa:-0}" -gt "${pb:-0}" ] && return 0
