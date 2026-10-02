@@ -91,8 +91,12 @@ elevate_for() {
     [ "$NEEDS_SUDO" = "1" ] || return 0
     have sudo || die "$HOME_DIR is owned by root - run: sudo adquit $1"
     printf '  (fortress lives in %s - elevating with sudo)\n' "$HOME_DIR"
+    # sudo rebuilds the environment (env_reset), so an exported ADQUIT_* variable does
+    # not survive the hop - anything this script needs must be re-supplied here.
     exec sudo env ADQUIT_HOME="$HOME_DIR" REAL_HOME="$REAL_HOME" \
-        ADQUIT_REF="${ADQUIT_REF:-}" HOME="$REAL_HOME" bash "$0" "${ORIG_ARGS[@]}"
+        ADQUIT_REF="${ADQUIT_REF:-}" HOME="$REAL_HOME" \
+        ADQUIT_FORCE="${ADQUIT_FORCE:-}" ADQUIT_REHEALED="${ADQUIT_REHEALED:-}" \
+        ADQUIT_ORIGIN_FILE="${ADQUIT_ORIGIN_FILE:-}" bash "$0" "${ORIG_ARGS[@]}"
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -537,47 +541,97 @@ run_as_engine() { # run app.py subcommand with the right interpreter/home
     "$PY" "$APP" "$@"
 }
 
+restore_update() { # put the engine back exactly as it was before 'adquit update'
+    local origin="$1"
+    [ -f "$origin" ] || return 0
+    cp -f "$origin" "$APP" 2>/dev/null && rm -f "$origin" 2>/dev/null
+    warn "restored the previous app.py - your fortress is untouched and still serving"
+}
+
 cmd_update() {
+    local force="" force_arg="" opt
+    for opt in "$@"; do
+        case "$opt" in
+            -f|--force|--yes) force=1 ;;
+            *) die "unknown option for 'update': $opt  (usage: adquit update [--force])" ;;
+        esac
+    done
+    # ADQUIT_FORCE=1 is the second way in; --force is the first for a reason: sudo
+    # resets the environment, so an exported variable only reaches us if elevation
+    # re-supplies it (see elevate_for). A flag travels in argv and cannot be lost.
+    [ -n "${ADQUIT_FORCE:-}" ] && force=1
     [ -f "$APP" ] || die "not installed yet - run: adquit install"
     resolve_channel
     say "Updating fortress binaries (channel: $REF)"
 
-    # An update must never leave the box unprotected and must never downgrade the
-    # engine (a stale ref used to do exactly that). So: remember whether it was
-    # live, keep the old app.py, verify the new one, restore on any doubt.
+    # An update must never leave the box unprotected and must never swap in an engine
+    # it cannot explain. So: keep a pristine copy of what we are replacing, fetch,
+    # decide, verify, and restore on any doubt. The copy is per-state-dir and is
+    # never overwritten, because this function may re-run itself (CLI self-heal).
+    local origin="${ADQUIT_ORIGIN_FILE:-$STATE_DIR/update-origin.py}"
     local was_live=0; running >/dev/null 2>&1 && was_live=1
-    local old_ver new_ver old_id new_id decision backup="$APP.pre-update"
-    old_ver="$(app_version "$APP")"
-    old_id="$(file_id "$APP" 2>/dev/null || true)"
-    cp -f "$APP" "$backup" 2>/dev/null || true
+    if [ ! -f "$origin" ]; then
+        mkdir -p "$(dirname "$origin")" 2>/dev/null || true
+        cp -f "$APP" "$origin" 2>/dev/null || true
+    fi
+    if [ ! -f "$origin" ]; then origin="$APP.pre-update"; cp -f "$APP" "$origin" 2>/dev/null || true; fi
     fetch_repo "$HOME_DIR"
+
+    # The judgement below lives in the CLI you already have - which is a trap: a
+    # stale or buggy guard can refuse the very update that would fix it, and no
+    # amount of forcing makes a broken comparison honest. So if the channel carries
+    # a different CLI, install that one and hand the rest of the update to it. Once
+    # only: ADQUIT_REHEALED stops the two copies from bouncing the work back and forth.
+    if [ -z "${ADQUIT_REHEALED:-}" ] && [ -f "$HOME_DIR/bin/adquit" ] \
+       && bash -n "$HOME_DIR/bin/adquit" 2>/dev/null; then
+        local fetched_tag
+        fetched_tag="$(sed -n 's/^VERSION_TAG="\([^"]*\)".*/\1/p' "$HOME_DIR/bin/adquit" | head -n1)"
+        if [ -n "$fetched_tag" ] && [ "$fetched_tag" != "$VERSION_TAG" ]; then
+            say "CLI here is v$VERSION_TAG, the channel has v$fetched_tag - restarting the update with it"
+            install_cli_link
+            export ADQUIT_REHEALED=1 ADQUIT_ORIGIN_FILE="$origin"
+            [ -n "$force" ] && force_arg="--force"
+            # shellcheck disable=SC2086  # --force only, never a glob
+            exec bash "$HOME_DIR/bin/adquit" update $force_arg
+        fi
+    fi
+
+    local old_ver new_ver old_id new_id decision
+    old_ver="$(app_version "$origin" 2>/dev/null || true)"
+    old_id="$(file_id "$origin" 2>/dev/null || true)"
     new_ver="$(app_version "$APP")"
     new_id="$(file_id "$APP" 2>/dev/null || true)"
     decision="$(update_decision "$old_ver" "$new_ver" "$old_id" "$new_id")"
     case "$decision" in
         skip)
-            rm -f "$backup" 2>/dev/null || true
-            say "already up to date - engine v$new_ver is byte-identical to what is installed"
-            printf '  (nothing restarted, your blocklists keep running)\n'
-            printf '  fresh blocklists?  %sadquit gravity%s\n' "$B" "$N"
-            return 0 ;;
+            if [ -n "$force" ]; then
+                warn "--force: reinstalling v$new_ver although the engine is unchanged"
+            else
+                rm -f "$origin" 2>/dev/null || true
+                say "already up to date - engine v$new_ver is byte-identical to what is installed"
+                printf '  (nothing restarted, your blocklists keep running)\n'
+                printf '  fresh blocklists?  %sadquit gravity%s\n' "$B" "$N"
+                return 0
+            fi ;;
         nostamp)
-            [ -f "$backup" ] && mv -f "$backup" "$APP"
+            restore_update "$origin"
             die "the update produced no usable app.py from $REPO/$REF (no version stamp) - that channel is behind, or main has no v19 yet" ;;
         refuse)
-            [ -f "$backup" ] && mv -f "$backup" "$APP"
-            die "channel $REPO/$REF holds v$new_ver but you are running v$old_ver - refusing to downgrade (ADQUIT_FORCE=1 to force)" ;;
+            if [ -z "$force" ]; then
+                restore_update "$origin"
+                die "channel $REPO/$REF holds v$new_ver but you are running v$old_ver - refusing to downgrade (adquit update --force to allow it)"
+            fi
+            warn "v$old_ver -> v$new_ver is a downgrade - carrying on because --force was given" ;;
         go)
             if [ "$old_ver" = "$new_ver" ]; then
                 printf '  same version stamp (v%s) but different code - applying\n' "$new_ver"
             fi ;;
     esac
-    if [ -n "${ADQUIT_FORCE:-}" ]; then decision=go; fi
     if ! "$PY" "$APP" --version >/dev/null 2>&1; then
-        [ -f "$backup" ] && mv -f "$backup" "$APP"
+        restore_update "$origin"
         die "the updated app.py is not runnable with $PY - restored v${old_ver:-previous}; check 'adquit doctor'"
     fi
-    rm -f "$backup"
+    rm -f "$origin" 2>/dev/null || true
     [ -f "$HOME_DIR/bin/adquit" ] && { cp -f "$HOME_DIR/bin/adquit" /usr/local/bin/adquit 2>/dev/null || true; }
     ensure_deps
     run_as_engine --rebuild
@@ -749,7 +803,9 @@ ${B}PROTECTION${N}
 
 ${B}MAINTENANCE${N}
   adquit install [--mode strict] [--user]   (re)install / upgrade in place
-  adquit update             pull the latest fortress + refresh feeds
+  adquit update [--force]   pull the latest fortress + refresh feeds
+                            ("already up to date" if unchanged; a real downgrade needs
+                             --force, because sudo wipes exported variables)
   adquit gravity            re-download every enabled blocklist
   adquit test [domain]      prove blocking works (engine + live resolver)
   adquit doctor             config, port, feed and dependency diagnostics
@@ -793,7 +849,7 @@ case "${1:-}" in
     watch)         cmd_watch ;;
     run)           cmd_run ;;
     install)       shift; cmd_install "$@" ;;
-    update|upgrade) cmd_update ;;
+    update|upgrade) shift; cmd_update "$@" ;;
     gravity|pull|update-lists) shift; cmd_gravity "$@" ;;
     mode)          shift; cmd_mode "$@" ;;
     block)         shift; cmd_block "$@" ;;

@@ -76,6 +76,19 @@
   and `nostamp` (v18 / not-Python channel); version maths is pure shell arithmetic, and the
   installed `app.py` is restored whenever a refusal happens. Engine/CLI/installer are stamped
   19.1, and a contract test asserts the three agree.
+  (five new CLI contract checks pin the decision table, the `--force` wiring and the self-heal marker).
+- **`--force`, because `sudo` eats environment variables.** `ADQUIT_FORCE=1 sudo adquit update`
+  silently failed the hint (env_reset drops it, and `set ADQUIT_FORCE=1` is csh syntax - bash's
+  `set` assigns positional parameters). `adquit update [--force]` now rides in argv, is re-read
+  after elevation, and `elevate_for` forwards `ADQUIT_FORCE` for anyone who still uses the env form.
+  An unrecognised flag is a loud usage error rather than a shrug.
+- **A stale guard can no longer wedge an update.** The version check lives in the CLI you already
+  have, so a broken one refuses the very update that would repair it. `adquit update` now compares
+  its own stamp with the fetched `bin/adquit`: when they differ it installs the channel's CLI and
+  re-executes itself once (`ADQUIT_REHEALED`, so the two copies cannot bounce the work back and
+  forth). The pristine engine copy is kept per state dir in `data/update-origin.py` and is never
+  overwritten, so a restore after the hop still returns *your* file, not something a partial
+  update wrote - and it is deleted on success.
 - **YouTube ad payload audit**: a user pasted the player's own ad debug blob and we measured
   the engine against every host in it. 10 ad/reporting endpoints were reachable on `strict`
   and are now in the seed - `static.googleadsserving.cn`, `pagead.google.com`,
@@ -104,7 +117,7 @@
 - **Colours**: `printf '...%s...' "$C"` printed literal `\033[32m` because printf only expands
   escapes in its *format*; all prompt/control colours now use ANSI-C quoting.
 - Tests: 59 offline (payload-regression class, subscription export, RDAP intel with a stubbed
-  network) + 21 CLI contract checks; `tests/test_cli.sh` now times each check, keeps its output
+  network) + 22 CLI contract checks; `tests/test_cli.sh` now times each check, keeps its output
   on failure and raises `::error::` annotations + a step summary on GitHub Actions.
 
 ### Robustness at the edges (post-release hardening)

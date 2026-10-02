@@ -91,6 +91,15 @@ echo team/xyz > "$TMP/home/.channel"
 HOME_DIR="$TMP/home" ADQUIT_REF= sh -c '. "$0/helpers.sh"; [ "$(detect_channel)" = "team/xyz" ]' "$TMP"
 HOME_DIR="$TMP/home" ADQUIT_REF=pinned/branch sh -c '. "$0/helpers.sh"; [ "$(detect_channel)" = "pinned/branch" ]' "$TMP"
 grep -q MIN_APP_VERSION "$REPO/install.sh"
+# the escape hatch must survive sudo: a flag travels in argv, an export does not
+grep -q 'adquit update \[--force\]' "$REPO/bin/adquit"                  # help says so
+grep -q "usage: adquit update \[--force\]" "$REPO/bin/adquit"           # and so does the error
+grep -q 'update|upgrade) shift; cmd_update "$@"' "$REPO/bin/adquit"       # flags reach the function
+grep -A10 '^elevate_for()' "$REPO/bin/adquit" | grep -q 'ADQUIT_FORCE='    # env forwarded across sudo
+# a stale guard must not be able to wedge an update it cannot judge
+grep -q 'ADQUIT_REHEALED' "$REPO/bin/adquit"                               # one-hop marker
+grep -q 'restarting the update with it' "$REPO/bin/adquit"                  # hand-off to the fetched CLI
+grep -q 'restore_update "$origin"' "$REPO/bin/adquit"                       # engine restored on every refusal
 grep -q "refusing to install app.py" "$REPO/install.sh"
 grep -q 'bg_run "$STATE_DIR/gravity.log"' "$BIN"                   # gravity must not own the pidfile
 [ "$(grep -c start_detached "$BIN")" -eq 2 ]                       # definition + the one service call site
@@ -111,6 +120,7 @@ check "adquit lan prints reachable URLs"    bash -c "'$BIN' lan | grep -E -q 'ht
 check "adquit --version answers with no install at all" bash -c "
     '$BIN' --version | grep -q '$VER'
 "
+check "adquit update rejects an unknown flag" bash -c "'$BIN' update --frorce 2>&1 | grep -q 'unknown option'"
 check "adquit test (offline, no live)"      "$BIN" test --no-live
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"

@@ -145,6 +145,10 @@ adquit protect on|off       repoint THIS machine's DNS at the fortress
 adquit update               pull the newest fortress, rebuild, refresh, restart
                             (follows the install's channel; "already up to date" when the
                              engine is byte-identical, refuses only a real downgrade)
+adquit update --force       ... and carry on anyway. Use the flag, not ADQUIT_FORCE=1:
+                             sudo rebuilds the environment, so exported variables do not
+                             reach the script (ADQUIT_FORCE is re-supplied on elevation,
+                             but a flag in argv can never be lost).
 adquit uninstall
 ```
 
@@ -295,7 +299,8 @@ wire the fortress into home automation or a dashboard.
 | `ModuleNotFoundError: No module named 'flask'` (or `dnslib`, `requests`) | You ran `python3 app.py` with a bare interpreter. `adquit doctor` says exactly this and how to fix it; the installer builds a private venv so you never hand-install anything. |
 | `refusing to install app.py v18.0 …` / `no version stamp` | The installer noticed the ref is behind itself and stopped rather than half-installing. Pass `ADQUIT_REF=<branch>` or merge. |
 | `already up to date - engine vX is byte-identical` | Not an error: your channel has no newer commit. Blocklists are updated separately with `adquit gravity`. |
-| `refusing to downgrade vA -> vB` | The channel genuinely holds an **older** engine than you run (v19.1+ compares content, not just the stamp, so same-version commits update normally). Point `ADQUIT_REF` at the right branch, or `ADQUIT_FORCE=1` to allow it. |
+| `refusing to downgrade vA -> vB` | The channel genuinely holds an **older** engine than you run (v19.1+ compares content, not just the stamp, so same-version commits update normally). Point `ADQUIT_REF` at the right branch, or `sudo adquit update --force` to allow it. `ADQUIT_FORCE=1` alone does nothing through `sudo` - the environment is reset. |
+| `adquit update` refuses, and the refusal makes no sense | If the CLI on your box predates v19.1 it has no escape hatch of its own: the guard that is misfiring is the one you are running. Re-install in place instead - it refreshes `app.py` **and** the CLI and leaves `data/` (config, custom blocks, allows, lists) alone: `curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/<your-ref>/install.sh \| sudo env ADQUIT_REF=<your-ref> bash` |
 | `port 53 is already in use` | `adquit doctor` names the squatter (usually `systemd-resolved`); the installer writes a `DNSStubListener=no` drop-in for exactly that, or use `ADQUIT_DNS_PORT=5353`. |
 | something you need got blocked | `adquit allow <domain>` — the whitelist is layer 0 and beats every other rule; `adquit rules <domain>` shows which layer decided. |
 | feeds look dead | `adquit verify-lists` reports which of the 131 sources your box can reach; a dead feed is an error badge, never a breakage. |
