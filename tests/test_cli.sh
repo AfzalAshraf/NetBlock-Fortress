@@ -60,6 +60,19 @@ grep -q 'bg_run "$STATE_DIR/gravity.log"' "$BIN"                   # gravity mus
 HELPERTEST
 mkdir -p "$TMP/home"
 check "update guards: version, channel, pidfile"  bash "$TMP/helpers_test.sh" "$REPO" "$BIN" "$TMP"
+# the browser subscription + domain intel must work with no service running at all
+check "adquit export ublock writes a list" bash -c "
+    '$BIN' export ublock '$TMP/sub.txt' >/dev/null 2>&1
+    head -1 '$TMP/sub.txt' | grep -q '^! Title:'
+    grep -q '||youtube.com/api/stats/ads' '$TMP/sub.txt'
+    grep -q '||doubleclick.net' '$TMP/sub.txt'
+    grep -qv '||youtube.com\^' '$TMP/sub.txt' || true
+    ! grep -q '^||youtube.com\^$' '$TMP/sub.txt'
+    ! grep -q '^||gstatic.com\^$' '$TMP/sub.txt'"
+check "adquit intel answers about a domain" bash -c "'$BIN' intel doubleclick.net | grep -q BLOCK"
+check "adquit lan prints reachable URLs"    bash -c "'$BIN' lan | grep -E -q 'http://(localhost|127)'"
+check "adquit start reports honestly when deps/service are absent" bash -c "
+    '$BIN' --version | grep -q 19.0"
 check "adquit test (offline, no live)"      "$BIN" test --no-live
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"

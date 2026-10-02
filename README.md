@@ -137,6 +137,9 @@ adquit test                 prove it works: engine self-test + live DNS probe
 adquit doctor               port/resolver/dependency/feed diagnostics
 adquit verify-lists         check that all 131 feed URLs are reachable
 adquit rules google.com     ask the engine about any hostname
+adquit intel scam-ads.biz   who owns that landing page (RDAP age/registrar) + verdict
+adquit export ublock         publish the same rules as a browser filter list
+adquit lan                   why can't my laptop see the dashboard? (and fix it)
 adquit passwd               rotate the dashboard password
 adquit protect on|off       repoint THIS machine's DNS at the fortress
 adquit update               pull the newest fortress, rebuild, refresh, restart
@@ -206,6 +209,39 @@ browser extensions cannot go.
 sudo adquit protect          # NetworkManager / systemd-resolved / resolv.conf, auto-detected
 sudo adquit protect off      # restore
 ```
+
+**The browser half (what a resolver cannot do)** — a DNS sinkhole only sees hostnames, so
+ads served from a host you keep alive (`youtube.com`, `google.com`) arrive as *paths*. The
+fortress therefore publishes an adblock-syntax subscription generated from its own live state:
+
+```bash
+adquit export ublock                 # writes data/adquit.ublock.txt
+# or subscribe to the live one, in uBlock Origin -> Dashboard -> Import -> "I already know":
+http://<fortress-ip>:8080/adquit.txt
+```
+
+It carries the path rules (`||youtube.com/api/stats/ads`, `/ptracking`,
+`/get_midroll_info`, `||www.google.com/pagead/`…), cosmetics that collapse the empty ad slot,
+and every host this box actually blocks - so the browser and the resolver never disagree.
+Run it *next to* uBlock's own lists; it is a mirror of your fortress, not a replacement.
+
+**Advertiser / landing-page intel** — when an ad slips through and you want to know what the
+"why this ad" link points at:
+
+```bash
+adquit intel scam-game-landing.com   # engine verdict + RDAP age/registrar + the block command
+adquit block scam-game-landing.com   # arm it (hot-reloaded into the running resolver)
+```
+
+**Reaching the dashboard from another device on your Wi-Fi**
+
+```bash
+adquit lan           # what is listening, the URLs, and whether a firewall blocks them
+sudo adquit lan open # open the dashboard port in ufw/firewalld
+```
+
+Never forward `:8080` through your router. If the box is a VPS, its *provider* security group
+also has to allow the port, or reach it over a tunnel instead: `ssh -N -L 8080:127.0.0.1:8080 you@server`.
 
 **API / metrics**
 

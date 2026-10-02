@@ -480,6 +480,102 @@ class TestSinkholeHTTP(unittest.TestCase):
             nb.CFG["sinkhole_mode"] = "zeroip"
 
 
+class TestYouTubeAdPayload(unittest.TestCase):
+    """Every host a real 'YouTube pre-roll told us about' payload points at, plus the
+    hosts that payload's *player* needs to keep working.  Regression cover for v19.1:
+    these were the ad endpoints the strict profile still let through."""
+
+    MUST_BLOCK = [
+        # ad serving / verification / reporting
+        "pagead2.googlesyndication.com", "pagead.googlesyndication.com",
+        "ade.googlesyndication.com", "googleadservices.com", "www.googleadservices.com",
+        "ad.doubleclick.net", "static.doubleclick.net", "pubads.g.doubleclick.net",
+        "securepubads.g.doubleclick.net", "googleads.g.doubleclick.net",
+        "static.googleadsserving.cn", "pagead.google.com", "pagead.l.google.com",
+        "adservice.google.com", "adservice.google.ae", "dai.google.com",
+        # player telemetry / measurement
+        "s.youtube.com", "video-stats.l.google.com", "video-stats.youtube.com",
+        "app-measurement.com", "firebaselogging.googleapis.com",
+        "crashlyticsreports-pa.googleapis.com", "pulse.video", "doubleverify.com",
+        "adsafeprotected.com", "innovid.com", "imasdk.googleapis.com",
+        "staticads.youtube.com", "youtubeadsdk.com",
+        # ad-UX endpoints (the "My Ad Center" / transparency panels report here)
+        "myadcenter.google.com", "adstransparency.google.com",
+    ]
+    MUST_ALLOW = [
+        "www.youtube.com", "m.youtube.com", "music.youtube.com", "tv.youtube.com",
+        "i.ytimg.com", "yt3.ggpht.com", "yt3.googleusercontent.com",
+        "manifest.googlevideo.com", "www.google.com", "accounts.google.com",
+        "play.google.com", "gstatic.com", "ads.google.com",       # campaign manager
+        "adssettings.google.com",                                  # ad opt-out controls
+        "dart.dev",                                                # shares a label, not ours
+    ]
+
+    def test_ad_payload_hosts_are_sinkholed(self):
+        gaps = [d for d in self.MUST_BLOCK if verdict(d)["action"] != "block"]
+        self.assertEqual([], gaps, "these ad endpoints are still reachable: %s" % gaps)
+
+    def test_player_and_public_services_stay_up(self):
+        broken = [d for d in self.MUST_ALLOW
+                  if verdict(d)["action"] == "block"]
+        self.assertEqual([], broken, "the engine broke: %s" % broken)
+
+    def test_hard_ad_label_override_is_scoped_to_the_estate(self):
+        # Google owns both the ad tech and the trusted zones, so an ad label under a
+        # google zone must die anyway - that is the layer-5b override, and it is
+        # deliberately limited to the named labels of that estate.
+        v = verdict("pagead.google.co.uk")
+        self.assertEqual("block", v["action"])
+        self.assertIn("trusted zone", v["reason"])
+        # an ad-*sounding* label that is not on the hard list stays reachable
+        self.assertEqual("allow", verdict("myads.google.com")["action"])
+        # a host that merely shares a name with an ad technology stays reachable too
+        self.assertEqual("allow", verdict("dart.dev")["action"])
+        self.assertEqual("allow", verdict("adsense.garden")["action"])
+
+
+class TestSubscriptionExport(unittest.TestCase):
+    """`adquit export ublock` + http://fortress:8080/adquit.txt - the path-level half
+    of the job a resolver cannot do (ads that ride on youtube.com / google.com)."""
+
+    def test_subscription_builds(self):
+        text = nb.build_ublock_subscription()
+        lines = [l for l in text.splitlines() if l and not l.startswith("!")]
+        self.assertGreater(len(lines), 150, "subscription too thin: %s rules" % len(lines))
+        self.assertTrue(text.startswith("! Title:"), text[:40])
+        for needle in ("||youtube.com/api/stats/ads$important",
+                       "||youtube.com/get_midroll_info$important",
+                       "||youtube.com/ptracking$important",
+                       "||google.com/ads/$third-party",
+                       "youtube.com##ytd-ad-slot-renderer"):
+            self.assertIn(needle, text)
+
+    def test_subscription_mirrors_engine_and_respects_exemptions(self):
+        text = nb.build_ublock_subscription()
+        self.assertIn("||doubleclick.net^", text)
+        for must_not in ("||youtube.com^", "||gstatic.com^", "||ads.google.com^"):
+            self.assertNotIn(must_not, text, "subscription would break: %s" % must_not)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = nb.app.test_client()
+
+    def test_route_serves_it_without_a_token(self):
+        # a browser extension cannot log in, so this one route is deliberately public
+        res = self.client.get("/adquit.txt")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("text/plain", res.headers.get("Content-Type", ""))
+        body = res.get_data(as_text=True)
+        self.assertTrue(body.startswith("! Title:"))
+        self.assertIn("||youtube.com/api/stats/ads$important", body)
+        self.assertIn("Cache-Control", res.headers)
+        res2 = self.client.get("/adquit.txt?all=1")
+        self.assertEqual(res2.status_code, 200)
+        count = lambda txt: sum(1 for line in txt.splitlines() if line.startswith("||"))
+        self.assertGreaterEqual(count(res2.get_data(as_text=True)), count(body),
+                                "the ?all=1 variant must never carry fewer rules")
+
+
 class TestDependencyGate(unittest.TestCase):
     """`--version` / `--doctor` must answer even on a box where flask/requests/dnslib
     are gone (wiped venv, bare `python3 app.py`), and starting the service must

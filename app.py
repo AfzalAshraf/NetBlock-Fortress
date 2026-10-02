@@ -687,7 +687,7 @@ CORE_SEED = {
     # CTV / set-top beacons
     "ads.samsung.com": "ctv", "samsungads.com": "ctv", "ads.hulu.com": "ctv",
     "smarttv.hulu.com": "ctv", "lgtvads.com": "ctv", "ads.roku.com": "ctv",
-    "roku.com.ads": "ctv", "amazon-adsystem.tv": "ctv", "firetveu.ads.amazon.com": "ctv",
+    "amazon-adsystem.tv": "ctv", "firetveu.ads.amazon.com": "ctv",
     "ads.cmpassport.com": "ctv", "ads.hbo.com": "ctv", "applovinctv.com": "ctv",
     "vturb.com": "ctv", "amagi.tv": "ctv", "audiencenet.tv": "ctv", "ssp.amagi.tv": "ctv",
     "ads.vizio.com": "ctv", "ads.tcl.com": "ctv", "ads.xiaomi.tv": "ctv",
@@ -695,9 +695,23 @@ CORE_SEED = {
     # In-video / YouTube ad endpoints
     "s.youtube.com": "video", "video-stats.l.google.com": "video",
     "video-stats.youtube.com": "video", "youtubei.googleapis.com": "video",
-    "youtubeadsdk.com": "video", "ytimg.com.legal": "video", "admaven.co": "video",
+    "youtubeadsdk.com": "video", "admaven.co": "video",
     "imasdk.googleapis.com": "video", "videostats.kakao.com": "video",
-    "api.youtube.com.ads": "video", "metric.gstatic.com": "video",
+    # hosts a real YouTube player ad payload referenced and v18 let through
+    "static.googleadsserving.cn": "video", "s2.youtube.com": "video",
+    "dai.google.com": "video", "pagead.google.com": "video",
+    "static.doubleclick.net": "video", "ade.googlesyndication.com": "video",
+    # Google's own ad-reporting / ad-UX endpoints: the player's "My Ad Center" panel and
+    # the Ad Transparency lookup both report to these. Blocking costs nothing but a button
+    # that no longer opens (allow them again with: adquit allow adstransparency.google.com).
+    "myadcenter.google.com": "ads", "adstransparency.google.com": "ads",
+    "myactivity.google.com.ads": "ads", "adservice.google.ae": "ads",
+    "pagead.googlesyndication.com": "video", "pagead.l.google.com": "video",
+    # client telemetry that only exists to profile you
+    "app-measurement.com": "telemetry", "firebaselogging.googleapis.com": "telemetry",
+    "crashlyticsreports-pa.googleapis.com": "telemetry", "pulse.video": "fingerprint",
+    "doubleverify.com": "retarget", "adsafeprotected.com": "retarget",
+    
     # Push / notification ad gateways
     "onesignal.net": "push", "onesignal.com": "push", "pushnami.com": "push",
     "pushengage.com": "push", "pushwoosh.com": "push", "engageya.com": "push",
@@ -1676,14 +1690,25 @@ def _classify_uncached(d):
         if hit:
             return hit
 
-    # 4 - advertiser dashboards stay reachable
-    if d in AD_PORTAL_HOSTS:
-        return _allow("Ad portal")
+    # 4 - advertiser dashboards stay reachable (and so does the personalized-ads opt-out
+    # panel at adssettings.google.com, which is a control, not an ad)
+    if d in AD_PORTAL_HOSTS or d == "adssettings.google.com":
+        return _allow("Ad portal" if d in AD_PORTAL_HOSTS else "Ad opt-out controls")
 
     # 5 - YouTube / in-video ad + player telemetry endpoints
     if d in YT_AD_HOSTS or (CFG.get("youtube_aggressive", True) and YT_EDGE_RE.search(d)):
         if cfg_bool("invideo_ads", True) or cfg_bool("youtube_aggressive", True):
             return _deny("video", "video", "In-video ad endpoint", "youtube")
+
+    if CFG.get("block_mode") == "nuclear" and d in NUCLEAR_ONLY_HOSTS:
+        return _deny("telemetry", "telemetry", "Nuclear-only endpoint", "heuristics")
+
+    # 5b - hard ad labels: armed even inside trusted zones.  google.com is trusted so
+    # "ads.google.com" must survive, but adservice.google.<cc> / pagead.google.<cc> are
+    # pure ad endpoints wearing a trusted family name, so they die here regardless.
+    head = d.split(".", 1)[0]
+    if head in HARD_AD_LABELS and in_google_estate(d):
+        return _deny("ads", "banner", "Ad endpoint in a trusted zone", "patterns")
 
     # 6 - keyword engine on the registrable domain (all modes)
     if cfg_bool("pattern_engine", True) and not is_trusted(d):
@@ -1746,6 +1771,31 @@ YT_EDGE_RE = re.compile(
     r"^(?:r\d+---sn-(?:4g5edn7s|vgqsrn7e|aigl6ned|hp576n7e|q4fl6n7s)\.googlevideo\.com$"
     r"|(?:staticads|ad|ads|adstats|adservice|pagead)\.youtube\.com$"
     r"|ads\.(?:tv\.)?(?:youtube|google)\.com$)")
+
+# Google owns the ad tech *and* the trusted zones, so "adservice.google.ae" and
+# "pagead.google.com" are ad endpoints wearing a family name we otherwise protect.
+# The override is scoped to that estate only, so unrelated hosts that merely share a
+# label (dart.dev, admaven.co) stay reachable.
+GOOGLE_ESTATE_RE = re.compile(
+    r"(?:^|\.)(?:google(?:\.[a-z]{2,3}){1,2}|googleapis\.com|gstatic\.com|googlevideo\.com"
+    r"|googlesyndication\.com|googleadservices\.com|ggpht\.com|youtube\.com|youtube-nocookie\.com)$")
+
+
+def in_google_estate(domain):
+    return bool(GOOGLE_ESTATE_RE.search(norm_domain(domain)))
+
+
+# First-label ad endpoints that live under a trusted zone (blocked before the guard).
+HARD_AD_LABELS = frozenset([
+    "adservice", "pagead", "googleadsserving", "adsense", "admob", "doubleclick",
+    "googlesyndication", "googleadservices", "adinterax", "adsystem",
+])
+
+# Only armed in `nuclear`: these carry player/analytics config, so blocking them can
+# inconvenience a client (GA UI, third-party YouTube apps) as much as it stops tracking.
+NUCLEAR_ONLY_HOSTS = frozenset([
+    "youtube.googleapis.com", "analytics.google.com", "secure-data-reporting.googleapis.com",
+])
 
 # ──────────────────────────────────────────────
 #  AI triage (OpenRouter, optional)
@@ -3991,6 +4041,177 @@ def api_mode():
                     "feeds": len(CFG.get("enabled_lists", []))})
 
 
+# ──────────────────────────────────────────────
+#  Browser-level subscription (the part DNS cannot reach)
+# ──────────────────────────────────────────────
+# A resolver sees hostnames only.  Ads served from a host you must keep alive
+# (youtube.com, google.com) arrive as *paths* on that host, so they need a
+# filter-list.  The fortress generates one from its own state so a browser
+# extension and the DNS engine never disagree - subscribe to /adquit.txt.
+UBLOCK_PATH_RULES = [
+    "! path rules: ad pods / ad reporting that ride on a host you keep allowed",
+    "||youtube.com/api/stats/ads$important",
+    "||youtube.com/api/stats/adevent$important",
+    "||youtube.com/api/stats/brandprofiling$important",
+    "||youtube.com/ptracking$important",
+    "||youtube.com/get_midroll_info$important",
+    "||youtube.com/annotations_invideo$important",
+    "||youtube.com/yt_ad_types_api/get_ad_types$important",
+    "||youtube.com/pagead/",
+    "||www.google.com/pagead/",
+    "||www.google.com/ads/intent/",
+    "||ggpht.com/proxy/$image",
+    "||google.com/ads/$third-party",
+]
+UBLOCK_COSMETIC = [
+    "! cosmetics: collapse the slot so the page does not leave a gap",
+    "youtube.com,youtube-nocookie.com##.ytp-ad-player-overlay",
+    "youtube.com,youtube-nocookie.com##.ytp-ad-survey",
+    "youtube.com,youtube-nocookie.com##.ytp-visit-advertiser-link",
+    "youtube.com,youtube-nocookie.com##.ytp-ad-overlay-slot",
+    "youtube.com##ytd-ad-slot-renderer",
+    "youtube.com###masthead-ad",
+    "youtube.com##ytd-rich-item-renderer:has(ytd-ad-slot-renderer)",
+    "youtube.com##ytd-item-section-renderer:has(> #sections > ytd-ad-slot-renderer)",
+    "twitter.com,x.com##.promoted-tweet, [data-testid\:cellInnerDiv] .css-175oi2r:has(.r-1pi4i0q)",
+    "reddit.com,forum.*##.promotedLink, [data-promotion-root]",
+]
+
+
+def build_ublock_subscription(all_rules=False, cap=None):
+    """Text of an EasyList-style subscription mirroring this fortress."""
+    cap = cap or int(CFG.get("ublock_max_rules", 4000 if not all_rules else 200000))
+    host_counts = {}
+    try:
+        host_counts = {h: c for h, c in TOP_BLOCKED}
+    except Exception:
+        host_counts = {}
+    out = [
+        "! Title: NetBlock Fortress (adquit) - LAN subscription",
+        "! Homepage: https://github.com/AfzalAshraf/NetBlock-Fortress",
+        "! Expires: 1 day",
+        "! Version: %s - generated %s by the fortress at %s"
+        % (VERSION, datetime.now().strftime("%Y-%m-%d %H:%M"), socket.gethostname() or "this host"),
+        "! Rules below mirror the DNS engine: %s exact + %s wildcard zones armed on this box."
+        % ("{:,}".format(len(BLOCKED)), "{:,}".format(len(WILDCARDS))),
+        "! Blocking at the resolver already covers these; this list adds the path-level",
+        "! rules a DNS sinkhole cannot express.  Safe to run next to uBlock's own lists.",
+        "",
+    ]
+    out += UBLOCK_PATH_RULES
+    out.append("")
+    out += UBLOCK_COSMETIC
+    out.append("")
+    out.append("! ---- hosts blocked on this fortress%s ----" % (" (all)" if all_rules else " (most requested)"))
+    ordered = sorted(host_counts, key=lambda h: -host_counts[h]) if host_counts else []
+    seen = set()
+    for host in ordered + sorted(BLOCKED):
+        host = norm_domain(host)
+        if not host or host in seen or len(seen) >= cap:
+            continue
+        # skip anything a browser must reach for the filter to be honest about breakage
+        if host in AD_PORTAL_HOSTS or is_trusted(host):
+            continue
+        seen.add(host)
+        out.append("||%s^" % host)
+    for zone in sorted(WILDCARDS)[:cap]:
+        zone = norm_domain(zone)
+        if zone and zone not in seen and not is_trusted(zone):
+            out.append("||%s^" % zone)
+    return "\n".join(out) + "\n"
+
+
+@app.route("/adquit.txt")
+def adquit_subscription():
+    """Adblock-syntax subscription for browsers/apps, generated from live engine state."""
+    full = request.args.get("all") in ("1", "true", "yes")
+    body = build_ublock_subscription(all_rules=full)
+    resp = Response(body, mimetype="text/plain", headers={
+        "Content-Disposition": 'inline; filename="adquit.txt"',
+        "Cache-Control": "public, max-age=3600",
+        "X-Robots-Tag": "noindex",
+    })
+    return resp
+
+
+# ──────────────────────────────────────────────
+#  Domain intel (RDAP) - who is behind a landing page
+# ──────────────────────────────────────────────
+RDAP_CACHE = TTLCache(2000)
+
+
+def rdap_lookup(domain, timeout=8):
+    """Registration facts for a hostname via public RDAP.  Network-dependent and
+    deliberately never used while answering DNS; `adquit intel` calls it."""
+    zone = registrable(norm_domain(domain))
+    if not zone or "." not in zone:
+        return {"error": "not a registrable domain"}
+    hit = RDAP_CACHE.get(zone)
+    if hit:
+        return hit
+    info = {"zone": zone}
+    try:
+        res = requests.get("https://rdap.org/domain/%s" % zone, timeout=timeout,
+                           headers={"Accept": "application/rdap+json", "User-Agent": USER_AGENT},
+                           allow_redirects=True)
+        if res.status_code != 200:
+            return {"error": "rdap http %s" % res.status_code}
+        data = res.json()
+        events = {e.get("eventAction"): e.get("eventDate") for e in data.get("events", []) or []}
+        reg = ""
+        for ent in data.get("entities", []) or []:
+            if "registrar" in (ent.get("roles") or []):
+                for v in ent.get("vcardArray", [None, []])[1] or []:
+                    if v and v[0] == "fn":
+                        reg = v[3]
+                break
+        info["registrar"] = reg or "unknown"
+        info["created"] = events.get("registration") or events.get("eventDate") or ""
+        info["expires"] = events.get("expiration") or ""
+        info["status"] = ",".join(data.get("status", []) or [])[:80]
+        info["nameservers"] = sorted({h.get("ldhName", "") for h in data.get("nameservers", []) or []})[:6]
+        if info["created"]:
+            try:
+                d = datetime.fromisoformat(info["created"][:10])
+                info["age_days"] = (datetime.now() - d).days
+            except Exception:
+                pass
+    except Exception as exc:
+        return {"error": "unreachable (%s)" % type(exc).__name__}
+    RDAP_CACHE.set(zone, info)
+    return info
+
+
+def intel_report(domain):
+    """Everything the fortress knows about one hostname + how to act on it."""
+    d = norm_domain(domain)
+    verdict = classify(d)
+    out = {"domain": d, "zone": registrable(d), "action": verdict["action"],
+           "reason": verdict["reason"], "layer": verdict["source"], "category": verdict["cat"],
+           "vector": verdict["vec"], "trusted_zone": is_trusted(d),
+           "requests_from_lan": sum(1 for h, c in TOP_BLOCKED if h == d)}
+    out["rdap"] = rdap_lookup(d)
+    age = out["rdap"].get("age_days")
+    hints = []
+    if age is not None and age <= 30:
+        hints.append("registered %s days ago - freshly-baked domains in ads are a scam signal" % age)
+    elif age is not None:
+        hints.append("domain age %s days" % age)
+    if out["rdap"].get("status") and any(k in out["rdap"]["status"].lower()
+                                         for k in ("client transfer prohibited", "redemption", "pending")):
+        hints.append("registry status: %s" % out["rdap"]["status"])
+    if verdict["action"] != "block":
+        hints.append("not blocked yet - arm it with:  adquit block %s" % d)
+        if registrable(d) != d:
+            hints.append("or kill the whole zone:      adquit block %s" % registrable(d))
+    else:
+        hints.append("blocked by %s (%s); subdomains of %s %s covered"
+                     % (verdict["source"] or "engine", verdict["vec"], registrable(d),
+                        "are" if verdict["reason"].startswith("Wildcard") or registrable(d) == d else "are not"))
+    out["hints"] = hints
+    return out
+
+
 @app.route("/metrics")
 def metrics():
     p = stats_payload()
@@ -4031,6 +4252,18 @@ def _api_get(path, params=None, timeout=6):
         return {"_error": "http %s" % res.status_code}
     except Exception as exc:
         return {"_error": str(exc)[:100]}
+
+
+def _api_raw(path, timeout=8):
+    """Plain-text GET against the live service (no token needed for /adquit.txt)."""
+    url = "http://127.0.0.1:%s%s" % (CFG.get("web_port", 8080), path)
+    try:
+        res = requests.get(url, timeout=timeout)
+        if res.status_code == 200 and res.text.lstrip().startswith("!"):
+            return res.text
+    except Exception:
+        pass
+    return None
 
 
 GREEN, RED, YEL, DIM, BOLD, RESET = ("\033[32m", "\033[31m", "\033[33m", "\033[2m",
@@ -4246,7 +4479,7 @@ def cli(argv):
               "  --update-lists | --rebuild | --verify-lists | --mode <name>\n"
               "  --block <domain...> | --allow <domain...> | --unblock <domain>\n"
               "  --set-auth <user> <pass> | --set <key> <value> | --get <key>\n"
-              "  --top | --health | --version")
+              "  --top | --health | --version | --export ublock [file] | --intel <domain>")
         return 0
     if cmd in ("--stats", "stats"):
         return cmd_stats()
@@ -4261,6 +4494,62 @@ def cli(argv):
         return cmd_doctor()
     if cmd in ("--health",):
         print(json.dumps(_api_get("/api/health"), indent=2))
+        return 0
+    if cmd in ("--export", "export"):
+        what = rest[0] if rest and not rest[0].startswith("-") else "ublock"
+        if what not in ("ublock", "adblock", "list"):
+            print("[!] unknown export '%s' (available: ublock)" % what)
+            return 2
+        path = None
+        for a in rest[1:]:
+            if not a.startswith("-"):
+                path = a
+        all_rules = "--all" in rest
+        text = None
+        live = _api_raw("/adquit.txt" + ("?all=1" if all_rules else ""))   # service state wins
+        if live:
+            text = live
+        else:
+            text = build_ublock_subscription(all_rules=all_rules)
+        dest = Path(path) if path else (DATA_DIR / "adquit.ublock.txt")
+        try:
+            dest.write_text(text)
+        except Exception as exc:
+            print("[!] could not write %s: %s" % (dest, exc))
+            return 1
+        n = sum(1 for line in text.splitlines() if line and not line.startswith("!"))
+        print("[+] wrote %s (%s filter rules) - subscribe to it in uBlock Origin / AdGuard:"
+              % (dest, "{:,}".format(n)))
+        print("    either open that file, or use the live URL:  http://<fortress-ip>:%s/adquit.txt"
+              % CFG.get("web_port", 8080))
+        return 0
+    if cmd in ("--intel", "intel"):
+        targets = [a for a in rest if not a.startswith("-")]
+        if not targets:
+            print("[!] usage: --intel <domain> [<domain> ...]")
+            return 2
+        as_json = "--json" in rest
+        for d in targets:
+            rep = intel_report(d)
+            if as_json:
+                print(json.dumps(rep, indent=2))
+                continue
+            col = "BLOCK" if rep["action"] == "block" else "allow"
+            print("%s  %s" % (d.center(max(28, len(d))), col))
+            print("  verdict      %s  (layer: %s, %s)" % (rep["reason"], rep["layer"] or "engine", rep["vector"]))
+            print("  zone         %s%s" % (rep["zone"], "   [trusted zone]" if rep["trusted_zone"] else ""))
+            r = rep.get("rdap") or {}
+            if r.get("error"):
+                print("  registration unavailable (%s)" % r["error"])
+            else:
+                print("  registrar    %s" % r.get("registrar", "?"))
+                print("  created      %s%s" % (r.get("created", "?")[:10],
+                                               "" if r.get("age_days") is None else "  (%s days old)" % r["age_days"]))
+                if r.get("nameservers"):
+                    print("  ns           %s" % " ".join(x for x in r["nameservers"] if x))
+            for h in rep.get("hints", []):
+                print("  note         %s" % h)
+            print()
         return 0
     if cmd in ("--update-lists", "--pull", "update-lists"):
         force = "--force" in rest

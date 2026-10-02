@@ -12,13 +12,19 @@
 # Part of NetBlock Fortress - see README.md
 set -o pipefail
 
+# Keep the operator's full command line: elevation re-runs this script with sudo, and it
+# must replay *every* argument (`adquit block a.com b.com`), not just the verb.
+ORIG_ARGS=("$@")
+
 VERSION_TAG="19.0"
 REPO="${ADQUIT_REPO:-AfzalAshraf/NetBlock-Fortress}"
 REF="${ADQUIT_REF:-main}"
 RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
 TARBALL="${ADQUIT_TARBALL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF}"
 SERVICE="adquit"
-C="\033[32m"; Y="\033[33m"; R="\033[31m"; B="\033[1m"; D="\033[2m"; N="\033[0m"
+C=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+# (ANSI-C quoting matters: printf passes %s substitutions through untouched, so a
+#  literal "\033[32m" in a variable would be printed verbatim - which it was.)
 [ -t 1 ] || { C=""; Y=""; R=""; B=""; D=""; N=""; }
 
 say()  { printf "${B}${C}==>${N} %s\n" "$*"; }
@@ -54,16 +60,59 @@ PY="$HOME_DIR/venv/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
 STATE_DIR="$HOME_DIR/data"
 PIDFILE="$HOME_DIR/adquit.pid"
+REAL_HOME="$HOME"
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    REAL_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    [ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
+fi
+NEEDS_SUDO=0
+if ! is_root && [ ! -w "$HOME_DIR" ] && [ -f "$APP" ]; then NEEDS_SUDO=1; fi
 
 export ADQUIT_HOME="$HOME_DIR"
-if [ ! -d /run/systemd/system ] || ! is_root; then
-    export ADQUIT_DNS_PORT="${ADQUIT_DNS_PORT:-5353}"
-    export ADQUIT_WEB_PORT="${ADQUIT_WEB_PORT:-8080}"
-fi
+case "$HOME_DIR" in
+    "$REAL_HOME"/*)   # a rootless ~/.adquit install cannot bind :53
+        export ADQUIT_DNS_PORT="${ADQUIT_DNS_PORT:-5353}"
+        export ADQUIT_WEB_PORT="${ADQUIT_WEB_PORT:-8080}"
+        ;;
+esac
 
-using_systemd() { [ -n "$SYSTEMD" ] && is_root && [ -f "/etc/systemd/system/$SERVICE.service" ]; }
+# Reads (status/stats/rules/doctor) work unprivileged; anything that writes state or
+# controls the service is re-run through sudo instead of failing with "Permission denied"
+# and then reporting a half-started user-mode fortress as if it were live.
+using_systemd() {
+    [ -n "$SYSTEMD" ] || return 1
+    [ -f "/etc/systemd/system/$SERVICE.service" ] || return 1
+    is_root && return 0
+    [ "$NEEDS_SUDO" = "1" ] && return 0          # elevate_for() re-runs us as root
+    return 1
+}
+
+elevate_for() {
+    [ "$NEEDS_SUDO" = "1" ] || return 0
+    have sudo || die "$HOME_DIR is owned by root - run: sudo adquit $1"
+    printf '  (fortress lives in %s - elevating with sudo)\n' "$HOME_DIR"
+    exec sudo env ADQUIT_HOME="$HOME_DIR" REAL_HOME="$REAL_HOME" \
+        ADQUIT_REF="${ADQUIT_REF:-}" HOME="$REAL_HOME" bash "$0" "${ORIG_ARGS[@]}"
+}
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+lan_ip() { # the address other devices on this network will see
+    ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1
+}
+
+lan_urls() {
+    local p host ip
+    p="$(web_port)"
+    host="$(hostname 2>/dev/null || echo localhost)"
+    ip="$(lan_ip)"
+    printf '  http://localhost:%s\n' "$p"
+    [ -n "$ip" ] && printf '  http://%s:%s   (LAN - what other devices use)\n' "$ip" "$p"
+    case "$host" in
+        *.local) printf '  http://%s:%s   (mDNS, same network)\n' "$host" "$p" ;;
+        *)       printf '  http://%s.local:%s   (mDNS, same network)\n' "$host" "$p" ;;
+    esac
+}
 
 token() {
     if [ -r "$STATE_DIR/config.json" ]; then
@@ -279,6 +328,13 @@ port_busy() { # is something already listening on a tcp port?
     return 1
 }
 
+dns_port() {
+    [ -r "$STATE_DIR/config.json" ] && \
+        "$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('dns_port',53))" 2>/dev/null \
+        && return 0
+    printf '%s' "${ADQUIT_DNS_PORT:-53}"
+}
+
 web_port() {
     "$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('web_port',8080))" 2>/dev/null \
         || printf '%s' "${ADQUIT_WEB_PORT:-8080}"
@@ -343,25 +399,31 @@ cmd_start() {
     if using_systemd; then
         $SUDO systemctl start "$SERVICE"
         wait_healthy || { $SUDO journalctl -u "$SERVICE" -n 20 --no-pager; die "service did not become healthy"; }
-        printf '%s✔ fortress live%s  dashboard http://127.0.0.1:%s  (systemd unit: %s)\n' \
-            "$C" "$N" "$(web_port)" "$SERVICE"
+        printf '%s✔ fortress live%s  dns :%s  dashboard http://127.0.0.1:%s  (systemd unit: %s)\n' \
+            "$C" "$N" "$(dns_port)" "$(web_port)" "$SERVICE"
+        printf '%s  reachable from your other devices:%s\n' "$D" "$N"
+        lan_urls | sed 's/^/   /'
         return 0
     fi
     if running; then
         warn "already running (dashboard :$(web_port))"
         return 0
     fi
-    local dp; dp="${ADQUIT_DNS_PORT:-53}"
+    local dp; dp="$(dns_port)"
     if port_busy "$dp" && ! health_ok; then
         warn "udp/tcp $dp is already bound - another resolver (or an old fortress) owns it"
     fi
     ADQUIT_HOME="$HOME_DIR" start_detached "$HOME_DIR/adquit.out" "$PY" "$APP" --serve
     if wait_healthy; then
         printf '%s✔ fortress live%s  dashboard http://127.0.0.1:%s  dns :%s  pid %s\n' \
-            "$C" "$N" "$(web_port)" "$dp" "$(cat "$PIDFILE")"
+            "$C" "$N" "$(web_port)" "$dp" "$(cat "$PIDFILE" 2>/dev/null || echo '-')"
+        printf '%s  reachable from your other devices:%s\n' "$D" "$N"
+        lan_urls | sed 's/^/   /'
     else
-        printf '%sfailed to start%s - last lines of %s:\n' "$R" "$N" "$HOME_DIR/adquit.out"
+        # /api/health never answered - do not claim otherwise, show why instead
+        printf '%s✘ not serving yet%s - last lines of %s:\n' "$R" "$N" "$HOME_DIR/adquit.out"
         tail -n 12 "$HOME_DIR/adquit.out" 2>/dev/null | sed 's/^/    /'
+        printf '    also try: journalctl -u %s -n 40   (or: adquit doctor)\n' "$SERVICE"
         return 1
     fi
 }
@@ -486,6 +548,57 @@ cmd_update() {
 }
 
 cmd_gravity() { run_as_engine --update-lists "$@"; }
+
+cmd_export() {
+    elevate_for export
+    run_as_engine --export "$@"
+}
+
+cmd_intel() {
+    [ $# -ge 1 ] || die "usage: adquit intel <domain> [domain ...]"
+    run_as_engine --intel "$@"
+}
+
+cmd_lan() {
+    local p; p="$(web_port)"
+    printf '%sReachability of the fortress dashboard%s\n' "$B" "$N"
+    printf '  listening   : '
+    if have ss; then
+        ss -tulpn 2>/dev/null | grep -q ":$p " && printf 'tcp/%s on 0.0.0.0 (all interfaces)\n' "$p" \
+            || printf '%snothing on tcp/%s - the service is not up%s\n' "$R" "$p" "$N"
+    else
+        printf 'unknown (no ss)\n'
+    fi
+    printf '  URLs:\n'; lan_urls | sed 's/^/    /'
+    printf '  firewall    : '
+    if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw status 2>/dev/null | grep -q "$p"; then printf '%sopen%s\n' "$C" "$N"
+        else printf '%sblocked by ufw%s\n' "$R" "$N"; fi
+    elif have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+        if firewall-cmd --query-port="$p/tcp" >/dev/null 2>&1; then printf '%sopen%s\n' "$C" "$N"
+        else printf '%sblocked by firewalld%s\n' "$R" "$N"; fi
+    else
+        printf 'no active firewall\n'
+    fi
+    if [ "${1:-}" = "open" ]; then
+        if have ufw; then
+            $SUDO ufw allow "$p/tcp" comment 'adquit dashboard' && say 'firewall: tcp/%s open' "$p"
+        elif have firewall-cmd; then
+            $SUDO firewall-cmd --permanent --add-port="$p/tcp" >/dev/null && $SUDO firewall-cmd --reload \
+                && say 'firewall: tcp/%s open' "$p"
+        else
+            warn "no ufw/firewalld found - nothing to open (a cloud box needs its security group)"
+        fi
+        return 0
+    fi
+    printf '%s  if a device on your Wi-Fi cannot reach it:%s\n' "$D" "$N"
+    printf '    1) sudo adquit lan open          (opens the host firewall)\n'
+    printf '    2) cloud host? also allow tcp/%s in the provider security group\n' "$p"
+    printf '    3) on a different network, skip exposure entirely with a tunnel:\n'
+    printf '         ssh -N -L 8080:127.0.0.1:%s user@this-box   ->  http://localhost:8080\n' "$p"
+    printf '    4) never port-forward this dashboard to the internet; it is LAN-only by design\n'
+    return 0
+}
 cmd_test()   { run_as_engine --test "$@"; }
 cmd_doctor() { run_as_engine --doctor "$@"; }
 cmd_verify() { run_as_engine --verify-lists "$@"; }
@@ -617,6 +730,15 @@ cmd_run() {
     exec "$PY" "$APP" --serve
 }
 
+
+# A normal user driving a root-owned install: elevate once, centrally, for every verb
+# that writes state or controls the service. Reads stay unprivileged.
+case "${1:-}" in
+    start|stop|restart|run|install|update|upgrade|gravity|pull|update-lists|mode|block|\
+    allow|unblock|blocklist|feed|passwd|password|protect|uninstall|remove|export|lan|reach)
+        elevate_for "${1:-}" ;;
+esac
+
 case "${1:-}" in
     ""|start)      cmd_start ;;
     stop)          cmd_stop ;;
@@ -636,6 +758,9 @@ case "${1:-}" in
     test|self-test) shift; cmd_test "$@" ;;
     doctor)        shift; cmd_doctor "$@" ;;
     verify|verify-lists) shift; cmd_verify "$@" ;;
+    export)        shift; cmd_export "${1:-ublock}" "${@:2}" ;;
+    intel|whois)   shift; cmd_intel "$@" ;;
+    lan|reach)     shift; cmd_lan "$@" ;;
     stats)         cmd_stats ;;
     json)          run_as_engine --json ;;
     top)           shift; cmd_top "$@" ;;

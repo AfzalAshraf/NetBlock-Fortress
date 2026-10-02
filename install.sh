@@ -33,7 +33,7 @@ UPSTREAM="${ADQUIT_UPSTREAM:-1.1.1.1}"
 SKIP_LISTS="${ADQUIT_SKIP_LISTS:-0}"
 NO_CLI="${ADQUIT_NO_CLI:-0}"
 
-C="\033[32m"; Y="\033[33m"; R="\033[31m"; B="\033[1m"; D="\033[2m"; N="\033[0m"
+C=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m' 
 [ -t 1 ] || { C=""; Y=""; R=""; B=""; D=""; N=""; }
 step() { printf "${B}${C}[%s/8]${N} %s\n" "$1" "$2"; }
 note() { printf "        %s\n" "$1"; }
@@ -276,15 +276,20 @@ fi
 
 # ---------------------------------------------------------------------------
 step 7 "Firewall & CLI"
+FW_STATE="none"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    FW_STATE="ufw"
     ufw allow "$DNS_PORT"/udp >/dev/null 2>&1 || true
     ufw allow "$WEB_PORT"/tcp >/dev/null 2>&1 || true
     note "ufw: opened $DNS_PORT/udp and $WEB_PORT/tcp"
 elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    FW_STATE="firewalld"
     firewall-cmd --permanent --add-port="$DNS_PORT"/udp >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-port="$WEB_PORT"/tcp >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
     note "firewalld: opened $DNS_PORT/udp and $WEB_PORT/tcp"
+else
+    note "no active host firewall - nothing to open (a cloud box still needs its security group)"
 fi
 if [ "$NO_CLI" != "1" ]; then
     CLI_TARGET="/usr/local/bin/adquit"
@@ -348,7 +353,15 @@ sleep 2
 if curl -fsS --max-time 5 "http://127.0.0.1:$WEB_PORT/api/health" >/dev/null 2>&1; then
     note "dashboard is answering on :$WEB_PORT"
 else
-    warn "dashboard not answering yet - check: $(basename "${START_CMD%% *}") logs / $HOME_DIR/adquit.out"
+    warn "dashboard not answering yet - here is what the service said:"
+    if [ -s "$HOME_DIR/adquit.out" ]; then
+        tail -n 12 "$HOME_DIR/adquit.out" 2>/dev/null | sed 's/^/        /'
+    fi
+    if command -v journalctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        journalctl -u "$SERVICE" -n 12 --no-pager 2>/dev/null | sed 's/^/        /'
+    fi
+    note "the first gravity pull can take a few minutes; adquit status shows progress"
+    note "reachability checks:  adquit lan      (and: sudo adquit lan open)"
 fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -362,7 +375,16 @@ printf "${B}  ==============================================================${N}
 printf "   dashboard     ${B}http://%s:%s${N}\n" "$IP" "$WEB_PORT"
 printf "   login         ${B}admin${N} / ${B}%s${N}%s\n" "$PW" "${RANDOM_PW:+   (generated once - store it now)}"
 printf "   dns server    ${B}%s:%s${N}\n" "$IP" "$DNS_PORT"
-printf "   rules         see 'adquit stats' after the first gravity pull\n\n"
+printf "   rules         see 'adquit stats' after the first gravity pull\n"
+LAN_HOST="$(hostname 2>/dev/null || echo host)"
+case "$LAN_HOST" in *.local) : ;; *) LAN_HOST="$LAN_HOST.local";; esac
+printf "   from any device on this network: http://%s:$WEB_PORT\n" "$LAN_HOST"
+if [ "$FW_STATE" = "none" ]; then
+    printf "   %snot reachable from your laptop?%s open it with:  sudo adquit lan open\n" "$Y" "$N"
+    printf "   %s(your provider security group / router ACL can block $WEB_PORT too)%s\n" "$D" "$N"
+fi
+printf "\n   %ssubscribe browsers to the same rules:%s  %s   (uBlock Origin: Dashboard -> Import -> Add filter list)\n" "$D" "$N" "http://$IP:$WEB_PORT/adquit.txt"
+printf "\n"
 printf "   ${D}protect the whole network : set your router DNS to %s${N}\n" "$IP"
 printf "   ${D}protect just this machine : sudo adquit protect${N}\n"
 printf "   ${D}manage everything         : adquit  /  adquit help${N}\n\n"

@@ -67,6 +67,37 @@
 - Config schema versioning + migration (v18 `enabled_lists` ids are remapped to v19 feeds,
   `/opt/netblock` is migrated to `/opt/adquit`).
 
+### v19.1 - what the first real-world installs taught us
+- **YouTube ad payload audit**: a user pasted the player's own ad debug blob and we measured
+  the engine against every host in it. 10 ad/reporting endpoints were reachable on `strict`
+  and are now in the seed - `static.googleadsserving.cn`, `pagead.google.com`,
+  `pagead.l.google.com`, `s2.youtube.com`, `dai.google.com`, `adservice.google.<cc>`,
+  `app-measurement.com`, `firebaselogging.googleapis.com`, `crashlyticsreports-pa.googleapis.com`,
+  `pulse.video` - plus Google's ad-UX endpoints (`myadcenter.google.com`,
+  `adstransparency.google.com`). `adssettings.google.com` (the opt-out panel) and advertiser
+  dashboards stay reachable on purpose; junk seed entries (`metric.gstatic.com`,
+  `ytimg.com.legal`, `roku.com.ads`, `ads.cloudtv`) were removed.
+- **Layer 5b**: an ad label inside a *trusted* zone (`pagead.google.co.uk`) is blocked again,
+  scoped to Google's own estate so unrelated hosts that merely share a label (`dart.dev`) live.
+- **`adquit export ublock` + `GET /adquit.txt`** - an EasyList-style subscription generated
+  from live engine state, for the path-level ads a resolver cannot see (`/api/stats/ads`,
+  `/ptracking`, `/get_midroll_info`, `www.google.com/pagead/`) plus slot-collapse cosmetics.
+  Public by design (a filter client cannot log in) and it contains only blocklist domains.
+- **`adquit intel <domain>`** - verdict + RDAP registration age/registrar/nameservers and the
+  exact `adquit block` to run, for scam landing pages that rotate faster than feeds do.
+- **`adquit lan` / `sudo adquit lan open`** - what is listening, which URLs other devices
+  should use, whether ufw/firewalld is in the way; the installer now prints the same hints and
+  says so when there is *no* host firewall (a cloud security group being the usual culprit).
+- **Root install, normal user**: control verbs (`start/stop/mode/block/allow/...`) re-run
+  through sudo instead of failing with `Permission denied` on `/opt/adquit/adquit.pid` and then
+  reporting a phantom instance as live; `dns`/`web` ports are read from the service config
+  rather than invented from defaults; `adquit start` only prints "live" after `/api/health`
+  answers, and otherwise dumps the service log (this is how "✔ fortress live" was lying).
+- **Colours**: `printf '...%s...' "$C"` printed literal `\033[32m` because printf only expands
+  escapes in its *format*; all prompt/control colours now use ANSI-C quoting.
+- Tests: 57 offline (incl. a payload-regression class and the subscription export) + 21 CLI
+  contract checks.
+
 ### Robustness at the edges (post-release hardening)
 - `python3 app.py --version / --help / --doctor` now work on a box with **no** Python deps
   (a wiped venv, or a bare `python3` run): they print instructions and a real offline
