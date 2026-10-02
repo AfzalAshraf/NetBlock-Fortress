@@ -1,0 +1,10 @@
+! Adblock Plus 2.0
+||ads.adblock-one.com^
+||track.adblock-two.com^$third-party
+||popup.adblock-three.com^$script,domain=example.com
+|http://direct-url-ad.com/banner.js
+@@||unbreak.example.com^
+||sub.wild-adzone.net^$important
+! cosmetic selectors must be ignored by the DNS engine
+.example.com##.ad-banner
+.example.com#$?#.sponsored { remove: true; }

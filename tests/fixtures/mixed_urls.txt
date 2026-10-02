@@ -1,0 +1,5 @@
+https://url-only-ads.com/some/path
+http://other-ads.io/
+ads.mixed-case.COM
+xn--pple-43d.com
+garbage-line

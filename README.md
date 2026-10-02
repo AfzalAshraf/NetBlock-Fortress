@@ -1,38 +1,271 @@
-# 🛡️ NetBlock Fortress
+# 🛡️ NetBlock Fortress — `adquit`
 
-**Network-wide ad blocker & threat intelligence DNS server in a single Python file.**
-
-Replaces Pi-hole with Brave-Shield style analytics, 50 blocklists across 10 categories,
-YouTube ad stripping, AI-powered domain classification, and a dark-themed web dashboard.
-
-![Version](https://img.shields.io/badge/version-18.0-brightgreen)
-![Python](https://img.shields.io/badge/python-3.8+-blue)
-![License](https://img.shields.io/badge/license-MIT-yellow)
-
----
-
-## ✨ Features
-
-| Feature | Description |
-|---|---|
-| 🎯 **50 Blocklists** | Ads, Trackers, Malware, Phishing, Spam, Social, Adult, Gambling, Crypto, Security |
-| 🎬 **YouTube Ad Blocking** | 250+ hardcoded YT ad domains + Oiyay blocklist + googlevideo pattern matching |
-| 🤖 **AI Classification** | OpenRouter free-tier AI classifies unknown domains in real-time |
-| 🔄 **CNAME Uncloaking** | Resolves canonical aliases to catch cloaked trackers |
-| 🛡️ **DNS Rebinding Protection** | Blocks public domains resolving to private IPs |
-| 🧠 **DGA Detection** | Entropy analysis blocks algorithm-generated malware domains |
-| ⚡ **Rate Limiting** | Configurable per-client queries/second with abuse logging |
-| 🚫 **Amplification Defense** | Refuses DNS ANY queries used in DDoS attacks |
-| 📊 **Threat Dashboard** | Brave-Shield style stats: bandwidth saved, time saved, threat breakdown |
-| 🌐 **Multi-Page UI** | Dark theme, real href navigation, no JS SPA freezing |
-| 🔐 **Login Auth** | SHA-256 password hashing, customizable username |
-| 📦 **Single File** | Everything in one `app.py` — no complex dependencies |
-
----
-
-## 🚀 Quick Install (Linux VPS / Local PC)
-
-### One-Command Install
+**A network-wide ad shield that blocks every micro *and* macro ad — installable with one command and driven by one word.**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/netblock-fortress/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/main/install.sh | sudo bash
+```
+
+Then, on that machine, forever:
+
+```bash
+adquit            # start (auto-installs itself if you skipped the one-liner)
+```
+
+**v19.0 “Omni-Shield”** — 131 blocklist feeds, 21 categories, 16 ad vectors, a wildcard +
+pattern engine for ad infrastructure that no list has seen yet, a zero-pixel creative sinkhole,
+and a `adquit` CLI that does everything: start, stop, block, allow, modes, gravity, self-test,
+doctor, stats. Single Python file, three PyPI dependencies, no database, no Docker required.
+
+![version](https://img.shields.io/badge/version-19.0-brightgreen)
+![python](https://img.shields.io/badge/python-3.8%2B-blue)
+![deps](https://img.shields.io/badge/dependencies-3-informational)
+![license](https://img.shields.io/badge/license-MIT-yellow)
+![tests](https://github.com/AfzalAshraf/NetBlock-Fortress/workflows/CI/badge.svg)
+
+---
+
+## What `adquit` does
+
+| | |
+|---|---|
+| 🎯 **131 feeds / 21 categories** | Ad networks, in-app SDKs, CTV, native, push, exchanges, mail pixels, fingerprinting, telemetry, malware, phishing, spam, cryptojacking, regional filters |
+| 🐜 **Micro-ad blocking** | Impression beacons, 1×1 pixels, SDK handshakes, RTB bidding calls, audience-sync, device fingerprinting, session replay, email open tracking |
+| 📢 **Macro-ad blocking** | Display banners, pre/mid-roll video endpoints, pop-unders, interstitials, native “sponsored” units, smart-TV ads, push-notification ads, shopping/affiliate units |
+| 🧠 **Pattern + wildcard engine** | `*.adnetwork.com` zones, ad-infrastructure host labels (`ads.`, `prebid.`, `banner.`…) and 100+ ad-tech keywords — catches brand-new hosts that no list knows yet |
+| 🕳️ **Zero-pixel creative sinkhole** | Optional: sinkhole the ad host to the fortress and answer with an empty GIF/JS/CSS so ad slots collapse instead of hanging on a spinner |
+| ⚡ **Fast by design** | TTL decision cache + upstream response cache, bounded DNS thread pool, UDP **and** TCP DNS, pickled gravity cache (instant restart), conditional-GET feed pulls |
+| 📊 **Dashboard** | Brave-Shield style analytics, 24 h sparkline, top blocked hosts, per-client inspection, security events, live query log |
+| 🧪 **Coverage matrix** | A page that shows exactly which ad vectors are armed, how many rules back each one, and lets you flip macro/micro/CTV/push/exchange/email coverage with one click |
+| 🔬 **Domain lab** | Type any hostname and watch the 8-layer decision trace: whitelist → feed → wildcard → unbreak → in-video → keyword pattern → label pattern → heuristics |
+| 🤖 **Optional AI triage** | Free-tier OpenRouter classification of unknown domains (off by default) |
+| 🔐 **Hardened** | Random session/API tokens, no more “admin works even after rename”, rate limiting, DNS-rebinding guard, DGA + homograph detection, ANY-query refusal |
+| 🧰 **`adquit` CLI** | `start stop restart status logs watch mode block allow unblock gravity test doctor stats json top rules passwd protect uninstall` |
+
+---
+
+## Install
+
+### 1. One command (recommended — VPS, box, Raspberry Pi)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/main/install.sh | sudo bash
+```
+
+The installer is idempotent — run it again to upgrade. It detects the OS and package
+manager, creates a private venv, frees udp/53 from `systemd-resolved`, installs the
+`adquit` systemd unit + logrotate, opens the firewall, starts a rootless-safe
+background blocklist pull, and generates a random dashboard password (printed once).
+
+No `curl` available? Everything is in this repo:
+
+```bash
+git clone https://github.com/AfzalAshraf/NetBlock-Fortress && cd NetBlock-Fortress
+sudo bash install.sh
+```
+
+…or just let `adquit` bootstrap itself from a checkout:
+
+```bash
+./bin/adquit            # installs, starts, prints the dashboard URL
+```
+
+### 2. Without root (laptop / any machine)
+
+```bash
+ADQUIT_USER=1 bash install.sh          # or: sudo ./bin/adquit install --user
+adquit start                           # DNS on :5353, dashboard on :8080
+sudo adquit protect                    # point this machine's DNS at 127.0.0.1
+```
+
+### 3. Docker
+
+```bash
+docker build -t netblock-fortress:19 .
+docker run -d --name adquit --network host -v adquit-data:/opt/adquit/data \
+  -e ADQUIT_PASSWORD=*** netblock-fortress:19
+```
+
+or `docker compose up -d`. Inside the container `adquit` is the entrypoint, so
+`docker exec -it adquit adquit stats` works.
+
+### 4. Env knobs for the one-liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/main/install.sh \
+  | sudo ADQUIT_MODE=nuclear ADQUIT_PASSWORD=*** ADQUIT_SKIP_LISTS=1 bash
+```
+
+| var | meaning | default |
+|---|---|---|
+| `ADQUIT_MODE` | `off` · `balanced` · `strict` · `family` · `nuclear` | `strict` |
+| `ADQUIT_HOME` | install directory | `/opt/adquit` (root) / `~/.adquit` (user) |
+| `ADQUIT_PASSWORD` | dashboard password | random, printed once |
+| `ADQUIT_DNS_PORT` / `ADQUIT_WEB_PORT` | listener ports | `53` / `8080` |
+| `ADQUIT_UPSTREAM` | upstream resolver | `1.1.1.1` |
+| `ADQUIT_SKIP_LISTS` | `1` = don’t download feeds during install | `0` |
+| `ADQUIT_USER` | `1` = rootless install | `0` |
+| `ADQUIT_REPO` / `ADQUIT_REF` | install from a fork/branch | this repo / `main` |
+
+---
+
+## Then: `adquit`
+
+```
+adquit                      start the fortress (installs on first run)
+adquit status | stats | watch | logs | top
+adquit start | stop | restart | run
+adquit mode family          off | balanced | strict | family | nuclear
+adquit block doubleclick.net my-tracking.biz      # your own blacklist (wildcards ok)
+adquit allow news.ycombinator.com                 # never blocked again
+adquit blocklist add https://example.com/list.txt "My feed"
+adquit gravity              re-download every enabled feed and recompile
+adquit test                 prove it works: engine self-test + live DNS probe
+adquit doctor               port/resolver/dependency/feed diagnostics
+adquit verify-lists         check that all 131 feed URLs are reachable
+adquit rules google.com     ask the engine about any hostname
+adquit passwd               rotate the dashboard password
+adquit protect on|off       repoint THIS machine's DNS at the fortress
+adquit update               pull the newest fortress, rebuild, refresh, restart
+adquit uninstall
+```
+
+Everything is also reachable without the wrapper: `python3 app.py --help`.
+
+---
+
+## Micro vs macro: the coverage matrix
+
+`adquit` tags every rule with the ad vector it kills, and the dashboard lets you switch
+vectors on or off (Settings → *Ad Coverage & Responses*, or the Coverage page).
+
+| kind | vectors | typical traffic |
+|---|---|---|
+| **macro** | `banner` `video` `popup` `native` `ctv` `push` `shopping` | the ad you can see: display units, pre/mid-roll, pop-unders & interstitials, sponsored/native slots, smart-TV & console ads, browser push ads, shopping/affiliate widgets |
+| **micro** | `pixel` `sdk` `adx` `retarget` `fingerprint` `telemetry` `email` `shortlink` `malvertising` | the ad you can’t see: 1×1 impression pixels, mobile in-app SDK traffic (AdMob/AppLovin/Unity/ironSource), RTB & prebid bidding calls, audience-sync/retargeting, canvas fingerprinting, session replay & telemetry pings, mail open pixels, ad redirector shorteners, malvertising |
+
+Turning a vector **off** only relaxes ad blocking — malware/phishing/spam feeds stay armed in
+every profile, so safety never depends on ad settings.
+
+### Decision layers (first match wins)
+
+```
+0  whitelist + self-protection          ← your own allow list, dashboard hostnames
+1  safety feeds (malware/phishing)     ← beat every anti-breakage exception
+2  unbreak exceptions (@@ rules)       ← keep ad-manager & payment hosts alive
+3  curated feeds: exact → wildcard → parent
+4  advertiser dashboards                ← ads.tiktok.com, business.facebook.com, …
+5  in-video ad endpoints                ← Google Video ad edges, player telemetry
+6  ad-tech keyword patterns             ← adsystem, doubleclick, exoclick, taboola, hotjar …
+7  ad-infrastructure host labels        ← ads./prebid./banner./interstitial. (strict+nuclear)
+8  heuristics                           ← DGA entropy, IDN homographs, typosquats, low-rep TLDs
+```
+
+Layer 6–7 run in **shadow mode** on the `balanced` profile (logged, not blocked) so you can
+see what would have broken before you arm it.
+
+### Profiles
+
+| profile | feeds | what to expect |
+|---|---|---|
+| `off` | 0 | plain resolver; blocking paused (downloads, IoT setup, troubleshooting) |
+| `balanced` | 16 | heavy ad networks + malware only, zero breakage, patterns in shadow mode |
+| `strict` | 94 | **default** — full macro+micro coverage, CNAME uncloaking, telemetry, threat feeds |
+| `family` | 105 | strict + adult/gambling/piracy + SafeSearch enforcement |
+| `nuclear` | 125 | every feed incl. regional + Hagezi Ultimate/Pro++, typosquat + low-rep TLD blocking |
+
+---
+
+## Using it
+
+**Dashboard** — `http://<box-ip>:8080`, login `admin` / the password printed at install
+(`adquit passwd` to change). Pages: Dashboard · Security Center · Blocklists · **Ad Coverage
+Matrix** · **Domain Lab** · Protection Modes · Live Query Logs · Custom Rules · Settings.
+
+**Protect your network** — set your router’s DNS (IPv4) to the fortress IP. Every device —
+phones, TVs, consoles, laptops — is covered with zero per-device setup, including apps where
+browser extensions cannot go.
+
+**Protect one machine**
+
+```bash
+sudo adquit protect          # NetworkManager / systemd-resolved / resolv.conf, auto-detected
+sudo adquit protect off      # restore
+```
+
+**API / metrics**
+
+```bash
+TOKEN="$(sudo python3 -c 'import json;print(json.load(open("/opt/adquit/data/config.json"))["api_token"])')"
+curl "http://127.0.0.1:8080/api/stats?token=$TOKEN"
+curl http://127.0.0.1:8080/metrics          # Prometheus text: rules, per-vector counts, top hosts
+curl "http://127.0.0.1:8080/api/lookup?domain=ads.exoclick.com&token=<token>"
+```
+
+`/api/block`, `/api/allow`, `/api/refresh`, `/api/mode` accept the same token — enough to
+wire the fortress into home automation or a dashboard.
+
+---
+
+## What changed in v19.0 (the “major” update)
+
+* **6× the coverage** — 50 → **131 feeds**, 10 → 21 categories, plus 16 tagged ad vectors.
+* **New engines** — wildcard zones, ad-keyword + host-label pattern engines, unbreak
+  (`@@`) exception handling, IDN homograph and typosquat detection.
+* **Zero-pixel creative sinkhole** — ad requests get an empty 1×1 GIF / empty JS-CSS body,
+  so pages stop stalling on dead ad frames.
+* **Speed** — TTL caches for verdicts *and* upstream answers, bounded thread pool instead of
+  one thread per packet, TCP DNS + proper truncation, pickled gravity cache, conditional GETs
+  with ETag/Last-Modified and parallel feed downloads.
+* **Fixed real bugs from v18** — `DNSRecord.add_rr()` does not exist in dnslib, so blocked
+  queries **never received a reply** (clients just timed out); every `hagezi` feed URL pointed
+  at a directory that no longer exists; `firebog` mirrors were used where upstream sources are
+  available; the login route accepted `admin` even after a rename; the session secret was
+  hard-coded; per-client rate maps grew without bound.
+* **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
+  rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
+  compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
+  MIT licence, 48-assertion offline test suite.
+* **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
+  `adquit stats` answers even when the web layer is down.
+
+---
+
+## Notes, limits and honesty
+
+* This is **DNS-level** blocking. It kills ad traffic at the resolver — including mobile apps,
+  smart TVs and consoles — but it cannot re-style a page, so an empty ad box may still be
+  drawn. The creative sinkhole is the mitigation: blocked creatives return empty bodies
+  instead of hanging.
+* YouTube pre-roll: the ad *servers* and player telemetry are blocked, which works for the
+  web player and many clients. In-video ads served from `googlevideo.com` itself cannot be
+  removed by DNS alone (that needs a client-side extension). Blocking is aggressive-mode
+  configurable, and YouTube never breaks: `youtube.com` is in the trusted-zone list.
+* `nuclear` will occasionally block something you want. `adquit allow <domain>` (or the
+  Domain Lab) fixes it in one command; the whitelist beats every other layer except nothing —
+  it is layer 0.
+* Feed URLs rot. `adquit verify-lists` tells you which of the 131 sources are reachable from
+  your box; a dead feed shows as an error badge in the dashboard and never breaks anything.
+* Nothing leaves your network except (optional) AI triage calls and feed downloads.
+  Query logs stay in `data/queries.jsonl`, rotated by logrotate. No telemetry, no accounts.
+
+## Development
+
+```bash
+make lint      # python + shell syntax and shellcheck
+make test      # offline test suite (48 engine/API/UI tests) + CLI contract
+make run       # foreground dev instance (dns :5353, web :8080)
+```
+
+Layout: `app.py` (the whole engine + dashboard, by design one file) · `bin/adquit` (CLI) ·
+`install.sh` / `uninstall.sh` (packaging) · `tests/` (fixtures + runners).
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). Blocklist data belongs to its respective maintainers
+([Hagezi](https://github.com/hagezi/dns-blocklists),
+[AdGuard](https://github.com/AdguardTeam/FiltersRegistry),
+[uBlock Origin](https://github.com/uBlockOrigin/uAssets),
+[OISD](https://oisd.nl), [StevenBlack](https://github.com/StevenBlack/hosts),
+[ShadowWhisperer](https://github.com/ShadowWhisperer/Blocklists),
+[Perflyst](https://github.com/Perflyst/PiHoleBlocklist) and many more).

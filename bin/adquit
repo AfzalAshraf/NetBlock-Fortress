@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+#
+# adquit - one word to run a network-wide micro & macro ad shield.
+#
+#   adquit                 start the fortress (installs itself on first run)
+#   adquit start|stop|restart|status|logs|watch
+#   adquit mode strict|family|nuclear|balanced|off
+#   adquit block doubleclick.net   |   adquit allow news.ycombinator.com
+#   adquit test            prove blocking works end-to-end
+#   adquit stats           live counters in the terminal
+#
+# Part of NetBlock Fortress - see README.md
+set -o pipefail
+
+VERSION_TAG="19.0"
+REPO="${ADQUIT_REPO:-AfzalAshraf/NetBlock-Fortress}"
+REF="${ADQUIT_REF:-main}"
+RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
+TARBALL="${ADQUIT_TARBALL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF}"
+SERVICE="adquit"
+C="\033[32m"; Y="\033[33m"; R="\033[31m"; B="\033[1m"; D="\033[2m"; N="\033[0m"
+[ -t 1 ] || { C=""; Y=""; R=""; B=""; D=""; N=""; }
+
+say()  { printf "${B}${C}==>${N} %s\n" "$*"; }
+warn() { printf "${B}${Y}warn:${N} %s\n" "$*"; }
+die()  { printf "${B}${R}error:${N} %s\n" "$*" >&2; exit 1; }
+ask()  { printf "%s " "$*"; read -r a; printf '%s' "$a"; }
+
+is_root() { [ "$(id -u)" = "0" ]; }
+
+SUDO=""
+if ! is_root; then
+    if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+fi
+
+# ---------------------------------------------------------------------------
+#  Where does the fortress live?
+# ---------------------------------------------------------------------------
+SYSTEMD=""
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    SYSTEMD="yes"
+fi
+
+if [ -n "${ADQUIT_HOME:-}" ]; then
+    HOME_DIR="$ADQUIT_HOME"
+elif [ -x /opt/adquit/app.py ] || [ -x /opt/adquit/venv/bin/python ] || is_root; then
+    HOME_DIR="/opt/adquit"
+    [ -d /opt/netblock ] && [ ! -e /opt/adquit ] && HOME_DIR="/opt/netblock"
+else
+    HOME_DIR="$HOME/.adquit"
+fi
+APP="$HOME_DIR/app.py"
+PY="$HOME_DIR/venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+STATE_DIR="$HOME_DIR/data"
+PIDFILE="$HOME_DIR/adquit.pid"
+
+export ADQUIT_HOME="$HOME_DIR"
+if [ ! -d /run/systemd/system ] || ! is_root; then
+    export ADQUIT_DNS_PORT="${ADQUIT_DNS_PORT:-5353}"
+    export ADQUIT_WEB_PORT="${ADQUIT_WEB_PORT:-8080}"
+fi
+
+using_systemd() { [ -n "$SYSTEMD" ] && is_root && [ -f "/etc/systemd/system/$SERVICE.service" ]; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+token() {
+    if [ -r "$STATE_DIR/config.json" ]; then
+        "$PY" -c "import json,sys;print(json.load(open('$STATE_DIR/config.json')).get('api_token',''))" 2>/dev/null
+    fi
+}
+
+# ---------------------------------------------------------------------------
+#  Installer (also used by `curl | sudo bash` via install.sh)
+# ---------------------------------------------------------------------------
+source_dir() { # locate a checkout containing app.py
+    for d in "$(dirname "$(readlink -f "$0")")/.." "$(dirname "$(readlink -f "$0")")" "$PWD" "$OLDPWD"; do
+        [ -f "$d/app.py" ] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+fetch_repo() { # download app.py + adquit into HOME_DIR
+    local dest="$1" tmp
+    tmp="$(mktemp -d)"
+    say "Fetching NetBlock Fortress v$VERSION_TAG from GitHub"
+    if have curl && curl -fsSL --max-time 120 "$TARBALL" -o "$tmp/src.tar.gz" 2>/dev/null; then
+        if tar -xzf "$tmp/src.tar.gz" -C "$tmp" 2>/dev/null; then
+            local root
+            root="$(find "$tmp" -maxdepth 1 -mindepth 1 -type d | head -n1)"
+            if [ -f "$root/app.py" ]; then
+                install -m 0755 "$root/app.py" "$dest/app.py"
+                [ -f "$root/bin/adquit" ] && install -D -m 0755 "$root/bin/adquit" "$dest/bin/adquit"
+                rm -rf "$tmp"; return 0
+            fi
+        fi
+    fi
+    if have curl && curl -fsSL --max-time 60 "$RAW_BASE/app.py" -o "$dest/app.py" 2>/dev/null; then
+        curl -fsSL --max-time 30 "$RAW_BASE/bin/adquit" -o "$dest/bin/adquit" 2>/dev/null || true
+        chmod 0755 "$dest/bin/adquit" 2>/dev/null || true
+        return 0
+    fi
+    have git || { rm -rf "$tmp"; die "need curl or git to download the fortress"; }
+    git clone --depth 1 -b "$REF" "https://github.com/$REPO.git" "$tmp/clone" >/dev/null 2>&1 \
+        || { rm -rf "$tmp"; die "git clone of $REPO failed"; }
+    install -m 0755 "$tmp/clone/app.py" "$dest/app.py"
+    [ -f "$tmp/clone/bin/adquit" ] && install -D -m 0755 "$tmp/clone/bin/adquit" "$dest/bin/adquit"
+    rm -rf "$tmp"
+}
+
+ensure_deps() {
+    say "Checking Python dependencies (flask, requests, dnslib)"
+    if ! "$PY" -c "import flask, requests, dnslib" 2>/dev/null; then
+        $SUDO "$PY" -m pip install --quiet --upgrade flask requests dnslib 2>/dev/null \
+            || $SUDO "$PY" -m pip install --quiet --user flask requests dnslib 2>/dev/null \
+            || $SUDO "$PY" -m pip install --quiet --break-system-packages flask requests dnslib \
+            || die "pip install failed - run: python3 -m pip install flask requests dnslib"
+    fi
+}
+
+install_cli_link() {
+    local target="/usr/local/bin/adquit"
+    [ -w /usr/local/bin ] || target="$HOME/.local/bin/adquit"
+    mkdir -p "$(dirname "$target")"
+    cp "$HOME_DIR/bin/adquit" "$target" 2>/dev/null || true
+    chmod 0755 "$target" 2>/dev/null || true
+    printf '  %scommand:%N %sadquit%s now available at %s\n' "$D" "$B" "$N" "$target"
+}
+
+write_unit() {
+    local unit="/etc/systemd/system/$SERVICE.service"
+    say "Installing systemd unit $unit"
+    cat > "$unit" <<UNIT
+[Unit]
+Description=NetBlock Fortress - network-wide micro & macro ad shield
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ADQUIT_HOME=$HOME_DIR
+Environment=ADQUIT_NO_PIP=1
+ExecStart=$PY $APP --serve
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    [ -f /etc/systemd/system/netblock.service ] && {
+        warn "migrating the legacy 'netblock' service"
+        systemctl stop netblock 2>/dev/null || true
+        systemctl disable netblock 2>/dev/null || true
+        rm -f /etc/systemd/system/netblock.service
+        systemctl daemon-reload
+    }
+    cat > "/etc/logrotate.d/adquit" 2>/dev/null <<LOG || true
+$STATE_DIR/adquit.log $STATE_DIR/queries.jsonl {
+    size 10M
+    rotate 2
+    compress
+    missingok
+    notifempty
+}
+LOG
+}
+
+cmd_install() {
+    local mode="strict" with_lists=1 user_mode="" pw="" already=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --user) user_mode=1 ;;
+            --mode) mode="${2:-strict}"; shift ;;
+            --password) pw="$2"; shift ;;
+            --no-lists) with_lists=0 ;;
+            --already-elevated) already=1 ;;
+            *) warn "ignoring unknown flag: $1" ;;
+        esac
+        shift
+    done
+    if [ -n "$user_mode" ]; then
+        HOME_DIR="$HOME/.adquit"
+    elif ! is_root && [ -n "$SUDO" ] && [ -z "$already" ]; then
+        say "elevating with sudo"
+        exec $SUDO env ADQUIT_HOME="${ADQUIT_HOME:-}" ADQUIT_REF="$REF" ADQUIT_REPO="$REPO" \
+            bash "$0" install "$@" --already-elevated
+    elif ! is_root && [ -z "$SUDO" ]; then
+        warn "no root available - installing in $HOME/.adquit (user mode)"
+        HOME_DIR="$HOME/.adquit"
+    fi
+    export ADQUIT_HOME="$HOME_DIR"
+    APP="$HOME_DIR/app.py"
+    STATE_DIR="$HOME_DIR/data"
+    PIDFILE="$HOME_DIR/adquit.pid"
+    PY="$HOME_DIR/venv/bin/python"
+    [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+    [ -n "$PY" ] || die "python3 is required - install it first (apt install python3 python3-venv)"
+
+    mkdir -p "$HOME_DIR/bin" "$STATE_DIR/lists"
+    if [ -d /opt/netblock ] && [ ! -e /opt/adquit ] && is_root; then
+        say "migrating a v18 install from /opt/netblock"
+        ln -sfn /opt/netblock /opt/adquit
+        HOME_DIR=/opt/netblock; export ADQUIT_HOME="$HOME_DIR"
+        APP="$HOME_DIR/app.py"; STATE_DIR="$HOME_DIR/data"; PIDFILE="$HOME_DIR/adquit.pid"
+    fi
+    local src; src="$(source_dir)" || src=""
+    if [ -n "$src" ] && [ "$src" != "$HOME_DIR" ]; then
+        say "installing from local checkout: $src"
+        install -m 0755 "$src/app.py" "$HOME_DIR/app.py"
+        [ -f "$src/bin/adquit" ] && install -D -m 0755 "$src/bin/adquit" "$HOME_DIR/bin/adquit"
+        [ -d "$src/data/lists" ] && cp -rn "$src/data/lists/." "$STATE_DIR/lists/" 2>/dev/null
+    else
+        fetch_repo "$HOME_DIR"
+    fi
+    if [ ! -d "$HOME_DIR/venv" ] && have python3; then
+        say "creating a private virtualenv"
+        python3 -m venv "$HOME_DIR/venv" >/dev/null 2>&1 || true
+    fi
+    [ -x "$HOME_DIR/venv/bin/python" ] && PY="$HOME_DIR/venv/bin/python"
+    export PY
+    ensure_deps
+    [ -n "$pw" ] && "$PY" "$HOME_DIR/app.py" --passwd "$pw" >/dev/null 2>&1
+    "$PY" "$HOME_DIR/app.py" --mode "$mode" >/dev/null 2>&1
+    if is_root && [ -n "$SYSTEMD" ]; then write_unit; fi
+    if is_root; then install_cli_link; fi
+    if [ "$with_lists" = "1" ]; then
+        say "pulling blocklists in the background (first run downloads a few hundred MB)"
+        ADQUIT_HOME="$HOME_DIR" start_detached "$STATE_DIR/gravity.log" "$PY" "$APP" --update-lists
+    fi
+    say "installed into $HOME_DIR"
+    cmd_start || true
+    print_ready
+}
+
+print_ready() {
+    local ip port user
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [ -n "$ip" ] || ip="$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)"
+    port="$("$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('web_port',8080))" 2>/dev/null || echo "${ADQUIT_WEB_PORT:-8080}")"
+    user="$("$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('admin_username','admin'))" 2>/dev/null || echo admin)"
+    printf '\n%s%s NetBlock Fortress is armed %s\n' "$B" "$C" "$N"
+    printf '   dashboard   http://%s:%s  (user %s)\n' "$ip" "$port" "$user"
+    printf '   dns server  %s:%s\n' "$ip" "${ADQUIT_DNS_PORT:-53}"
+    printf '   manage with %sadquit stats%s / %sadquit help%s\n\n' "$B" "$N" "$B" "$N"
+    printf '   point your router or devices at %s%s%s to protect every app on the network\n' "$Y" "$ip" "$N"
+    printf '   protect this machine only:      %ssudo adquit protect%s\n\n' "$Y" "$N"
+}
+
+# ---------------------------------------------------------------------------
+#  Service control
+# ---------------------------------------------------------------------------
+port_busy() { # is something already listening on a tcp port?
+    local p="$1"
+    if have ss; then ss -lnt 2>/dev/null | grep -q ":$p "; return $?; fi
+    if have netstat; then netstat -lnt 2>/dev/null | grep -q ":$p "; return $?; fi
+    return 1
+}
+
+web_port() {
+    "$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('web_port',8080))" 2>/dev/null \
+        || printf '%s' "${ADQUIT_WEB_PORT:-8080}"
+}
+
+health_ok() {
+    local p; p="$(web_port)"
+    curl -fsS --max-time 2 "http://127.0.0.1:$p/api/health" >/dev/null 2>&1
+}
+
+running() {
+    if using_systemd; then
+        systemctl is-active --quiet "$SERVICE" && return 0
+        health_ok && return 0
+        return 1
+    fi
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    health_ok
+}
+
+wait_healthy() { # up to ~15s
+    local i
+    for i in $(seq 1 30); do
+        health_ok && return 0
+        [ -f "$PIDFILE" ] && ! kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && return 1
+        sleep 0.5
+    done
+    health_ok
+}
+
+start_detached() { # background a command so it survives this shell
+    local log="$1"; shift
+    if have setsid; then
+        setsid "$@" >> "$log" 2>&1 < /dev/null &
+    else
+        nohup "$@" >> "$log" 2>&1 < /dev/null &
+    fi
+    echo $! > "$PIDFILE"
+}
+
+cmd_start() {
+    if [ ! -f "$APP" ]; then
+        say "first run: installing the fortress"
+        cmd_install --already-elevated
+        return $?
+    fi
+    mkdir -p "$STATE_DIR"
+    if using_systemd; then
+        $SUDO systemctl start "$SERVICE"
+        wait_healthy || { $SUDO journalctl -u "$SERVICE" -n 20 --no-pager; die "service did not become healthy"; }
+        printf '%s✔ fortress live%s  dashboard http://127.0.0.1:%s  (systemd unit: %s)\n' \
+            "$C" "$N" "$(web_port)" "$SERVICE"
+        return 0
+    fi
+    if running; then
+        warn "already running (dashboard :$(web_port))"
+        return 0
+    fi
+    local dp; dp="${ADQUIT_DNS_PORT:-53}"
+    if port_busy "$dp" && ! health_ok; then
+        warn "udp/tcp $dp is already bound - another resolver (or an old fortress) owns it"
+    fi
+    ADQUIT_HOME="$HOME_DIR" start_detached "$HOME_DIR/adquit.out" "$PY" "$APP" --serve
+    if wait_healthy; then
+        printf '%s✔ fortress live%s  dashboard http://127.0.0.1:%s  dns :%s  pid %s\n' \
+            "$C" "$N" "$(web_port)" "$dp" "$(cat "$PIDFILE")"
+    else
+        printf '%sfailed to start%s - last lines of %s:\n' "$R" "$N" "$HOME_DIR/adquit.out"
+        tail -n 12 "$HOME_DIR/adquit.out" 2>/dev/null | sed 's/^/    /'
+        return 1
+    fi
+}
+
+cmd_stop() {
+    if using_systemd; then
+        $SUDO systemctl stop "$SERVICE" 2>/dev/null || true
+    fi
+    if [ -f "$PIDFILE" ]; then
+        local pid; pid="$(cat "$PIDFILE" 2>/dev/null)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+            printf '%sstopped%s\n' "$Y" "$N"
+            rm -f "$PIDFILE"
+            return 0
+        fi
+        rm -f "$PIDFILE"
+    fi
+    if health_ok; then
+        pkill -f "$APP --serve" 2>/dev/null || true
+        printf '%sstopped%s\n' "$Y" "$N"
+    else
+        warn "not running"
+    fi
+}
+
+cmd_restart() { cmd_stop; sleep 1; cmd_start; }
+
+cmd_status() {
+    printf '%sNetBlock Fortress %s%s\n' "$B" "$VERSION_TAG" "$N"
+    printf '  home     %s\n' "$HOME_DIR"
+    printf '  python   %s\n' "$PY"
+    printf '  runner   %s\n' "$(using_systemd && echo systemd || echo 'pid file')"
+    if running; then
+        printf '  state    %slive%s  dashboard http://127.0.0.1:%s\n' "$C" "$N" "$(web_port)"
+    else
+        printf '  state    %sdown%s\n' "$R" "$N"
+    fi
+    if [ -f "$STATE_DIR/config.json" ]; then
+        "$PY" - "$STATE_DIR/config.json" <<'PYX' || true
+import json, sys
+c = json.load(open(sys.argv[1]))
+print("  mode     %s" % c.get("block_mode"))
+print("  dns      :%s -> %s   web :%s" % (c.get("dns_port"), c.get("dns_upstream"), c.get("web_port")))
+print("  feeds    %s enabled | sinkhole %s" % (len(c.get("enabled_lists", [])), c.get("sinkhole_mode")))
+for k in ("macro_ads", "micro_ads", "ctv_ads", "push_ads", "invideo_ads", "email_tracking",
+          "adtech_endpoints", "pattern_engine"):
+    print("  %-8s %s" % (k, "armed" if c.get(k) else "off"))
+PYX
+    fi
+    [ -f "$STATE_DIR/snapshot.json" ] && "$PY" - "$STATE_DIR/snapshot.json" <<'PYX' || true
+import json, sys
+s = json.load(open(sys.argv[1]))
+print("  traffic  %s queries, %s blocked (%s%%), %s clients"
+      % (s.get("total"), s.get("blocked"),
+         round(s.get("blocked", 0) * 100.0 / max(1, s.get("total", 1)), 1), s.get("clients")))
+print("  rules    %s exact + %s wildcard zones" % (s.get("rules"), s.get("wildcards")))
+PYX
+}
+
+cmd_logs() {
+    if using_systemd; then exec $SUDO journalctl -u "$SERVICE" -n "${1:-120}" --no-pager -f
+    elif [ -f "$HOME_DIR/adquit.out" ]; then exec tail -n "${1:-120}" -f "$HOME_DIR/adquit.out"
+    else die "no log file yet (service is not running through adquit)"; fi
+}
+
+cmd_watch() {
+    exec "$PY" "$APP" --watch
+}
+
+cmd_stats() { "$PY" "$APP" --stats; }
+
+# ---------------------------------------------------------------------------
+#  Engine control
+# ---------------------------------------------------------------------------
+run_as_engine() { # run app.py subcommand with the right interpreter/home
+    [ -f "$APP" ] || { say "installing first"; cmd_install --already-elevated; }
+    "$PY" "$APP" "$@"
+}
+
+cmd_update() {
+    [ -f "$APP" ] || die "not installed yet - run: adquit install"
+    say "Updating fortress binaries"
+    fetch_repo "$HOME_DIR"
+    [ -f "$HOME_DIR/bin/adquit" ] && { cp -f "$HOME_DIR/bin/adquit" /usr/local/bin/adquit 2>/dev/null || true; }
+    ensure_deps
+    run_as_engine --rebuild
+    if running; then cmd_restart; fi
+    say "updating gravity (this downloads every enabled feed)"
+    start_detached "$STATE_DIR/gravity.log" "$PY" "$APP" --update-lists
+    printf '  feed pull started in the background (log: %s)\n' "$HOME_DIR/data/gravity.log"
+}
+
+cmd_gravity() { run_as_engine --update-lists "$@"; }
+cmd_test()   { run_as_engine --test "$@"; }
+cmd_doctor() { run_as_engine --doctor "$@"; }
+cmd_verify() { run_as_engine --verify-lists "$@"; }
+cmd_rules()  { run_as_engine --rules "$@"; }
+cmd_top()    { run_as_engine --top "$@"; }
+cmd_mode()   { run_as_engine --mode "$@"; if running; then cmd_restart; fi; }
+cmd_block()  { run_as_engine --block "$@"; }
+cmd_allow()  { run_as_engine --allow "$@"; }
+cmd_unblock(){ run_as_engine --unblock "$@"; }
+cmd_passwd() { run_as_engine --passwd "$@"; }
+cmd_feed()   {
+    local url="$1" name="${2:-}"
+    [ -n "$url" ] || die "usage: adquit blocklist add <url> [name]"
+    "$PY" - "$STATE_DIR/config.json" "$url" "$name" <<'PYX'
+import json, sys, hashlib, pathlib
+cfg_path, url, name = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.load(open(cfg_path))
+lid = "custom_" + hashlib.sha256(url.encode()).hexdigest()[:8]
+feeds = dict(cfg.get("custom_lists") or {})
+feeds[lid] = {"name": name or url.split("/")[2:][-1][:40], "url": url, "cat": "ads", "vec": "banner"}
+cfg["custom_lists"] = feeds
+if lid not in cfg.get("enabled_lists", []):
+    cfg["enabled_lists"] = list(cfg.get("enabled_lists", [])) + [lid]
+pathlib.Path(cfg_path).write_text(json.dumps(cfg, indent=2))
+print("[+] added feed", lid)
+PYX
+    run_as_engine --update-lists
+}
+
+# ---------------------------------------------------------------------------
+#  Point this machine (or the network) at the fortress
+# ---------------------------------------------------------------------------
+cmd_protect() {
+    is_root || { [ -n "$SUDO" ] && exec $SUDO bash "$0" protect "$@" || die "needs root"; }
+    local action="${1:-on}" port="${ADQUIT_DNS_PORT:-53}"
+    if have resolvctl || have systemctl && [ -d /run/systemd/system ]; then :; fi
+    case "$action" in
+        on)
+            if have nmcli && nmcli -t -f NAME c show --active 2>/dev/null | head -n1 | grep -q .; then
+                local con; con="$(nmcli -t -f NAME c show --active | head -n1)"
+                say "NetworkManager connection '$con' -> DNS 127.0.0.1"
+                nmcli connection modify "$con" ipv4.dns "127.0.0.1" ipv4.ignore-auto-dns yes
+                nmcli connection up "$con" >/dev/null 2>&1 || true
+            elif have resolvectl; then
+                local link; link="$(resolvectl status 2>/dev/null | awk '/Link/{print $2; exit}')"
+                say "systemd-resolved link ${link:-all} -> DNS 127.0.0.1:$port"
+                resolvectl dns "${link:-}" "$port" 2>/dev/null || resolvectl dns global 127.0.0.1
+                resolvectl domain "${link:-}" "~." 2>/dev/null || true
+            else
+                printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf.adquit
+                cp -f /etc/resolv.conf "/etc/resolv.conf.adquit.bak" 2>/dev/null || true
+                printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+                say "wrote /etc/resolv.conf (backup: /etc/resolv.conf.adquit.bak)"
+            fi
+            ;;
+        off)
+            if have resolvectl; then resolvectl revert all 2>/dev/null || true; fi
+            if have nmcli; then
+                local con; con="$(nmcli -t -f NAME c show --active 2>/dev/null | head -n1)"
+                [ -n "$con" ] && nmcli connection modify "$con" ipv4.dns "" ipv4.ignore-auto-dns no \
+                    && nmcli connection up "$con" >/dev/null 2>&1 || true
+            fi
+            [ -f /etc/resolv.conf.adquit.bak ] && cp -f /etc/resolv.conf.adquit.bak /etc/resolv.conf \
+                && say "restored /etc/resolv.conf"
+            ;;
+        *) die "usage: adquit protect on|off" ;;
+    esac
+}
+
+cmd_uninstall() {
+    is_root || { [ -n "$SUDO" ] && exec $SUDO bash "$0" uninstall || die "needs root"; }
+    if using_systemd; then
+        systemctl stop "$SERVICE" 2>/dev/null || true
+        systemctl disable "$SERVICE" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$SERVICE.service" /etc/logrotate.d/adquit
+        systemctl daemon-reload
+    fi
+    running && kill "$(cat "$PIDFILE")" 2>/dev/null
+    local keep=""
+    [ "${1:-}" = "--keep-data" ] && keep=1
+    if [ -z "$keep" ]; then rm -rf "$HOME_DIR"; else rm -f "$APP" "$HOME_DIR/bin/adquit"; fi
+    rm -f /usr/local/bin/adquit
+    warn "uninstalled. If you pointed your router at this box, restore its DNS."
+}
+
+usage() {
+    cat <<USAGE
+${B}adquit${N} - NetBlock Fortress v$VERSION_TAG ("$D Omni-Shield $N")
+One command for a network-wide ad + tracker shield: every micro-ad pixel,
+SDK handshake and macro banner/ad-video request on your LAN dies at the DNS layer.
+
+${B}START / STOP${N}
+  adquit                    start the fortress (auto-installs on first run)
+  adquit start | stop | restart | status | logs | watch
+  adquit run                run in the foreground (no service, no systemd)
+
+${B}PROTECTION${N}
+  adquit mode <name>        off | balanced | strict | family | nuclear
+  adquit block <domain>...  add to your own blacklist (wildcards ok)
+  adquit allow <domain>...  never block a domain again
+  adquit unblock <domain>   remove a custom block rule
+  adquit blocklist add <url> [name]     import any hosts/adblock feed
+
+${B}MAINTENANCE${N}
+  adquit install [--mode strict] [--user]   (re)install / upgrade in place
+  adquit update             pull the latest fortress + refresh feeds
+  adquit gravity            re-download every enabled blocklist
+  adquit test [domain]      prove blocking works (engine + live resolver)
+  adquit doctor             config, port, feed and dependency diagnostics
+  adquit verify-lists       check every feed URL is reachable
+  adquit stats | top [n] | rules <domain>...
+  adquit passwd [new]       change the dashboard password
+  adquit protect on|off     point THIS machine's DNS at the fortress
+  adquit uninstall [--keep-data]
+
+${B}AFTER INSTALLING${N}
+  set your router's DNS to this machine's IP and every device is covered,
+  or run 'sudo adquit protect' to protect just this machine.
+
+  one-line install on a fresh box:
+    curl -fsSL ${RAW_BASE%/*}/install.sh | sudo bash
+USAGE
+}
+
+cmd_run() {
+    [ -f "$APP" ] || { say "installing first"; cmd_install --already-elevated --no-lists; }
+    export ADQUIT_HOME="${ADQUIT_HOME:-$HOME_DIR}"
+    say "foreground run - Ctrl-C to stop (dashboard http://127.0.0.1:${ADQUIT_WEB_PORT:-8080})"
+    exec "$PY" "$APP" --serve
+}
+
+case "${1:-}" in
+    ""|start)      cmd_start ;;
+    stop)          cmd_stop ;;
+    restart)       cmd_restart ;;
+    status)        cmd_status ;;
+    logs)          shift; cmd_logs "$@" ;;
+    watch)         cmd_watch ;;
+    run)           cmd_run ;;
+    install)       shift; cmd_install "$@" ;;
+    update|upgrade) cmd_update ;;
+    gravity|pull|update-lists) shift; cmd_gravity "$@" ;;
+    mode)          shift; cmd_mode "$@" ;;
+    block)         shift; cmd_block "$@" ;;
+    allow|unblock-domain) shift; cmd_allow "$@" ;;
+    unblock)       shift; cmd_unblock "$@" ;;
+    blocklist|feed) shift; case "${1:-add}" in add) shift; cmd_feed "$@";; *) cmd_feed "${1:-}";; esac ;;
+    test|self-test) shift; cmd_test "$@" ;;
+    doctor)        shift; cmd_doctor "$@" ;;
+    verify|verify-lists) shift; cmd_verify "$@" ;;
+    stats)         cmd_stats ;;
+    json)          run_as_engine --json ;;
+    top)           shift; cmd_top "$@" ;;
+    rules)         shift; cmd_rules "$@" ;;
+    passwd|password) shift; cmd_passwd "$@" ;;
+    protect)       shift; cmd_protect "$@" ;;
+    uninstall|remove) shift; cmd_uninstall "$@" ;;
+    version|-v|--version) printf 'adquit %s (NetBlock Fortress %s)\n' "$VERSION_TAG" "$VERSION_TAG" ;;
+    help|-h|--help) usage ;;
+    *) printf '%sunknown command: %s%s\n\n' "$R" "${1:-}" "$N" >&2; usage; exit 2 ;;
+esac

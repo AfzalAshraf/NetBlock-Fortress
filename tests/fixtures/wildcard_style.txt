@@ -1,0 +1,5 @@
+! OISD "domainswild" flavour + leading-dot zones
+*ads.wildcard-prefix.com
+*cdn.wildcdn.net
+.doubleclick-parent.com
+*track.subdomains.example
