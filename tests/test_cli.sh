@@ -7,10 +7,32 @@ export ADQUIT_HOME="$TMP" ADQUIT_NO_PIP=1 ADQUIT_DNS_PORT=5398 ADQUIT_WEB_PORT=1
 BIN="$REPO/bin/adquit"
 fails=0
 
-check() { # check <label> <cmd...>  (time-bounded: a wedged subcommand must never hang CI)
+check() { # check <label> <cmd...>  - time-bounded, timed, and self-reporting
     local label="$1"; shift
-    if timeout 60 "$@" >/dev/null 2>&1; then printf '  \033[32m✔\033[0m %s\n' "$label"
-    else printf '  \033[31m✘\033[0m %s\n' "$label"; fails=$((fails + 1)); fi
+    local out rc t0 t1
+    t0=$(date +%s)
+    out="$(timeout 90 "$@" 2>&1)"; rc=$?
+    t1=$(date +%s)
+    if [ "$rc" = "0" ]; then
+        printf '  \033[32m✔\033[0m %s \033[2m(%ss)\033[0m\n' "$label" "$((t1 - t0))"
+    else
+        printf '  \033[31m✘\033[0m %s \033[31m(exit %s after %ss)\033[0m\n' "$label" "$rc" "$((t1 - t0))"
+        printf '%s\n' "$out" | tail -n 10 | sed 's/^/      | /'
+        fails=$((fails + 1))
+        # GitHub swallows job logs behind a blob host; annotations and the step summary do not,
+        # so a red CI run is still diagnosable from `gh api .../check-runs/<id>/annotations`.
+        if [ -n "${GITHUB_ACTIONS:-}" ]; then
+            printf '::error::CLI contract: "%s" exited %s after %ss\n' "$label" "$rc" "$((t1 - t0))"
+            printf '%s\n' "$out" | tail -n 5 | while IFS= read -r line; do
+                [ -n "$line" ] && printf '::error::  %s\n' "${line:0:180}"
+            done
+        fi
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            { printf '### ✘ `%s`\n\nexit `%s` after `%ss`\n\n```\n%s\n```\n\n' \
+                    "$label" "$rc" "$((t1 - t0))" "$(printf '%s\n' "$out" | tail -n 40)"
+            } >> "$GITHUB_STEP_SUMMARY"
+        fi
+    fi
 }
 
 printf '\n\033[1m  adquit CLI contract\033[0m\n'
