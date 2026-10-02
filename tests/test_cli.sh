@@ -37,7 +37,10 @@ check() { # check <label> <cmd...>  - time-bounded, timed, and self-reporting
 
 printf '\n\033[1m  adquit CLI contract\033[0m\n'
 check "help renders"              bash -c "$BIN help | grep -q 'START / STOP'"
-check "version string"            bash -c "$BIN version | grep -q '19.0'"
+VER="$(sed -n 's/^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$REPO/app.py" | head -n1)"
+check "version string"            bash -c "$BIN version | grep -q '$VER'"
+check "CLI, engine and installer agree on the version" \
+      bash -c "grep -q 'VERSION_TAG=\"$VER\"' '$REPO/bin/adquit' && grep -q 'INSTALLER_VERSION=\"$VER\"' '$REPO/install.sh'"
 check "bash -n bin/adquit"        bash -n "$REPO/bin/adquit"
 check "bash -n install.sh"        bash -n "$REPO/install.sh"
 check "bash -n uninstall.sh"      bash -n "$REPO/uninstall.sh"
@@ -64,14 +67,26 @@ check "adquit mode strict accepted"         bash -c "$BIN mode strict >/dev/null
 cat > "$TMP/helpers_test.sh" <<'HELPERTEST'
 set -e
 REPO="$1"; BIN="$2"; TMP="$3"
-sed -n '/^app_version()/,/^}/p;/^ver_ge()/,/^}/p;/^detect_channel()/,/^}/p' "$BIN" > "$TMP/helpers.sh"
+sed -n '/^app_version()/,/^}/p;/^ver_ge()/,/^}/p;/^update_decision()/,/^}/p;/^detect_channel()/,/^}/p' "$BIN" > "$TMP/helpers.sh"
 # shellcheck disable=SC1090
 . "$TMP/helpers.sh"
-[ "$(app_version "$REPO/app.py")" = "19.0" ]                       # stamp parse
+STAMP="$(sed -n 's/^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$REPO/app.py" | head -n1)"
+[ -n "$STAMP" ]                                                     # stamp discoverable
+[ "$(app_version "$REPO/app.py")" = "$STAMP" ]
 printf 'VERSION = "18.0"\n' > "$TMP/old.py"
 [ "$(app_version "$TMP/old.py")" = "18.0" ]                         # older stamp
-ver_ge 19.0 19.0; ver_ge 20.1 19.0; ver_ge 19.0 19.0-rc1
-! ver_ge 18.0 19.0                                                  # downgrade refused
+printf '# comment\n  VERSION   = "19.2"   # trailing note\n' > "$TMP/odd.py"
+[ "$(app_version "$TMP/odd.py")" = "19.2" ]                         # tolerant parse
+ver_ge "$STAMP" "$STAMP"; ver_ge 20.1 "$STAMP"                      # equal is NOT a downgrade
+ver_ge "$STAMP" "$STAMP-rc1"                                        # a pre-release reads as its base
+! ver_ge 18.0 "$STAMP"                                              # real downgrade refused
+# the decision the update acts on (this is what used to refuse v19.0 -> v19.0)
+[ "$(update_decision "$STAMP" "$STAMP" same same)" = skip ]        # unchanged engine: no restart
+[ "$(update_decision "$STAMP" "$STAMP" old new)" = go ]            # same stamp, newer code = branch life
+[ "$(update_decision "$STAMP" 18.0 x y)" = refuse ]                # channel behind us
+[ "$(update_decision 18.0 "$STAMP" x y)" = go ]                    # channel ahead
+[ "$(update_decision "$STAMP" "" x y)" = nostamp ]                 # v18 / not-Python channel
+[ "$(update_decision "" "$STAMP" "" y)" = go ]                      # nothing installed yet
 echo team/xyz > "$TMP/home/.channel"
 HOME_DIR="$TMP/home" ADQUIT_REF= sh -c '. "$0/helpers.sh"; [ "$(detect_channel)" = "team/xyz" ]' "$TMP"
 HOME_DIR="$TMP/home" ADQUIT_REF=pinned/branch sh -c '. "$0/helpers.sh"; [ "$(detect_channel)" = "pinned/branch" ]' "$TMP"
@@ -93,8 +108,9 @@ check "adquit export ublock writes a list" bash -c "
     ! grep -q '^||gstatic.com\^$' '$TMP/sub.txt'"
 check "adquit intel answers about a domain" bash -c "'$BIN' intel doubleclick.net | grep -q BLOCK"
 check "adquit lan prints reachable URLs"    bash -c "'$BIN' lan | grep -E -q 'http://(localhost|127)'"
-check "adquit start reports honestly when deps/service are absent" bash -c "
-    '$BIN' --version | grep -q 19.0"
+check "adquit --version answers with no install at all" bash -c "
+    '$BIN' --version | grep -q '$VER'
+"
 check "adquit test (offline, no live)"      "$BIN" test --no-live
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"

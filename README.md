@@ -12,12 +12,12 @@ Then, on that machine, forever:
 adquit            # start (auto-installs itself if you skipped the one-liner)
 ```
 
-**v19.0 “Omni-Shield”** — 131 blocklist feeds, 21 categories, 16 ad vectors, a wildcard +
+**v19.1 “Omni-Shield”** — 131 blocklist feeds, 21 categories, 16 ad vectors, a wildcard +
 pattern engine for ad infrastructure that no list has seen yet, a zero-pixel creative sinkhole,
 and a `adquit` CLI that does everything: start, stop, block, allow, modes, gravity, self-test,
 doctor, stats. Single Python file, three PyPI dependencies, no database, no Docker required.
 
-![version](https://img.shields.io/badge/version-19.0-brightgreen)
+![version](https://img.shields.io/badge/version-19.1-brightgreen)
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![deps](https://img.shields.io/badge/dependencies-3-informational)
 ![license](https://img.shields.io/badge/license-MIT-yellow)
@@ -143,7 +143,8 @@ adquit lan                   why can't my laptop see the dashboard? (and fix it)
 adquit passwd               rotate the dashboard password
 adquit protect on|off       repoint THIS machine's DNS at the fortress
 adquit update               pull the newest fortress, rebuild, refresh, restart
-                            (follows the install's channel; refuses a downgrade)
+                            (follows the install's channel; "already up to date" when the
+                             engine is byte-identical, refuses only a real downgrade)
 adquit uninstall
 ```
 
@@ -293,6 +294,8 @@ wire the fortress into home automation or a dashboard.
 | `adquit: command not found` | The install never ran (row above), or the CLI is off `PATH`: `/usr/local/bin/adquit` for a root install, `~/.local/bin/adquit` for `ADQUIT_USER=1`. |
 | `ModuleNotFoundError: No module named 'flask'` (or `dnslib`, `requests`) | You ran `python3 app.py` with a bare interpreter. `adquit doctor` says exactly this and how to fix it; the installer builds a private venv so you never hand-install anything. |
 | `refusing to install app.py v18.0 …` / `no version stamp` | The installer noticed the ref is behind itself and stopped rather than half-installing. Pass `ADQUIT_REF=<branch>` or merge. |
+| `already up to date - engine vX is byte-identical` | Not an error: your channel has no newer commit. Blocklists are updated separately with `adquit gravity`. |
+| `refusing to downgrade vA -> vB` | The channel genuinely holds an **older** engine than you run (v19.1+ compares content, not just the stamp, so same-version commits update normally). Point `ADQUIT_REF` at the right branch, or `ADQUIT_FORCE=1` to allow it. |
 | `port 53 is already in use` | `adquit doctor` names the squatter (usually `systemd-resolved`); the installer writes a `DNSStubListener=no` drop-in for exactly that, or use `ADQUIT_DNS_PORT=5353`. |
 | something you need got blocked | `adquit allow <domain>` — the whitelist is layer 0 and beats every other rule; `adquit rules <domain>` shows which layer decided. |
 | feeds look dead | `adquit verify-lists` reports which of the 131 sources your box can reach; a dead feed is an error badge, never a breakage. |

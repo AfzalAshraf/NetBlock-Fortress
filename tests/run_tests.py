@@ -670,7 +670,7 @@ except BaseException as exc:               # a broken import escaping the gate
     def test_version_answers_without_deps(self):
         res = self.run_gate("--version")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("19.0", res.stdout)
+        self.assertIn(nb.VERSION, res.stdout)
         self.assertIn("without its Python deps", res.stdout)
         self.assertNotIn("Traceback", res.stderr)
 

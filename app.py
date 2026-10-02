@@ -36,7 +36,7 @@ from pathlib import Path
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "19.0"
+VERSION = "19.1"
 CODENAME = "Omni-Shield"
 CONFIG_VERSION = 19
 USER_AGENT = (

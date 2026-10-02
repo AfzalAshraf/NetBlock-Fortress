@@ -16,7 +16,7 @@ set -o pipefail
 # must replay *every* argument (`adquit block a.com b.com`), not just the verb.
 ORIG_ARGS=("$@")
 
-VERSION_TAG="19.0"
+VERSION_TAG="19.1"
 REPO="${ADQUIT_REPO:-AfzalAshraf/NetBlock-Fortress}"
 REF="${ADQUIT_REF:-main}"
 RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
@@ -382,11 +382,42 @@ start_detached() { # start the service in the background and record its pid
 }
 
 app_version() { # the VERSION stamp inside an app.py, without running python
-    sed -n 's/^VERSION *= *"\([0-9][0-9.]*\)".*/\1/p' "$1" 2>/dev/null | head -n1
+    sed -n 's/^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*["'"'"']\([0-9][0-9.]*\).*/\1/p' "$1" 2>/dev/null \
+        | tr -d '\r\n' | head -n1
 }
 
-ver_ge() { # ver_ge A B -> is version A >= version B
-    [ "$(printf '%s\n%s\n' "$B" "$A" | sort -t. -k1,1n -k2,2n | head -n1)" = "$B" ]
+ver_ge() { # ver_ge A B -> is A >= B?  Pure shell arithmetic on (major,minor,patch):
+           # a `sort | head` pipeline here made equal versions fail (SIGPIPE/locale).
+    local a="$1" b="$2" pa pb i
+    for i in 1 2 3; do
+        pa="${a%%.*}"; pb="${b%%.*}"
+        pa="${pa%%[!0-9]*}"; pb="${pb%%[!0-9]*}"
+        [ "${pa:-0}" -gt "${pb:-0}" ] && return 0
+        [ "${pa:-0}" -lt "${pb:-0}" ] && return 1
+        a="${a#*.}"; b="${b#*.}"
+    done
+    return 0
+}
+
+file_id() { # content fingerprint, so "same version, newer code" is distinguishable
+    local f="$1"
+    [ -f "$f" ] || return 1
+    if have sha256sum; then sha256sum "$f" | cut -c1-16
+    elif have shasum; then shasum "$f" | cut -c1-16
+    elif have md5sum; then md5sum "$f" | cut -c1-16
+    else wc -c < "$f" | tr -d ' \r'; fi
+}
+
+update_decision() { # update_decision OLD NEW OLDFINGERPRINT NEWFINGERPRINT
+    # nostamp : the channel has no real fortress app.py (v18, or not Python at all)
+    # skip    : byte-identical engine - nothing to do, do not bounce the resolver
+    # refuse  : the channel holds a *lower* version than what is installed
+    # go      : newer, or the same version with different code (normal on a branch)
+    local oldv="$1" newv="$2" olds="$3" news="$4"
+    [ -z "$newv" ] && { printf 'nostamp'; return 0; }
+    if [ -n "$olds" ] && [ "$olds" = "$news" ]; then printf 'skip'; return 0; fi
+    [ -z "$oldv" ] && { printf 'go'; return 0; }
+    if ver_ge "$newv" "$oldv"; then printf 'go'; else printf 'refuse'; fi
 }
 
 cmd_start() {
@@ -515,19 +546,33 @@ cmd_update() {
     # engine (a stale ref used to do exactly that). So: remember whether it was
     # live, keep the old app.py, verify the new one, restore on any doubt.
     local was_live=0; running >/dev/null 2>&1 && was_live=1
-    local old_ver new_ver backup="$APP.pre-update"
+    local old_ver new_ver old_id new_id decision backup="$APP.pre-update"
     old_ver="$(app_version "$APP")"
-    [ -n "$old_ver" ] && cp -f "$APP" "$backup" 2>/dev/null || true
+    old_id="$(file_id "$APP" 2>/dev/null || true)"
+    cp -f "$APP" "$backup" 2>/dev/null || true
     fetch_repo "$HOME_DIR"
     new_ver="$(app_version "$APP")"
-    if [ -z "$new_ver" ]; then
-        if [ -f "$backup" ]; then mv -f "$backup" "$APP"; warn "restored the previous app.py"; fi
-        die "the update produced no usable app.py from $REPO/$REF (no version stamp) - that channel is probably behind"
-    fi
-    if [ -n "$old_ver" ] && ! ver_ge "$new_ver" "$old_ver" && [ -z "${ADQUIT_FORCE:-}" ]; then
-        mv -f "$backup" "$APP" 2>/dev/null || true
-        die "refusing to downgrade v$old_ver -> v$new_ver from $REPO/$REF (set ADQUIT_FORCE=1 to allow it)"
-    fi
+    new_id="$(file_id "$APP" 2>/dev/null || true)"
+    decision="$(update_decision "$old_ver" "$new_ver" "$old_id" "$new_id")"
+    case "$decision" in
+        skip)
+            rm -f "$backup" 2>/dev/null || true
+            say "already up to date - engine v$new_ver is byte-identical to what is installed"
+            printf '  (nothing restarted, your blocklists keep running)\n'
+            printf '  fresh blocklists?  %sadquit gravity%s\n' "$B" "$N"
+            return 0 ;;
+        nostamp)
+            [ -f "$backup" ] && mv -f "$backup" "$APP"
+            die "the update produced no usable app.py from $REPO/$REF (no version stamp) - that channel is behind, or main has no v19 yet" ;;
+        refuse)
+            [ -f "$backup" ] && mv -f "$backup" "$APP"
+            die "channel $REPO/$REF holds v$new_ver but you are running v$old_ver - refusing to downgrade (ADQUIT_FORCE=1 to force)" ;;
+        go)
+            if [ "$old_ver" = "$new_ver" ]; then
+                printf '  same version stamp (v%s) but different code - applying\n' "$new_ver"
+            fi ;;
+    esac
+    if [ -n "${ADQUIT_FORCE:-}" ]; then decision=go; fi
     if ! "$PY" "$APP" --version >/dev/null 2>&1; then
         [ -f "$backup" ] && mv -f "$backup" "$APP"
         die "the updated app.py is not runnable with $PY - restored v${old_ver:-previous}; check 'adquit doctor'"

@@ -68,6 +68,14 @@
   `/opt/netblock` is migrated to `/opt/adquit`).
 
 ### v19.1 - what the first real-world installs taught us
+- **`adquit update` is content-aware now.** It refused a legitimate branch update with
+  `refusing to downgrade v19.0 -> v19.0` because it compared only the version stamp (through a
+  `sort | head` pipeline that equal versions could trip over). `update_decision` now returns
+  `skip` (byte-identical engine - do not bounce the resolver), `go` (newer *or* the same stamp
+  with different code, which is normal on a rolling branch), `refuse` (strictly lower version)
+  and `nostamp` (v18 / not-Python channel); version maths is pure shell arithmetic, and the
+  installed `app.py` is restored whenever a refusal happens. Engine/CLI/installer are stamped
+  19.1, and a contract test asserts the three agree.
 - **YouTube ad payload audit**: a user pasted the player's own ad debug blob and we measured
   the engine against every host in it. 10 ad/reporting endpoints were reachable on `strict`
   and are now in the seed - `static.googleadsserving.cn`, `pagead.google.com`,
