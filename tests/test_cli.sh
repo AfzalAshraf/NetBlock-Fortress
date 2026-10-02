@@ -7,9 +7,9 @@ export ADQUIT_HOME="$TMP" ADQUIT_NO_PIP=1 ADQUIT_DNS_PORT=5398 ADQUIT_WEB_PORT=1
 BIN="$REPO/bin/adquit"
 fails=0
 
-check() { # check <label> <cmd...>
+check() { # check <label> <cmd...>  (time-bounded: a wedged subcommand must never hang CI)
     local label="$1"; shift
-    if "$@" >/dev/null 2>&1; then printf '  \033[32m✔\033[0m %s\n' "$label"
+    if timeout 60 "$@" >/dev/null 2>&1; then printf '  \033[32m✔\033[0m %s\n' "$label"
     else printf '  \033[31m✘\033[0m %s\n' "$label"; fails=$((fails + 1)); fi
 }
 
@@ -22,7 +22,6 @@ check "bash -n uninstall.sh"      bash -n "$REPO/uninstall.sh"
 mkdir -p "$TMP/bin" "$TMP/data/lists" "$TMP/data/meta"
 cp "$REPO/app.py" "$TMP/app.py"
 cp "$REPO/tests/fixtures/hosts_style.txt" "$TMP/data/lists/fx.txt"
-"$REPO/app.py" >/dev/null 2>&1
 python3 - "$TMP" <<'PY'
 import json, sys, pathlib
 home = pathlib.Path(sys.argv[1])

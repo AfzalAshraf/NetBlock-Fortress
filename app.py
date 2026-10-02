@@ -3875,6 +3875,18 @@ def api_allow():
     return jsonify({"ok": True, "allowed": domain})
 
 
+@app.route("/api/reload", methods=["POST", "GET"])
+def api_reload():
+    """Re-read custom black/white lists and recompile gravity - what `adquit block`
+    calls so CLI changes take effect in the running resolver immediately."""
+    if not api_ok():
+        return jsonify({"error": "unauthorized"}), 401
+    load_custom_lists()
+    n = rebuild_master_blocklist()
+    flush_caches()
+    return jsonify({"ok": True, "rules": n, "wildcards": len(WILDCARDS)})
+
+
 @app.route("/api/refresh", methods=["POST", "GET"])
 def api_refresh():
     if not api_ok():
@@ -4080,6 +4092,15 @@ def cmd_doctor():
     return 1 if problems else 0
 
 
+def _notify_service():
+    """Tell a running fortress to pick up rule/config changes made from the CLI."""
+    res = _api_get("/api/reload")
+    if res.get("ok"):
+        print("[+] live service reloaded (%s rules, %s wildcard zones)"
+              % ("{:,}".format(res.get("rules", 0)), "{:,}".format(res.get("wildcards", 0))))
+    else:
+        print("[i] no live service to notify - changes apply on the next start")
+
 def cmd_stats(as_json=False):
     live = _api_get("/api/stats")
     if live.get("_error") and SNAPSHOT_FILE.exists():
@@ -4216,6 +4237,7 @@ def cli(argv):
         flush_caches()
         print("[+] blocked: %s (%s rules live)" % (", ".join(added) or "nothing new",
                                                    "{:,}".format(len(BLOCKED))))
+        _notify_service()
         return 0
     if cmd in ("--allow", "allow"):
         if not rest:
@@ -4225,6 +4247,7 @@ def cli(argv):
         rebuild_master_blocklist()
         flush_caches()
         print("[+] allowed: %s" % ", ".join(x for x in done if x))
+        _notify_service()
         return 0
     if cmd in ("--unblock",):
         if not rest:
@@ -4232,6 +4255,7 @@ def cli(argv):
             return 1
         removed = [remove_block_entry(d) for d in rest]
         print("[+] removed %s custom rules" % sum(1 for r in removed if r))
+        _notify_service()
         return 0
     if cmd in ("--set-auth",):
         if len(rest) < 2:

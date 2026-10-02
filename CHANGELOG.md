@@ -53,7 +53,9 @@
 - New profile `nuclear`; `off` profile pauses blocking without stopping the resolver;
   profile-specific pattern tuning (balanced = shadow mode).
 - Token-authenticated JSON API (`/api/stats`, `/api/lookup`, `/api/block`, `/api/allow`,
-  `/api/refresh`, `/api/mode`, `/api/health`) plus `/metrics` in Prometheus format.
+  `/api/refresh`, `/api/reload`, `/api/mode`, `/api/health`) plus `/metrics` in Prometheus format.
+- Hot reload: `adquit block|allow|unblock` pings `/api/reload`, so rules written from a shell
+  take effect in the running resolver without restarting the service.
 
 ### Security & correctness
 - Login no longer accepts the literal `admin` after the username is renamed; constant-time

@@ -116,7 +116,7 @@ adquit                      start the fortress (installs on first run)
 adquit status | stats | watch | logs | top
 adquit start | stop | restart | run
 adquit mode family          off | balanced | strict | family | nuclear
-adquit block doubleclick.net my-tracking.biz      # your own blacklist (wildcards ok)
+adquit block doubleclick.net my-tracking.biz      # your own blacklist (wildcards ok, hot-reloaded)
 adquit allow news.ycombinator.com                 # never blocked again
 adquit blocklist add https://example.com/list.txt "My feed"
 adquit gravity              re-download every enabled feed and recompile
@@ -202,7 +202,7 @@ curl http://127.0.0.1:8080/metrics          # Prometheus text: rules, per-vector
 curl "http://127.0.0.1:8080/api/lookup?domain=ads.exoclick.com&token=<token>"
 ```
 
-`/api/block`, `/api/allow`, `/api/refresh`, `/api/mode` accept the same token — enough to
+`/api/block`, `/api/allow`, `/api/refresh`, `/api/reload`, `/api/mode` accept the same token — enough to
 wire the fortress into home automation or a dashboard.
 
 ---
