@@ -576,6 +576,56 @@ class TestSubscriptionExport(unittest.TestCase):
                                 "the ?all=1 variant must never carry fewer rules")
 
 
+class TestDomainIntel(unittest.TestCase):
+    """`adquit intel` with RDAP stubbed, so the success path is covered even where the
+    network is not (the CI-only TypeError this test now catches was invisible offline)."""
+
+    class Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "events": [{"eventAction": "registration", "eventDate": "2026-09-25T00:00:00Z"},
+                           {"eventAction": "expiration", "eventDate": "2027-09-25T00:00:00Z"}],
+                "entities": [{"roles": ["registrar"],
+                              "vcardArray": ["vcard", [["fn", {}, "text", "Sneaky Registrar LLC"]]]}],
+                "status": ["client transfer prohibited"],
+                "nameservers": [{"ldhName": "ns1.scam-ads.net"}, {"ldhName": "ns2.scam-ads.net"}],
+            }
+
+    def setUp(self):
+        self._real_get = nb.requests.get
+
+    def tearDown(self):
+        nb.requests.get = self._real_get
+
+    def test_rdap_facts_are_parsed_and_cached(self):
+        nb.requests.get = lambda *a, **k: self.Resp()
+        rep = nb.intel_report("brand-new-scam.biz")
+        self.assertEqual("brand-new-scam.biz", rep["zone"])
+        self.assertEqual("Sneaky Registrar LLC", rep["rdap"]["registrar"])
+        self.assertIn("client transfer prohibited", rep["rdap"]["status"])
+        self.assertEqual(["ns1.scam-ads.net", "ns2.scam-ads.net"], rep["rdap"]["nameservers"])
+        self.assertIsNotNone(rep["rdap"].get("age_days"))
+        self.assertTrue(any("freshly" in h or "days old" in h for h in rep["hints"]), rep["hints"])
+        # a brand-new scam domain is on no list yet - that is the whole point of intel:
+        self.assertEqual("allow", rep["action"])
+        self.assertTrue(any("adquit block brand-new-scam.biz" in h for h in rep["hints"]), rep["hints"])
+        # cached on the second call (no HTTP) - a TTLCache.set() arity bug shows up here
+        nb.requests.get = lambda *a, **k: self.fail("RDAP was queried twice for one zone")
+        again = nb.intel_report("brand-new-scam.biz")
+        self.assertEqual("Sneaky Registrar LLC", again["rdap"]["registrar"])
+
+    def test_rdap_failure_is_not_fatal(self):
+        def boom(*a, **k):
+            raise OSError("no route to host")
+        nb.requests.get = boom
+        rep = nb.intel_report("totally-unknown-zone-xyz.net")
+        self.assertIn("error", rep["rdap"])
+        self.assertTrue(any("adquit block" in h for h in rep["hints"]))
+
+
 class TestDependencyGate(unittest.TestCase):
     """`--version` / `--doctor` must answer even on a box where flask/requests/dnslib
     are gone (wiped venv, bare `python3 app.py`), and starting the service must

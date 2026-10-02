@@ -275,7 +275,7 @@ wire the fortress into home automation or a dashboard.
 * **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
   rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
   compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
-  MIT licence, 51-test offline suite (engine, API, UI, dependency gate).
+  MIT licence, 59-test offline suite (engine, API, UI, exports, dependency gate).
 * **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
   `adquit stats` answers even when the web layer is down.
 * **Fails loudly, never silently** — `python3 app.py --version/--help/--doctor` still answer
@@ -319,7 +319,7 @@ wire the fortress into home automation or a dashboard.
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline suite (51 engine/API/UI/gate tests) + CLI contract
+make test      # offline suite (59 engine/API/UI/gate tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 

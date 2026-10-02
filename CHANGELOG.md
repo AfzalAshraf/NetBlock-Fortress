@@ -95,8 +95,9 @@
   answers, and otherwise dumps the service log (this is how "✔ fortress live" was lying).
 - **Colours**: `printf '...%s...' "$C"` printed literal `\033[32m` because printf only expands
   escapes in its *format*; all prompt/control colours now use ANSI-C quoting.
-- Tests: 57 offline (incl. a payload-regression class and the subscription export) + 21 CLI
-  contract checks.
+- Tests: 59 offline (payload-regression class, subscription export, RDAP intel with a stubbed
+  network) + 21 CLI contract checks; `tests/test_cli.sh` now times each check, keeps its output
+  on failure and raises `::error::` annotations + a step summary on GitHub Actions.
 
 ### Robustness at the edges (post-release hardening)
 - `python3 app.py --version / --help / --doctor` now work on a box with **no** Python deps

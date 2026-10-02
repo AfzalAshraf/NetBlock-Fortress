@@ -4178,7 +4178,7 @@ def rdap_lookup(domain, timeout=8):
                 pass
     except Exception as exc:
         return {"error": "unreachable (%s)" % type(exc).__name__}
-    RDAP_CACHE.set(zone, info)
+    RDAP_CACHE.set(zone, info, 86400)     # registration facts move slowly: cache a day
     return info
 
 

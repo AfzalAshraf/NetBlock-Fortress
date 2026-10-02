@@ -22,7 +22,7 @@ jobs:
         run: python -m pip install --quiet -r requirements.txt
       - name: Syntax
         run: python -m py_compile app.py
-      - name: Test suite (offline, 51 assertions)
+      - name: Test suite (offline, 59 assertions)
         run: python tests/run_tests.py
       - name: CLI contract
         run: bash tests/test_cli.sh
