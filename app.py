@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-NetBlock Fortress "Omni-Shield" v19.0 - network-wide micro & macro ad shield.
+NetBlock Fortress "Omni-Shield" v19.2 - network-wide micro & macro ad shield that
+also hosts your LAN: it answers your own site names and generates the reverse-proxy vhosts.
 
 Single-file application: authoritative DNS sinkhole + ad-creative sinkhole
 server + threat-intelligence web dashboard.  Runs on any Linux/macOS box with
@@ -36,7 +37,7 @@ from pathlib import Path
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "19.1"
+VERSION = "19.2"
 CODENAME = "Omni-Shield"
 CONFIG_VERSION = 19
 USER_AGENT = (
@@ -300,6 +301,16 @@ DEFAULT_CONFIG = {
     "enabled_lists": [],              # filled from registry defaults on first boot
     "custom_lists": {},               # user supplied {"id": {"name","url","cat"}}
     "always_allow": ["netblock.local", "adquit.local"],
+    # --- self-hosting on the LAN (adquit site / adquit proxy) ---
+    # names this box answers itself: {"media.lan": {"port": 8096, "proxy": true}} or
+    # {"nas.lan": {"ip": "192.168.1.40"}}. Answered BEFORE the ".lan means NXDOMAIN"
+    # rule, so a site you host is never killed by your own resolver.
+    "local_records": {},
+    # suffix -> internal server, e.g. {".lan": "192.168.1.1"}: names under it go to the
+    # router instead of the public upstream (printer.lan, nas.lan, fritz.box).
+    "lan_zones": {},
+    "answer_fortress_names": True,    # adquit.local / <hostname>.local -> this box
+    "trust_proxy": True,              # X-Forwarded-* accepted from loopback peers only
 }
 
 CFG = dict(DEFAULT_CONFIG)
@@ -2415,6 +2426,113 @@ def build_reply(question_record, q, verdict, blocked):
                         ttl=int(CFG.get("block_ttl", 300)), rdata=AAAA("::")))
     return reply, "sinkhole"
 
+def fortress_names():
+    """Hostnames that should always point at this machine for LAN clients.
+
+    `adquit lan` advertises http://<hostname>.local:8080 - but a client without mDNS
+    (Windows, most TVs) asks *us* for that name and used to get NXDOMAIN back from the
+    local-suffix guard below.
+    """
+    names = []
+    if CFG.get("answer_fortress_names", True):
+        names += ["adquit.local", "netblock.local", "fortress.local", "adquit.lan"]
+        try:
+            host = (socket.gethostname() or "").strip().lower()
+            if host:
+                names += [host + ".local", host + ".lan"]
+        except Exception:
+            pass
+    return names
+
+
+def local_record_for(qname):
+    """The config entry for this exact name (or its @ / short form), else None."""
+    recs = CFG.get("local_records")
+    if not isinstance(recs, dict) or not recs:
+        return None
+    e = recs.get(qname)
+    if e is None and qname.count(".") == 1:
+        e = recs.get("@" + qname) or recs.get(qname.split(".")[0])
+    if e is None:
+        return None
+    if isinstance(e, str):
+        e = {"ip": e}
+    return e if isinstance(e, dict) else None
+
+
+def local_record_ip(entry):
+    """What a LAN client has to dial: another machine if named, otherwise this box."""
+    ip = str(entry.get("ip") or entry.get("target") or "").strip()
+    return ip or fortress_ip()
+
+
+def build_local_reply(question, q, ip, ttl=300, ip6=""):
+    """A/AAAA for a name we host. AAAA stays empty unless an IPv6 was configured, so a
+    dual-stack client falls back to A instead of dutilessly dialing ::."""
+    reply = question.reply()
+    if q.qtype == QTYPE.A and ip:
+        reply.add_answer(RR(rname=q.qname, rtype=QTYPE.A, rclass=1, ttl=ttl, rdata=A(ip)))
+    elif q.qtype == QTYPE.AAAA and ip6:
+        reply.add_answer(RR(rname=q.qname, rtype=QTYPE.AAAA, rclass=1, ttl=ttl,
+                            rdata=AAAA(ip6)))
+    return reply
+
+
+def lan_zone_for(qname):
+    """Longest configured internal zone this name belongs to, else None."""
+    zones = CFG.get("lan_zones")
+    if not isinstance(zones, dict) or not zones:
+        return None
+    best = None
+    for suffix, target in zones.items():
+        s = str(suffix).strip().lower().lstrip(".")
+        if not s:
+            continue
+        if qname == s or qname.endswith("." + s):
+            if best is None or len(s) > len(best[0]):
+                best = (s, str(target or "").strip())
+    return best
+
+
+def resolve_lan_name(qname, qtype_str, server):
+    """Straight to the internal server - never via the public upstream, and cached for
+    only 30s so a laptop getting a new lease is not stuck behind an old answer."""
+    if not server:
+        return None
+    host, _, sport = server.partition(":")
+    port = int(sport) if sport.isdigit() else 53
+    key = ("lan", server, qname, qtype_str)
+    hit = UPSTREAM_CACHE.get(key)
+    if hit is not None:
+        return hit[0]
+    req = None
+    sock = None
+    try:
+        req = DNSRecord.question(qname, qtype_str)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2.0)
+        sock.sendto(req.pack(), (host, port))
+        data, _ = sock.recvfrom(4096)
+        ans = DNSRecord.parse(data)
+        UPSTREAM_CACHE.set(key, (ans, time.time()), 30)
+        return ans
+    except Exception:
+        empty = req.reply() if req is not None else None
+        if empty is not None:
+            empty.header.rcode = RCODE.NXDOMAIN
+        try:
+            UPSTREAM_CACHE.set(key, (empty, time.time()), 15)
+        except Exception:
+            pass
+        return empty
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
 def handle_dns_request(data, addr, send):
     global BLOCKED_QUERIES, DROPPED
     client_ip = addr[0]
@@ -2441,6 +2559,46 @@ def handle_dns_request(data, addr, send):
         send(reply.pack(), addr)
         SECURITY_EVENTS.append({"time": now_hm(), "type": "Amplification Blocked",
                                "client": client_ip, "detail": "%s %s" % (qtype_str, qname)})
+        return
+
+    # names this box hosts: answer them here, before the local-suffix guard below
+    entry = local_record_for(qname)
+    if entry is None and qname in fortress_names():
+        entry = {}
+    if entry is not None:
+        ttl = int(entry.get("ttl") or CFG.get("cache_ttl", 300))
+        reply = build_local_reply(question, q, local_record_ip(entry), ttl,
+                                  str(entry.get("ip6") or ""))
+        try:
+            send(reply.pack(), addr)
+        except Exception:
+            pass
+        _record(client_ip, qname, qtype_str, _allow("Local record"), False)
+        return
+
+    # LAN zones: the router answers these, not Cloudflare - and nothing about an
+    # internal hostname is ever leaked to a public resolver
+    zone = lan_zone_for(qname)
+    if zone:
+        ans = resolve_lan_name(qname, qtype_str, zone[1])
+        # rebuild on our own reply: dnslib's .q is read-only, and keeping our question
+        # intact is what preserves the id / edns the client sent
+        reply = question.reply()
+        if ans is not None:
+            for rr in list(getattr(ans, "rr", None) or []):
+                reply.add_answer(rr)
+            for rr in list(getattr(ans, "auth", None) or []):
+                reply.add_auth(rr)
+            for rr in list(getattr(ans, "ar", None) or []):
+                reply.add_ar(rr)
+            reply.header.rcode = ans.header.rcode
+        else:
+            reply.header.rcode = RCODE.NXDOMAIN
+        try:
+            send(reply.pack(), addr)
+        except Exception:
+            pass
+        _record(client_ip, qname, qtype_str, _allow("LAN zone .%s" % zone[0]), False)
         return
 
     # never forward link/local names upstream
@@ -2771,6 +2929,51 @@ app = Flask(__name__)
 app.secret_key = CFG.get("api_token", "netblock-fortress")
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SAMESITE="Lax",
                   SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=86400)
+
+
+class ProxyAware(object):
+    """WSGI middleware for running the dashboard behind nginx/Caddy on the same box.
+
+    Without it, every device on the LAN arrives as 127.0.0.1 - per-client stats, the
+    query log and rate limits all collapse onto the proxy - and absolute URLs built by
+    url_for() drop the prefix the app is mounted under. Only headers from a peer that
+    is literally this machine are believed, so a LAN client cannot name itself
+    somebody else by sending its own X-Forwarded-For.
+    """
+
+    LOCAL_PEERS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def __init__(self, wsgi):
+        self.wsgi = wsgi
+
+    def __call__(self, environ, start_response):
+        if CFG.get("trust_proxy", True) and (environ.get("REMOTE_ADDR") or "") in self.LOCAL_PEERS:
+            chain = environ.get("HTTP_X_FORWARDED_FOR") or ""
+            for hop in chain.split(","):
+                hop = hop.strip()
+                if hop:
+                    environ["REMOTE_ADDR"] = hop
+                    break
+            proto = (environ.get("HTTP_X_FORWARDED_PROTO") or "").split(",")[0].strip().lower()
+            if proto in ("http", "https"):
+                environ["wsgi.url_scheme"] = proto
+            prefix = (environ.get("HTTP_X_FORWARDED_PREFIX") or "").strip().rstrip("/")
+            if prefix.startswith("/") and not environ.get("SCRIPT_NAME"):
+                environ["SCRIPT_NAME"] = prefix
+            host = (environ.get("HTTP_X_FORWARDED_HOST") or "").split(",")[0].strip()
+            if host:
+                environ["HTTP_HOST"] = host
+                environ["SERVER_NAME"], _, port = host.partition(":")
+                if port:
+                    environ["SERVER_PORT"] = port
+                elif environ.get("wsgi.url_scheme") == "https":
+                    environ["SERVER_PORT"] = "443"
+                else:
+                    environ["SERVER_PORT"] = "80"
+        return self.wsgi(environ, start_response)
+
+
+app.wsgi_app = ProxyAware(app.wsgi_app)
 
 
 def is_logged_in():
@@ -4136,9 +4339,18 @@ def api_allow():
 @app.route("/api/reload", methods=["POST", "GET"])
 def api_reload():
     """Re-read custom black/white lists and recompile gravity - what `adquit block`
-    calls so CLI changes take effect in the running resolver immediately."""
+    calls so CLI changes take effect in the running resolver immediately.
+
+    ?config=1 is the cheap form: it re-reads data/config.json and clears the decision
+    cache but does not touch the feeds, so `adquit site add` / `adquit proxy install`
+    can publish a LAN name instantly instead of recompiling millions of rules."""
     if not api_ok():
         return jsonify({"error": "unauthorized"}), 401
+    if request.args.get("config"):
+        load_config()
+        flush_caches()
+        return jsonify({"ok": True, "config": True, "rules": len(BLOCKED),
+                        "wildcards": len(WILDCARDS)})
     load_custom_lists()
     n = rebuild_master_blocklist()
     flush_caches()
@@ -4791,11 +5003,25 @@ def cli(argv):
             val = int(val)
         elif isinstance(default, list):
             val = [x.strip() for x in val.split(",") if x.strip()]
+        elif isinstance(default, dict):
+            try:
+                parsed = json.loads(val)
+            except ValueError:
+                parsed = None
+            if not isinstance(parsed, dict):
+                print("[!] %s wants a JSON object, e.g." % key)
+                print('      --set local_records \'{"media.lan": {"port": 8096, "proxy": true}}\'')
+                return 1
+            val = parsed
         CFG[key] = val
         save_config()
         if key in VECTOR_SWITCH.values() or key in ("block_mode", "enabled_lists"):
             rebuild_master_blocklist()
             flush_caches()
+            _notify_service()
+        elif _api_get("/api/reload", {"config": "1"}).get("ok"):
+            print("[+] %s = %s (live service updated)" % (key, val))
+            return 0
         print("[+] %s = %s" % (key, val))
         return 0
     if cmd in ("--get",):

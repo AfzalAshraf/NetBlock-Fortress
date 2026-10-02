@@ -780,6 +780,189 @@ class TestBootFastPath(unittest.TestCase):
                          % offenders[:5])
 
 
+class TestLanSelfHosting(unittest.TestCase):
+    """`adquit site add media.lan --port 8096` must be answered by the fortress itself.
+
+    The failure mode this exists to prevent: a user hosts a site, points every device
+    at the fortress for DNS, and the resolver answers NXDOMAIN for the whole `.lan`
+    suffix (its anti-leak guard) - so the site is unreachable *because of* the blocker.
+    Published names therefore resolve before the engine runs, and names under a LAN
+    zone are forwarded to the router, never to a public resolver.
+    """
+
+    def setUp(self):
+        self.cfg = dict(nb.CFG)
+        nb.CFG.update({"local_records": {}, "lan_zones": {}, "answer_fortress_names": True,
+                       "sinkhole_ip": "192.168.1.50"})
+
+    def tearDown(self):
+        nb.CFG.clear()
+        nb.CFG.update(self.cfg)
+
+    # --- lookup helpers -----------------------------------------------------
+    def test_record_lookup_forms(self):
+        nb.CFG["local_records"] = {"media.lan": {"port": 8096}, "nas.lan": "192.168.1.40",
+                                   "@app.lan": {"port": 9000}}
+        self.assertEqual(nb.local_record_for("media.lan")["port"], 8096)
+        self.assertEqual(nb.local_record_for("nas.lan"), {"ip": "192.168.1.40"},
+                         "a bare string is a valid shorthand for an address")
+        self.assertEqual(nb.local_record_for("app.lan")["port"], 9000,
+                         "@ in a zone file must resolve as the bare host too")
+        self.assertIsNone(nb.local_record_for("whoever.lan"))
+        nb.CFG["local_records"] = "nonsense"
+        self.assertIsNone(nb.local_record_for("media.lan"), "a corrupt value must not raise")
+
+    def test_published_name_defaults_to_this_box(self):
+        nb.CFG["local_records"] = {"media.lan": {"port": 8096}}
+        self.assertEqual(nb.local_record_ip(nb.local_record_for("media.lan")), "192.168.1.50")
+        nb.CFG["local_records"]["nas.lan"] = {"ip": "192.168.1.40"}
+        self.assertEqual(nb.local_record_ip(nb.local_record_for("nas.lan")), "192.168.1.40")
+
+    def test_zone_lookup_prefers_the_longest_suffix(self):
+        nb.CFG["lan_zones"] = {"lan": "192.168.1.1", "home.lan": "192.168.1.1"}
+        self.assertEqual(nb.lan_zone_for("nas.home.lan")[0], "home.lan")
+        self.assertEqual(nb.lan_zone_for("printer.lan")[0], "lan")
+        self.assertIsNone(nb.lan_zone_for("example.com"))
+        nb.CFG["lan_zones"] = []
+        self.assertIsNone(nb.lan_zone_for("printer.lan"))
+
+    def test_aaaa_stays_empty_unless_configured(self):
+        from dnslib import DNSRecord, QTYPE
+        q = DNSRecord.question("media.lan", "A")
+        q.qtype = QTYPE.A
+        self.assertEqual(len(nb.build_local_reply(q, q.q, "192.168.1.50").rr), 1)
+        q6 = DNSRecord.question("media.lan", "AAAA")
+        self.assertEqual(len(nb.build_local_reply(q6, q6.q, "192.168.1.50").rr), 0,
+                         "no IPv6 configured must NOT mean 'dial ::'")
+        self.assertEqual(len(nb.build_local_reply(q6, q6.q, "192.168.1.50", ip6="fe80::1").rr), 1)
+
+    # --- the resolver path --------------------------------------------------
+    def _ask(self, name, qtype="A"):
+        from dnslib import DNSRecord
+        req = DNSRecord.question(name, qtype)
+        out = {}
+
+        def send(data, addr):
+            out["packet"] = data
+            out["addr"] = addr
+        nb.handle_dns_request(req.pack(), ("10.0.0.5", 5123), send)
+        self.assertIn("packet", out, "no reply for %s" % name)
+        rep = DNSRecord.parse(out["packet"])
+        return req.header.id, rep
+
+    def test_published_name_is_answered_locally(self):
+        nb.CFG["local_records"] = {"media.lan": {"port": 8096}}
+        rid, rep = self._ask("media.lan")
+        self.assertEqual(rep.header.id, rid, "the question id must come back intact")
+        self.assertEqual([str(a.rdata) for a in rep.rr], ["192.168.1.50"])
+        self.assertEqual(rep.header.rcode, 0)
+
+    def test_fortress_own_names_resolve_for_plain_unicast_clients(self):
+        _rid, rep = self._ask("adquit.lan")
+        self.assertEqual([str(a.rdata) for a in rep.rr], ["192.168.1.50"],
+                         "the URL `adquit lan` prints has to actually resolve")
+
+    def test_unmanaged_lan_name_never_reaches_a_public_resolver(self):
+        def no_ever(*a, **k):
+            raise AssertionError("LAN name leaked to the public upstream")
+        up, nb.resolve_upstream = nb.resolve_upstream, no_ever
+        try:
+            _rid, rep = self._ask("printer.lan")
+        finally:
+            nb.resolve_upstream = up
+        self.assertEqual(rep.header.rcode, nb.RCODE.NXDOMAIN)
+
+    def test_zone_names_are_forwarded_to_the_router_not_the_engine(self):
+        from dnslib import A, DNSRecord, QTYPE, RR
+        inner = DNSRecord.question("printer.lan", "A").reply()
+        inner.add_answer(RR("printer.lan", QTYPE.A, rdata=A("192.168.1.77"), ttl=30))
+        seen = []
+        up, ln, nb.resolve_upstream = nb.resolve_upstream, nb.resolve_lan_name, None
+        nb.resolve_upstream = lambda *a, **k: self.fail("public upstream consulted for a LAN zone")
+        nb.resolve_lan_name = lambda n, t, s: (seen.append((n, t, s)) or inner)
+        try:
+            nb.CFG["lan_zones"] = {"lan": "192.168.1.1"}
+            rid, rep = self._ask("printer.lan")
+        finally:
+            nb.resolve_upstream, nb.resolve_lan_name = up, ln
+        self.assertEqual(seen, [("printer.lan", "A", "192.168.1.1")])
+        self.assertEqual([str(a.rdata) for a in rep.rr], ["192.168.1.77"])
+        self.assertEqual(rep.header.id, rid, "reply must carry our question, not the router's")
+
+    def test_zone_with_a_dead_router_answers_something(self):
+        # a black hole: no answer, no exception, and no leak to the public resolver
+        nb.CFG["lan_zones"] = {"lan": "127.0.0.1:1"}
+        up, nb.resolve_upstream = nb.resolve_upstream, (
+            lambda *a, **k: self.fail("public upstream consulted for a LAN zone"))
+        try:
+            _rid, rep = self._ask("printer.lan")
+        finally:
+            nb.resolve_upstream = up
+        self.assertIn(rep.header.rcode, (nb.RCODE.NXDOMAIN, nb.RCODE.SERVFAIL))
+
+    def test_config_set_accepts_a_json_object(self):
+        cfg_path = nb.CONFIG_FILE
+        before = cfg_path.read_text() if cfg_path.exists() else None
+        try:
+            rc = nb.cli(["--set", "local_records", '{"media.lan": {"port": 8096}}'])
+            self.assertEqual(rc, 0)
+            self.assertEqual(nb.CFG["local_records"], {"media.lan": {"port": 8096}})
+            rc = nb.cli(["--set", "local_records", "not json"])
+            self.assertEqual(rc, 1, "garbage must be refused, not stored")
+        finally:
+            nb.CFG["local_records"] = {}
+            if before is not None:
+                cfg_path.write_text(before)
+            else:
+                cfg_path.unlink(missing_ok=True)
+
+
+class TestProxyAware(unittest.TestCase):
+    """Behind a reverse proxy on the same box, `request.remote_addr` must still be the
+    device that asked - and a device must not be able to claim to be someone else."""
+
+    def _env(self, peer, script_name=None, **headers):
+        env = {"REMOTE_ADDR": peer, "wsgi.url_scheme": "http", "SERVER_NAME": "adquit.lan",
+               "SERVER_PORT": "80", "REQUEST_METHOD": "GET", "PATH_INFO": "/api/health"}
+        if script_name is not None:
+            env["SCRIPT_NAME"] = script_name
+        for k, v in headers.items():
+            env["HTTP_" + k.upper().replace("-", "_")] = v
+        seen = {}
+
+        def wsgi(e, sr):
+            seen["env"] = e
+            return [b"ok"]
+        mw = nb.ProxyAware(wsgi)
+        mw(env, lambda *a: None)
+        return seen["env"]
+
+    def test_loopback_proxy_may_name_the_real_client(self):
+        env = self._env("127.0.0.1", **{"X-Forwarded-For": "203.0.113.7, 10.0.0.1",
+                                        "X-Forwarded-Proto": "https"})
+        self.assertEqual(env["REMOTE_ADDR"], "203.0.113.7")
+        self.assertEqual(env["wsgi.url_scheme"], "https")
+
+    def test_a_lan_client_cannot_impersonate_one(self):
+        env = self._env("192.168.1.80", **{"X-Forwarded-For": "8.8.8.8"})
+        self.assertEqual(env["REMOTE_ADDR"], "192.168.1.80", "spoofed header must be ignored")
+
+    def test_forwarded_prefix_becomes_script_name(self):
+        env = self._env("::1", **{"X-Forwarded-Prefix": "/adquit/"})
+        self.assertEqual(env["SCRIPT_NAME"], "/adquit")
+        env = self._env("::1", script_name="/already", **{"X-Forwarded-Prefix": "/x"})
+        self.assertEqual(env["SCRIPT_NAME"], "/already", "an existing mount wins")
+
+    def test_off_switch_is_respected(self):
+        cfg = dict(nb.CFG)
+        try:
+            nb.CFG["trust_proxy"] = False
+            env = self._env("127.0.0.1", **{"X-Forwarded-For": "203.0.113.7"})
+            self.assertEqual(env["REMOTE_ADDR"], "127.0.0.1")
+        finally:
+            nb.CFG.clear(); nb.CFG.update(cfg)
+
+
 class TestDependencyGate(unittest.TestCase):
     """`--version` / `--doctor` must answer even on a box where flask/requests/dnslib
     are gone (wiped venv, bare `python3 app.py`), and starting the service must

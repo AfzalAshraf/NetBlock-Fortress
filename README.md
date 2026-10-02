@@ -12,12 +12,14 @@ Then, on that machine, forever:
 adquit            # start (auto-installs itself if you skipped the one-liner)
 ```
 
-**v19.1 “Omni-Shield”** — 131 blocklist feeds, 21 categories, 16 ad vectors, a wildcard +
+**v19.2 “Omni-Shield”** — 131 blocklist feeds, 21 categories, 16 ad vectors, a wildcard +
 pattern engine for ad infrastructure that no list has seen yet, a zero-pixel creative sinkhole,
 and a `adquit` CLI that does everything: start, stop, block, allow, modes, gravity, self-test,
-doctor, stats. Single Python file, three PyPI dependencies, no database, no Docker required.
+doctor, stats — plus LAN self-hosting, so the box that kills your ads also answers
+`media.lan`, `nas.lan` and `dashboard.lan` and can front all of them on port 80.
+Single Python file, three PyPI dependencies, no database, no Docker required.
 
-![version](https://img.shields.io/badge/version-19.1-brightgreen)
+![version](https://img.shields.io/badge/version-19.2-brightgreen)
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![deps](https://img.shields.io/badge/dependencies-3-informational)
 ![license](https://img.shields.io/badge/license-MIT-yellow)
@@ -140,6 +142,13 @@ adquit rules google.com     ask the engine about any hostname
 adquit intel scam-ads.biz   who owns that landing page (RDAP age/registrar) + verdict
 adquit export ublock         publish the same rules as a browser filter list
 adquit lan                   why can't my laptop see the dashboard? (and fix it)
+adquit lan open [80 443]     open the dashboard (and any other LAN port) in ufw/firewalld
+adquit site add media.lan --port 8096   publish a self-hosted site by name; the fortress
+                            resolves it itself, so a 5M-rule list can never swallow it
+adquit site list | rm NAME    what is published, and take one down
+adquit lan-zone add .lan 192.168.1.1    printer.lan / nas.lan: ask the router, never a
+                            public resolver (adquit lan-zone list | rm SUFFIX)
+adquit proxy install          nginx/Caddy/Apache vhosts: every published site on one port
 adquit passwd               rotate the dashboard password
 adquit protect on|off       repoint THIS machine's DNS at the fortress
 adquit update               pull the newest fortress, rebuild, refresh, restart
@@ -241,8 +250,9 @@ adquit block scam-game-landing.com   # arm it (hot-reloaded into the running res
 **Reaching the dashboard from another device on your Wi-Fi**
 
 ```bash
-adquit lan           # what is listening, the URLs, and whether a firewall blocks them
-sudo adquit lan open # open the dashboard port in ufw/firewalld
+adquit lan                     # what is listening, the URLs, and whether a firewall blocks them
+sudo adquit lan open           # open the dashboard port in ufw/firewalld
+sudo adquit lan open 80 443    # ...and the ports your own sites will be served on
 ```
 
 Never forward `:8080` through your router. If the box is a VPS, its *provider* security group
@@ -259,6 +269,67 @@ curl "http://127.0.0.1:8080/api/lookup?domain=ads.exoclick.com&token=<token>"
 
 `/api/block`, `/api/allow`, `/api/refresh`, `/api/reload`, `/api/mode` accept the same token — enough to
 wire the fortress into home automation or a dashboard.
+
+---
+
+## Hosting your own sites behind the fortress
+
+The box that answers DNS for your whole network is the friendliest place to put the things you
+self-host: no port forwarding, no cloud, no certificate authority. Three verbs cover it.
+
+```bash
+# 1. publish a name. The fortress answers it itself - before the block engine runs.
+sudo adquit site add media.lan --port 8096              # jellyfin/qbittorrent/grafana/...
+sudo adquit site add nas.lan --ip 192.168.1.40 --no-proxy   # a site on another box
+sudo adquit site list
+
+# 2. one port for all of them: the fortress writes the vhosts, your web server does the serving
+sudo apt install nginx            # or caddy / apache2 - adquit detects which one you have
+sudo adquit proxy install --server nginx --port 80
+sudo adquit proxy status          # what is enabled, which file owns it, what it points at
+
+# 3. names you do not own: hand them to the router instead of NXDOMAIN
+sudo adquit lan-zone add .lan 192.168.1.1     # usually your router/gateway address
+```
+
+Then point the devices (or the router's DNS) at the fortress and `http://media.lan/` works from
+anywhere on the network — including on devices that already use the fortress *because* it is
+their resolver. A `site add` needs no restart: the running resolver picks the record up on the
+next query, and it is logged in the dashboard's query log as `Local record` so you can see why it
+answered.
+
+| verb | what it changes |
+|---|---|
+| `site add NAME --port P` | `local_records[NAME] = {"port": P, "host": "127.0.0.1"}` — the name answers with this box's LAN address, the vhost targets the local port |
+| `site add NAME --ip A --no-proxy` | DNS only: a name that should point elsewhere and get no vhost |
+| `site add NAME --port P --ws` | vhost gets the websocket upgrade headers (websockets, SSE, streams) |
+| `lan-zone add .lan ROUTER-IP` | names under `.lan` that you did **not** publish are forwarded to the router |
+| `proxy install [--port 80] [--server nginx]` | one managed file of vhosts, validated, reverted if it fails |
+
+`adquit.lan`, `adquit.local` and `<hostname>.local/.lan` resolve to the fortress by design (that
+is the URL `adquit lan` prints); `sudo adquit --set answer_fortress_names false` if you want them
+silent. Blocked ad hosts keep resolving to the fortress while `sinkhole_mode=fortress`, so after
+`proxy install --port 80` an ad slot is served your empty 1×1 pixel over port 80 as well — the
+blocker and the web server are the same box on purpose.
+
+**Limits, so nothing surprises you**
+
+* These names exist only while a device asks *this* resolver. A guest on another network, or a
+  laptop that switched to mobile data, gets NXDOMAIN — that is the point: no hostname of yours is
+  published to the internet.
+* Plain HTTP. `proxy install` binds a port and preserves the client's real address
+  (`X-Forwarded-For`, and the fortress trusts those headers only from a loopback peer). For
+  anything beyond your Wi-Fi, put it behind a tunnel (`tailscale`, `wireguard`) — do not forward
+  port 80 to the internet just because the vhosts are one command away.
+* Port 80/443 need root, and `--port 80` in sinkhole-fortress mode moves the zero-pixel server to
+  `sinkhole_port` 8081 automatically (the vhosts are rewritten to match) because two listeners
+  cannot share a port.
+* `proxy install` only ever writes files carrying its `adquit-managed` marker, backs up anything it
+  replaces to `*.adquit-backup`, and `proxy remove` takes exactly those files away again. It
+  validates (`nginx -t` / `caddy validate` / `apache2ctl configtest`) and restores the previous
+  config if the new one would not start.
+* Caddy is the one server it cannot wire up silently: the rendered `/etc/caddy/adquit.caddyfile`
+  needs one line in your Caddyfile (`import adquit.caddyfile`), which `proxy install` prints.
 
 ---
 

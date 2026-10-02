@@ -1,5 +1,65 @@
 # Changelog
 
+## v19.2 — the fortress also serves your own sites ("Self-Host")
+
+### LAN self-hosting
+- **`adquit site add media.lan --port 8096`** publishes a self-hosted app by name: the fortress
+  answers it from `local_records` *before* the block engine and before the anti-leak NXDOMAIN
+  guard for `.local`/`.lan`, so a 5.1M-rule list can never swallow a host you own. A running
+  resolver picks it up on the next query (no restart, no gravity rebuild — the write path goes
+  through `GET /api/reload?config=1`, which reloads config and flushes caches only), every
+  device pointed at the fortress finds it, and the dashboard query log shows *why* it answered
+  (`Local record`). `--ip`/`--no-proxy` publish a name without a vhost, `--host` retargets the
+  proxy, `--ws` adds websocket upgrade headers, `--ttl`/`--ip6`/`--note` shape the answer,
+  `site list` and `site rm` round it off. AAAA for a name without `ip6` returns NOERROR with zero
+  answers rather than a link-local address, so dual-stack clients do not dial `::` and hang.
+- **`adquit lan-zone add .lan 192.168.1.1`** — names under a zone that you did *not* publish are
+  forwarded to that resolver (usually the router, so `printer.lan` and the vendor's NAS name keep
+  working) with a 30 s positive / 15 s negative cache, longest-suffix wins, and a public resolver
+  is never asked for a name inside your network. `lan-zone list` explains the default behaviour.
+- `adquit.lan`, `adquit.local` and `<hostname>.local/.lan` now resolve to the fortress itself, so
+  the URL `adquit lan` prints actually opens (opt out: `adquit --set answer_fortress_names false`).
+
+### Reverse proxy, generated
+- **`adquit proxy install --server nginx|caddy|apache --port 80`** renders one managed file of
+  vhosts from the same registry the resolver reads: the dashboard stays reachable at its own name,
+  every published site gets a `server_name` block, and any *other* host that lands on the port is
+  sent to the zero-pixel sinkhole (fortress mode) or answered with 204 — so blocked ad domains
+  keep getting blocked instead of getting a "site not found" that confuses the engine.
+  `--dry-run` prints, `proxy status` shows the state, `proxy remove` un-winds it.
+- Detection, validation and self-healing: the target server is detected from what is installed,
+  the render is checked with `nginx -t` / `caddy validate` / `apache2ctl configtest` before reload,
+  the previous file is restored when validation fails, anything the user already had is backed up
+  to `*.adquit-backup`, and a config file without the `adquit-managed` marker is never touched
+  without `--force`. Caddy is asked (not edited) to `import adquit.caddyfile`; Apache gets the
+  sinkhole as the *first* vhost because that is what serves unmatched names, and `a2enmod
+  proxy proxy_http headers remoteip` is printed as the one-time prerequisite.
+- `--port 80` in sinkhole-fortress mode moves `sinkhole_port` to 8081 and rewrites the rendered
+  catch-all, because two listeners cannot share port 80. `sudo adquit lan open 80` (now accepting
+  any number of ports, validated as numbers) opens the firewall for the published sites.
+- `ProxyAware` WSGI middleware: behind the proxy, `request.remote_addr` is still the device that
+  asked — `X-Forwarded-For`/`-Proto`/`-Prefix` are honoured **only** from a loopback peer
+  (`trust_proxy`, on by default), so per-client stats, the query log and rate limits stay honest
+  and a LAN client cannot impersonate one.
+
+### Fixes found while proving the above
+- dnslib: `DNSRecord.q` is read-only, so forwarding a LAN answer means copying `add_answer`/
+  `add_auth`/`add_ar` and the rcode onto `question.reply()` — assigning the upstream record
+  produced a client timeout instead of an answer.
+- Caddy named matchers cannot contain dots: `@media.lan` is emitted as `@media_lan`.
+- `dash_names()` no longer mints a doubled suffix (`<host>.local.local`) on a machine whose
+  hostname already ends in `.local`/`.lan` - the dashboard vhost keeps the name it is given.
+- Proxy renderers use the CLI's effective `web_port` (env overrides included), not whatever a stale
+  `config.json` happens to hold.
+
+### Tests
+- 80 engine tests (was 66): record/zone lookup precedence, the four reply shapes, "a LAN name must
+  never reach a public resolver", zone forwarding carrying our question id, a dead router not
+  hanging the resolver, `--set` with a JSON object, and all four `ProxyAware` header rules.
+- 30 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
+  nginx render (dashboard vhost, per-site vhost, upgrade map, balanced braces, no `ServerName *`),
+  and the "refuses when not installed / bad flag" negatives.
+
 ## v19.0 "Omni-Shield" — the micro + macro release
 
 ### Coverage

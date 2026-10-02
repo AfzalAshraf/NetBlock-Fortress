@@ -100,6 +100,13 @@ grep -A10 '^elevate_for()' "$REPO/bin/adquit" | grep -q 'ADQUIT_FORCE='    # env
 grep -q 'ADQUIT_REHEALED' "$REPO/bin/adquit"                               # one-hop marker
 grep -q 'restarting the update with it' "$REPO/bin/adquit"                  # hand-off to the fetched CLI
 grep -q 'restore_update "$origin"' "$REPO/bin/adquit"                       # engine restored on every refusal
+# self-hosting: LAN names and the proxy must stay in step with the engine
+grep -q 'adquit site add media.lan' "$REPO/bin/adquit"                        # usage mentions it
+grep -q 'adquit lan-zone add' "$REPO/bin/adquit"                              # and the router zones
+grep -q 'site|lan-zone|proxy)' "$REPO/bin/adquit"                             # both elevate centrally
+grep -q 'adquit-managed' "$REPO/bin/adquit"                                    # only our own files
+grep -q 'answer_fortress_names' "$REPO/app.py"                                 # fortress names resolve
+grep -q 'local_records' "$REPO/app.py"                                          # ...and so do sites
 grep -q "refusing to install app.py" "$REPO/install.sh"
 grep -q 'bg_run "$STATE_DIR/gravity.log"' "$BIN"                   # gravity must not own the pidfile
 # a 5M-rule warm-up is not an outage: the probe waits, status says so, stop does not lie
@@ -131,6 +138,45 @@ check "adquit --version answers with no install at all" bash -c "
 check "adquit update rejects an unknown flag" bash -c "'$BIN' update --frorce 2>&1 | grep -q 'unknown option'"
 check "adquit test (offline, no live)"      "$BIN" test --no-live
 check "adquit status answers with a state line"  bash -c "'$BIN' status | grep -Eq 'state +(live|down|warming up)'"
+check "adquit site add/list/rm round-trip" bash -c "
+    '$BIN' site add media.lan --port 8096 >/dev/null &&
+    '$BIN' site list | grep -q '127.0.0.1:8096' &&
+    '$BIN' site rm media.lan >/dev/null &&
+    ! '$BIN' site list | grep -q '127.0.0.1:8096'
+"
+check "adquit site refuses a name it cannot publish" bash -c "
+    '$BIN' site add 'bad name.lan' >/dev/null 2>&1; test \$? -ne 0
+"
+check "adquit site refuses a proxied site with no port" bash -c "
+    '$BIN' site add portless.lan >/dev/null 2>&1; test \$? -ne 0
+"
+check "adquit proxy renders nginx vhosts for the effective web port" bash -c "
+    '$BIN' site add media.lan --port 8096 >/dev/null
+    '$BIN' proxy install --server nginx --port 80 --dry-run > '$TMP/nginx.conf' 2>&1
+    grep -q 'server_name media.lan;' '$TMP/nginx.conf'
+    grep -q 'proxy_pass http://127.0.0.1:$ADQUIT_WEB_PORT;' '$TMP/nginx.conf'
+    grep -q 'listen 80 default_server;' '$TMP/nginx.conf'
+    grep -q 'map \$http_upgrade' '$TMP/nginx.conf'
+    ! grep -q 'ServerName \*' '$TMP/nginx.conf'
+    awk 'BEGIN{d=0}{for(i=1;i<=length($0);i++){c=substr($0,i,1);if(c=="{")d++;else if(c=="}")d--}}END{exit d==0?0:1}' '$TMP/nginx.conf'
+    '$BIN' site rm media.lan >/dev/null
+"
+check "adquit proxy refuses a bad port and an unknown server" bash -c "
+    '$BIN' proxy install --port eight --dry-run >/dev/null 2>&1; test \$? -ne 0
+    '$BIN' proxy install --server tomcat --dry-run >/dev/null 2>&1; test \$? -ne 0
+"
+check "adquit lan open validates every port it is given" bash -c "
+    '$BIN' lan open abc >/dev/null 2>&1; test \$? -ne 0
+    '$BIN' lan open 99999 >/dev/null 2>&1; test \$? -ne 0
+    '$BIN' lan open 0 >/dev/null 2>&1; test \$? -ne 0
+"
+check "adquit lan-zone add/list/rm round-trip" bash -c "
+    '$BIN' lan-zone add lan 127.0.0.1:5399 >/dev/null &&
+    '$BIN' lan-zone list | grep -q 'lan' &&
+    grep -q '"lan_zones"' '$ADQUIT_HOME/data/config.json' &&
+    '$BIN' lan-zone rm lan >/dev/null &&
+    ! '$BIN' lan-zone list | grep -q '127.0.0.1:5399'
+"
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
 "$BIN" stop >/dev/null 2>&1
