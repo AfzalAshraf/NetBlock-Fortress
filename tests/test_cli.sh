@@ -37,6 +37,29 @@ check "adquit unblock removes it"           bash -c "$BIN unblock probe-me.examp
 check "adquit allow writes whitelist"       bash -c "$BIN allow ok-site.example >/dev/null && grep -q ok-site.example $TMP/data/custom_whitelist.txt"
 check "adquit mode nuclear accepted"        bash -c "$BIN mode nuclear >/dev/null && grep -q nuclear $TMP/data/config.json"
 check "adquit mode strict accepted"         bash -c "$BIN mode strict >/dev/null && grep -q strict $TMP/data/config.json"
+# Update-safety helpers (app_version / ver_ge / detect_channel) are unit-tested by
+# extracting them from bin/adquit - sourcing the script itself would run the CLI.
+cat > "$TMP/helpers_test.sh" <<'HELPERTEST'
+set -e
+REPO="$1"; BIN="$2"; TMP="$3"
+sed -n '/^app_version()/,/^}/p;/^ver_ge()/,/^}/p;/^detect_channel()/,/^}/p' "$BIN" > "$TMP/helpers.sh"
+# shellcheck disable=SC1090
+. "$TMP/helpers.sh"
+[ "$(app_version "$REPO/app.py")" = "19.0" ]                       # stamp parse
+printf 'VERSION = "18.0"\n' > "$TMP/old.py"
+[ "$(app_version "$TMP/old.py")" = "18.0" ]                         # older stamp
+ver_ge 19.0 19.0; ver_ge 20.1 19.0; ver_ge 19.0 19.0-rc1
+! ver_ge 18.0 19.0                                                  # downgrade refused
+echo team/xyz > "$TMP/home/.channel"
+HOME_DIR="$TMP/home" ADQUIT_REF= sh -c '. "$0/helpers.sh"; [ "$(detect_channel)" = "team/xyz" ]' "$TMP"
+HOME_DIR="$TMP/home" ADQUIT_REF=pinned/branch sh -c '. "$0/helpers.sh"; [ "$(detect_channel)" = "pinned/branch" ]' "$TMP"
+grep -q MIN_APP_VERSION "$REPO/install.sh"
+grep -q "refusing to install app.py" "$REPO/install.sh"
+grep -q 'bg_run "$STATE_DIR/gravity.log"' "$BIN"                   # gravity must not own the pidfile
+[ "$(grep -c start_detached "$BIN")" -eq 2 ]                       # definition + the one service call site
+HELPERTEST
+mkdir -p "$TMP/home"
+check "update guards: version, channel, pidfile"  bash "$TMP/helpers_test.sh" "$REPO" "$BIN" "$TMP"
 check "adquit test (offline, no live)"      "$BIN" test --no-live
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"

@@ -23,6 +23,8 @@ REF="${ADQUIT_REF:-main}"
 RAW="https://raw.githubusercontent.com/$REPO/$REF"
 TARBALL="https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF"
 SERVICE="adquit"
+INSTALLER_VERSION="19.0"          # this script
+MIN_APP_VERSION="${ADQUIT_MIN_APP:-19.0}"   # refuse to install an older engine beside a newer CLI
 HOME_DIR="${ADQUIT_HOME:-/opt/adquit}"
 PROFILE="${ADQUIT_MODE:-strict}"
 WEB_PORT="${ADQUIT_WEB_PORT:-8080}"
@@ -131,6 +133,28 @@ else
     rm -rf "$tmp"
 fi
 [ -s "$HOME_DIR/app.py" ] || fail "app.py is missing after install"
+
+# Guard the one failure that installs silently: a ref whose app.py is older than
+# this installer (e.g. main before a v19 merge, or a fork that drifted), or a
+# fetched file that is not Python at all.
+APP_VER="$("$PYBIN" -c 'import re, sys
+try:
+    src = open(sys.argv[1], errors="replace").read()
+except Exception:
+    print("nostamp"); sys.exit()
+m = re.search(r"^VERSION[ \t]*=[ \t]*[^0-9]*([0-9][0-9.]*)", src, re.M)
+print(m.group(1) if m else "nostamp")' "$HOME_DIR/app.py" 2>/dev/null)"
+case "$APP_VER" in
+    ""|nostamp)
+        fail "the app.py fetched from $REPO/$REF is not a v$MIN_APP_VERSION fortress source (no version stamp - it is likely an older branch). Merge the newer work into $REF, install from a checkout (./install.sh), or pass ADQUIT_REF=<branch>" ;;
+esac
+lowest="$(printf '%s\n%s\n' "$APP_VER" "$MIN_APP_VERSION" | sort -t. -k1,1n -k2,2n | head -n1)"
+if [ "$lowest" != "$MIN_APP_VERSION" ]; then
+    fail "refusing to install app.py v$APP_VER from $REPO/$REF - this installer (v$INSTALLER_VERSION) needs >= v$MIN_APP_VERSION. That branch is behind: merge it into $REF, or re-run with ADQUIT_REF=<branch>"
+fi
+note "app.py v$APP_VER from $REPO/$REF"
+# remember the channel, so `adquit update` stays on the ref this box came from
+printf '%s\n' "$REF" > "$HOME_DIR/.channel" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 step 4 "Python environment"

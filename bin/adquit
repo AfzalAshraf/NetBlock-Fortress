@@ -81,7 +81,25 @@ source_dir() { # locate a checkout containing app.py
     return 1
 }
 
+detect_channel() { # the ref this install came from (recorded by install.sh)
+    [ -n "${ADQUIT_REF:-}" ] && { printf '%s' "$ADQUIT_REF"; return; }
+    local f
+    for f in "$HOME_DIR/.channel" "/opt/adquit/.channel" "$HOME/.adquit/.channel"; do
+        [ -s "$f" ] && { head -n1 "$f" | tr -d '[:space:]'; return; }
+    done
+    printf 'main'
+}
+
+resolve_channel() { # point REPO/REF/URLs at the recorded channel (once per command)
+    [ -n "${ADQUIT_CHANNEL_DONE:-}" ] && return 0
+    ADQUIT_CHANNEL_DONE=1
+    REF="$(detect_channel)"
+    RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
+    TARBALL="${ADQUIT_TARBALL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF}"
+}
+
 fetch_repo() { # download app.py + adquit into HOME_DIR
+    resolve_channel
     local dest="$1" tmp
     tmp="$(mktemp -d)"
     say "Fetching NetBlock Fortress v$VERSION_TAG from GitHub"
@@ -230,7 +248,7 @@ cmd_install() {
     if is_root; then install_cli_link; fi
     if [ "$with_lists" = "1" ]; then
         say "pulling blocklists in the background (first run downloads a few hundred MB)"
-        ADQUIT_HOME="$HOME_DIR" start_detached "$STATE_DIR/gravity.log" "$PY" "$APP" --update-lists
+        ADQUIT_HOME="$HOME_DIR" bg_run "$STATE_DIR/gravity.log" "$PY" "$APP" --update-lists
     fi
     say "installed into $HOME_DIR"
     cmd_start || true
@@ -293,14 +311,27 @@ wait_healthy() { # up to ~15s
     health_ok
 }
 
-start_detached() { # background a command so it survives this shell
+bg_run() { # background a side task (gravity pull, feed update) - never touches the pidfile
     local log="$1"; shift
     if have setsid; then
         setsid "$@" >> "$log" 2>&1 < /dev/null &
     else
         nohup "$@" >> "$log" 2>&1 < /dev/null &
     fi
+}
+
+start_detached() { # start the service in the background and record its pid
+    local log="$1"; shift
+    bg_run "$log" "$@"
     echo $! > "$PIDFILE"
+}
+
+app_version() { # the VERSION stamp inside an app.py, without running python
+    sed -n 's/^VERSION *= *"\([0-9][0-9.]*\)".*/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+ver_ge() { # ver_ge A B -> is version A >= version B
+    [ "$(printf '%s\n%s\n' "$B" "$A" | sort -t. -k1,1n -k2,2n | head -n1)" = "$B" ]
 }
 
 cmd_start() {
@@ -416,14 +447,42 @@ run_as_engine() { # run app.py subcommand with the right interpreter/home
 
 cmd_update() {
     [ -f "$APP" ] || die "not installed yet - run: adquit install"
-    say "Updating fortress binaries"
+    resolve_channel
+    say "Updating fortress binaries (channel: $REF)"
+
+    # An update must never leave the box unprotected and must never downgrade the
+    # engine (a stale ref used to do exactly that). So: remember whether it was
+    # live, keep the old app.py, verify the new one, restore on any doubt.
+    local was_live=0; running >/dev/null 2>&1 && was_live=1
+    local old_ver new_ver backup="$APP.pre-update"
+    old_ver="$(app_version "$APP")"
+    [ -n "$old_ver" ] && cp -f "$APP" "$backup" 2>/dev/null || true
     fetch_repo "$HOME_DIR"
+    new_ver="$(app_version "$APP")"
+    if [ -z "$new_ver" ]; then
+        if [ -f "$backup" ]; then mv -f "$backup" "$APP"; warn "restored the previous app.py"; fi
+        die "the update produced no usable app.py from $REPO/$REF (no version stamp) - that channel is probably behind"
+    fi
+    if [ -n "$old_ver" ] && ! ver_ge "$new_ver" "$old_ver" && [ -z "${ADQUIT_FORCE:-}" ]; then
+        mv -f "$backup" "$APP" 2>/dev/null || true
+        die "refusing to downgrade v$old_ver -> v$new_ver from $REPO/$REF (set ADQUIT_FORCE=1 to allow it)"
+    fi
+    if ! "$PY" "$APP" --version >/dev/null 2>&1; then
+        [ -f "$backup" ] && mv -f "$backup" "$APP"
+        die "the updated app.py is not runnable with $PY - restored v${old_ver:-previous}; check 'adquit doctor'"
+    fi
+    rm -f "$backup"
     [ -f "$HOME_DIR/bin/adquit" ] && { cp -f "$HOME_DIR/bin/adquit" /usr/local/bin/adquit 2>/dev/null || true; }
     ensure_deps
     run_as_engine --rebuild
-    if running; then cmd_restart; fi
+    # start (not restart): also heals a service that had already died
+    if [ "$was_live" = "1" ] || using_systemd; then
+        cmd_stop >/dev/null 2>&1 || true
+        cmd_start
+    fi
+    say "updated to v$new_ver (was v${old_ver:-unknown})"
     say "updating gravity (this downloads every enabled feed)"
-    start_detached "$STATE_DIR/gravity.log" "$PY" "$APP" --update-lists
+    bg_run "$STATE_DIR/gravity.log" "$PY" "$APP" --update-lists
     printf '  feed pull started in the background (log: %s)\n' "$HOME_DIR/data/gravity.log"
 }
 

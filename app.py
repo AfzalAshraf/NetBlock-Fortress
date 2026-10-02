@@ -80,6 +80,90 @@ def _ensure_packages():
 
 _ensure_packages()
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Dependency gate.
+#  flask/requests/dnslib are required to *serve* traffic, but a box whose venv
+#  was removed (or a `python3 app.py` run outside the installer) must still be
+#  able to answer --version / --help and, most usefully, --doctor - with
+#  instructions rather than a ModuleNotFoundError traceback.
+# ─────────────────────────────────────────────────────────────────────────────
+def _missing_packages():
+    """Packages the fortress needs but cannot load. A partially removed venv can
+    make the import machinery raise instead of reporting absence, so a broken
+    finder counts as 'missing' - the gate below explains it, a traceback would not."""
+    import importlib.util
+    out = []
+    for pkg in REQUIRED_PACKAGES:
+        try:
+            if importlib.util.find_spec(pkg) is None:
+                out.append(pkg)
+        except Exception:
+            out.append(pkg)
+    return out
+
+
+def _dependency_instructions(missing):
+    return ("[!] NetBlock Fortress needs the Python package(s): %s\n"
+            "    Recommended - the one-command installer (private venv, service, CLI):\n"
+            "        curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/main/install.sh | sudo bash\n"
+            "    Or just the packages:\n"
+            "        python3 -m pip install %s\n"
+            "    Or, from a checkout:  ./install.sh   (rootless: ADQUIT_USER=1 ./install.sh)"
+            % (", ".join(missing), " ".join(missing)))
+
+
+def _offline_doctor(missing):
+    """Minimal health report for an install whose dependencies are broken."""
+    home = os.environ.get("ADQUIT_HOME") or os.environ.get("NETBLOCK_HOME")
+    if not home:
+        home = "/opt/adquit" if os.geteuid() == 0 else os.path.expanduser("~/.adquit")
+    cfg_path = os.path.join(home, "data", "config.json")
+    print("NetBlock Fortress %s - offline doctor (full checks need %s)"
+          % (VERSION, ", ".join(missing)))
+    print("  python     %s (%s)" % (sys.version.split()[0], sys.executable))
+    print("  home       %s%s" % (home, "" if os.access(home, os.W_OK) else "  [not writable]"))
+    print("  config     %s" % (cfg_path if os.path.isfile(cfg_path) else cfg_path + "  [missing - not installed?]"))
+    for pkg in REQUIRED_PACKAGES:
+        print("  package    %-9s %s" % (pkg, "MISSING" if pkg in missing else "ok"))
+    ports = {}
+    try:
+        with open(cfg_path) as fh:
+            cfg = json.load(fh)
+        ports = {"dns_port": cfg.get("dns_port", 53), "web_port": cfg.get("web_port", 8080)}
+    except Exception:
+        pass
+    for label, port in (("dns", ports.get("dns_port")), ("web", ports.get("web_port"))):
+        if not port:
+            continue
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(0.4)
+        listening = probe.connect_ex(("127.0.0.1", int(port))) == 0
+        probe.close()
+        print("  %-11s :%s %s" % (label + " port", port, "answered" if listening else "nothing listening"))
+    if not os.path.isfile(os.path.join(home, "app.py")):
+        print("  app.py     %s  [missing - run the installer]" % os.path.join(home, "app.py"))
+    print()
+    print(_dependency_instructions(missing))
+
+
+_MISSING = _missing_packages()
+if _MISSING:
+    _first = sys.argv[1] if len(sys.argv) > 1 else ""
+    if _first in ("--version", "-v"):
+        print("NetBlock Fortress %s (%s) - installed without its Python deps (%s)"
+              % (VERSION, CODENAME, ", ".join(_MISSING)))
+        sys.exit(0)
+    if _first in ("--help", "-h"):
+        print(__doc__.strip())
+        print()
+        print(_dependency_instructions(_MISSING))
+        sys.exit(0)
+    if _first in ("--doctor", "doctor", "-D"):
+        _offline_doctor(_MISSING)
+        sys.exit(1)
+    sys.stderr.write(_dependency_instructions(_MISSING) + "\n")
+    sys.exit(3)
+
 import requests
 from flask import (Flask, request, redirect, session, jsonify,
                    render_template_string, make_response, Response)

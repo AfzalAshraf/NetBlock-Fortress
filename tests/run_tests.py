@@ -480,6 +480,69 @@ class TestSinkholeHTTP(unittest.TestCase):
             nb.CFG["sinkhole_mode"] = "zeroip"
 
 
+class TestDependencyGate(unittest.TestCase):
+    """`--version` / `--doctor` must answer even on a box where flask/requests/dnslib
+    are gone (wiped venv, bare `python3 app.py`), and starting the service must
+    explain the problem instead of raising a ModuleNotFoundError traceback."""
+
+    HARNESS = r"""
+import sys
+BLOCK = {"flask", "requests", "dnslib", "werkzeug", "jinja2"}
+
+
+class Blocker:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in BLOCK:
+            raise ImportError("No module named %r" % (fullname,))
+        return None
+
+
+sys.meta_path.insert(0, Blocker())
+sys.argv = ["app.py"] + sys.argv[1:]
+src = open(APP, errors="replace").read()
+g = {"__name__": "__main__", "__file__": APP}
+try:
+    exec(compile(src, APP, "exec"), g)
+except SystemExit:
+    raise
+except BaseException as exc:               # a broken import escaping the gate
+    sys.stderr.write("UNWANTED EXCEPTION: %r\n" % (exc,))
+    sys.exit(99)
+"""
+
+    def setUp(self):
+        import subprocess
+        self.subprocess = subprocess
+        self.harness = HOME / "gate_harness.py"
+        self.harness.write_text("APP = %r" % str(REPO / "app.py") + chr(10) + self.HARNESS)
+        self.env = dict(os.environ, ADQUIT_HOME=str(HOME), ADQUIT_NO_PIP="1")
+
+    def run_gate(self, *args):
+        return self.subprocess.run([sys.executable, str(self.harness)] + list(args),
+                                   capture_output=True, text=True, timeout=120, env=self.env)
+
+    def test_version_answers_without_deps(self):
+        res = self.run_gate("--version")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("19.0", res.stdout)
+        self.assertIn("without its Python deps", res.stdout)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_doctor_diagnoses_without_deps(self):
+        res = self.run_gate("--doctor")
+        self.assertEqual(res.returncode, 1, res.stderr)
+        for needle in ("offline doctor", "flask", "MISSING", "install.sh"):
+            self.assertIn(needle, res.stdout, res.stdout[:600])
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_serving_refuses_with_instructions(self):
+        res = self.run_gate("--serve")
+        self.assertEqual(res.returncode, 3, res.stderr)
+        self.assertIn("needs the Python package(s)", res.stderr)
+        self.assertIn("pip install", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+
 if __name__ == "__main__":
     try:
         unittest.main(verbosity=2, exit=False, argv=[sys.argv[0]])

@@ -67,6 +67,17 @@
 - Config schema versioning + migration (v18 `enabled_lists` ids are remapped to v19 feeds,
   `/opt/netblock` is migrated to `/opt/adquit`).
 
+### Robustness at the edges (post-release hardening)
+- `python3 app.py --version / --help / --doctor` now work on a box with **no** Python deps
+  (a wiped venv, or a bare `python3` run): they print instructions and a real offline
+  diagnosis instead of a `ModuleNotFoundError` traceback; starting the service without deps
+  exits with code 3 and the same instructions.
+- The installer refuses a source ref that is older than itself (`refusing to install
+  app.py v18.0 … That branch is behind`) instead of silently mixing a new CLI with an old
+  engine, and records the channel in `.adquit/.channel`, which `adquit update` follows.
+- README: install-from-branch / install-from-checkout channels, and a troubleshooting table
+  for the failures people actually hit (`bash: line 2: ---: command not found` etc).
+
 ### Packaging & QA
 - One-command `install.sh` (idempotent, sudo-aware, OS/package-manager detection, venv,
   systemd unit + logrotate, systemd-resolved/dnsmasq conflict handling, ufw/firewalld rules,
@@ -77,6 +88,6 @@
 - CI: engine + dashboard suite on Python 3.8 / 3.11 / 3.12, CLI contract tests, and a real
   "install then `adquit test` then uninstall" smoke test in a container; release workflow
   publishes a tarball, installer asset and GHCR image.
-- `tests/run_tests.py`: 48 assertions covering the parser, every engine layer, DNS reply
+- `tests/run_tests.py`: 51 tests covering the parser, every engine layer, DNS reply
   shapes, rate limiter, caches, profiles, config migration, CLI, API auth and page rendering
   (offline by design — no network, no pytest).

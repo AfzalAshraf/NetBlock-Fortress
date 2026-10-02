@@ -57,6 +57,19 @@ manager, creates a private venv, frees udp/53 from `systemd-resolved`, installs 
 `adquit` systemd unit + logrotate, opens the firewall, starts a rootless-safe
 background blocklist pull, and generates a random dashboard password (printed once).
 
+The one-liner has no pin, so it installs whatever `main` holds. To take a branch or a
+fork instead — and to *stay* on that channel, since the installer records it in
+`.adquit/.channel` and `adquit update` follows it rather than downgrading you to `main`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/BRANCH/install.sh \
+  | sudo env ADQUIT_REF=BRANCH bash
+```
+
+If a ref is *older* than the installer you are running, the install stops out loud
+(`refusing to install app.py … That branch is behind`) instead of quietly giving you a
+mismatched engine + CLI pair.
+
 No `curl` available? Everything is in this repo:
 
 ```bash
@@ -127,6 +140,7 @@ adquit rules google.com     ask the engine about any hostname
 adquit passwd               rotate the dashboard password
 adquit protect on|off       repoint THIS machine's DNS at the fortress
 adquit update               pull the newest fortress, rebuild, refresh, restart
+                            (follows the install's channel; refuses a downgrade)
 adquit uninstall
 ```
 
@@ -225,11 +239,27 @@ wire the fortress into home automation or a dashboard.
 * **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
   rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
   compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
-  MIT licence, 48-assertion offline test suite.
+  MIT licence, 51-test offline suite (engine, API, UI, dependency gate).
 * **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
   `adquit stats` answers even when the web layer is down.
+* **Fails loudly, never silently** — `python3 app.py --version/--help/--doctor` still answer
+  with no Python deps installed (instructions, not a traceback); the installer refuses a ref
+  older than itself; `adquit update` verifies the new engine, rolls back on any doubt, follows
+  the channel the box was installed from, and restarts a service that had already died.
 
 ---
+
+## Troubleshooting
+
+| symptom | meaning / fix |
+|---|---|
+| `bash: line 2: ---: command not found` and ``unexpected EOF while looking for matching ``'`` | You piped a **markdown document** into bash — that ref’s `install.sh` is not a real script (as `main` was, before v19 was merged). Install from the right branch (`ADQUIT_REF=` above) or from a checkout. |
+| `adquit: command not found` | The install never ran (row above), or the CLI is off `PATH`: `/usr/local/bin/adquit` for a root install, `~/.local/bin/adquit` for `ADQUIT_USER=1`. |
+| `ModuleNotFoundError: No module named 'flask'` (or `dnslib`, `requests`) | You ran `python3 app.py` with a bare interpreter. `adquit doctor` says exactly this and how to fix it; the installer builds a private venv so you never hand-install anything. |
+| `refusing to install app.py v18.0 …` / `no version stamp` | The installer noticed the ref is behind itself and stopped rather than half-installing. Pass `ADQUIT_REF=<branch>` or merge. |
+| `port 53 is already in use` | `adquit doctor` names the squatter (usually `systemd-resolved`); the installer writes a `DNSStubListener=no` drop-in for exactly that, or use `ADQUIT_DNS_PORT=5353`. |
+| something you need got blocked | `adquit allow <domain>` — the whitelist is layer 0 and beats every other rule; `adquit rules <domain>` shows which layer decided. |
+| feeds look dead | `adquit verify-lists` reports which of the 131 sources your box can reach; a dead feed is an error badge, never a breakage. |
 
 ## Notes, limits and honesty
 
@@ -253,7 +283,7 @@ wire the fortress into home automation or a dashboard.
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline test suite (48 engine/API/UI tests) + CLI contract
+make test      # offline suite (51 engine/API/UI/gate tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 
