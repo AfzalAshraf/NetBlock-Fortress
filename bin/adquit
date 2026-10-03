@@ -22,6 +22,11 @@ REF="${ADQUIT_REF:-main}"
 RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
 TARBALL="${ADQUIT_TARBALL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF}"
 SERVICE="adquit"
+# Who may tell us the client's real address: caddy itself (loopback) and any proxy on the
+# private networks a LAN box uses. Written per proxy, and suggested as the global equivalent, so
+# the two can never disagree - inside `reverse_proxy` caddy parses these tokens as addresses, so
+# the module words from the global form ("static private_ranges") are a provisioning error here.
+CADDY_TRUSTED="127.0.0.0/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7"
 C=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
 # (ANSI-C quoting matters: printf passes %s substitutions through untouched, so a
 #  literal "\033[32m" in a variable would be printed verbatim - which it was.)
@@ -1080,9 +1085,10 @@ NGX
     [ -n "$sites" ] && printf '%s\n' "$sites"
 }
 
-caddy_proxy() { # $1 = upstream - `trusted_proxies` in a global block would force this file to
-                # be imported first, so say it per proxy and the fragment loads from anywhere
-    printf 'reverse_proxy %s {\n\t\t\ttrusted_proxies static private_ranges\n\t\t}' "$1"
+caddy_proxy() { # $1 = upstream - trusted_proxies belongs in a global `servers` block, but that
+                # would make this fragment loadable only as the first import; per proxy it is the
+                # same setting and it travels with the file
+    printf 'reverse_proxy %s {\n\t\t\ttrusted_proxies %s\n\t\t}' "$1" "$CADDY_TRUSTED"
 }
 
 render_caddy() { # $1 = listen port
@@ -1111,7 +1117,8 @@ render_caddy() { # $1 = listen port
     # instead (see caddy_proxy), which travels with the file; these two are for their whole
     # config, so they stay a suggestion in a comment.
     printf '# optional, for your whole Caddyfile (add at the top of %s):\n' "$PCFILE"
-    printf '#   auto_https off\n#   servers { trusted_proxies static private_ranges }\n\n'
+    printf '#   auto_https off\n#   servers { trusted_proxies static private_ranges }\n'
+    printf '# (per proxy we already set the same thing, for: %s)\n\n' "$CADDY_TRUSTED"
     if portal_block_on; then
         blocks="$blocks
 	@adquit_portal host $(portal_serve_names)

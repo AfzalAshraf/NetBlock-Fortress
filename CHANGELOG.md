@@ -54,6 +54,15 @@
   sat in the README for three releases because nothing ever read the help text. 51 verbs, all real.
 - The README's own test count is now one of the things the suite checks: a stale number means the
   docs stopped being read, and that is how `59-test` survived three versions of growth.
+- **`trusted_proxies` inside `reverse_proxy` takes addresses, not module names.** The first fix for
+  the point above copied the global form verbatim - `trusted_proxies static private_ranges` on each
+  proxy - and caddy took it, adapted it, and then refused to *provision*: `invalid IP address:
+  'static': ParseAddr("static"): unable to parse IP`. The fragment now writes the ranges themselves
+  (`CADDY_TRUSTED`: loopback, RFC1918, ULA) on every proxy, which is the same list the header comment
+  suggests for a global `servers` block, and the test pins both halves - no module words in a
+  per-proxy line, and every token an address - because "validates, then dies on reload" is the worst
+  moment to learn something. On the box that found it, `proxy install` reverted the fragment and left
+  the running sites untouched, which is the behaviour that was supposed to happen.
 - **A file is replaced by renaming onto it, never by truncating it.** `cli_refresh` copied the new
   CLI over `/usr/local/bin/adquit` with `cp -f` while that same script was being executed, and bash
   reads a running script as it goes: the update printed its results and then died at line 1890 with

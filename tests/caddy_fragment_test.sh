@@ -43,7 +43,21 @@ proxies="$(printf '%s\n' "$out" | grep -c 'reverse_proxy')"
 trusted="$(printf '%s\n' "$out" | grep -c 'reverse_proxy [^ ]* {')"
 [ "$proxies" -gt 0 ] || fail "the fragment proxies nothing at all - the render is wrong"
 [ "$proxies" = "$trusted" ] || \
-    fail "$proxies reverse_proxy lines but $trusted with trusted_proxies: the client's real address is lost"
+    fail "$proxies reverse_proxy lines but $trusted with a trusted_proxies block: the client's real address is lost"
+
+# ...and the ranges have to be *ranges*. This is the shape that shipped broken once: the global
+# form reads `servers { trusted_proxies static private_ranges }`, but inside `reverse_proxy` caddy
+# parses each token as an address, so copying the module words gives a config that adapts fine and
+# then dies provisioning with "invalid IP address: 'static'".
+live_lines="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*#' | grep 'trusted_proxies' || true)"
+[ -n "$live_lines" ] || fail "nothing sets trusted_proxies - every visitor will look like 127.0.0.1"
+if printf '%s\n' "$live_lines" | grep -qE 'trusted_proxies +(static|private_ranges)'; then
+    fail "the fragment puts the global trusted_proxies syntax inside reverse_proxy; caddy cannot provision it"
+fi
+bad="$(printf '%s\n' "$live_lines" | sed 's/.*trusted_proxies //' | tr ' \t' '\n\n' \
+        | grep -vE '^$' | grep -vE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+(/[0-9]{1,3})?$' | head -n1)"
+[ -z "$bad" ] || fail "trusted_proxies got a token that is not an address or range: '$bad'"
+
 printf '%s\n' "$out" | grep -q 'auto_https off' || \
     fail "the fragment stopped mentioning auto_https - the comment is the only thing keeping a .lan name off ACME"
 
