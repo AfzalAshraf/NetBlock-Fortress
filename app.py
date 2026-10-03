@@ -37,7 +37,7 @@ from pathlib import Path
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "19.2"
+VERSION = "19.3"
 CODENAME = "Omni-Shield"
 CONFIG_VERSION = 19
 USER_AGENT = (
@@ -311,6 +311,10 @@ DEFAULT_CONFIG = {
     "lan_zones": {},
     "answer_fortress_names": True,    # adquit.local / <hostname>.local -> this box
     "trust_proxy": True,              # X-Forwarded-* accepted from loopback peers only
+    "portal_enabled": True,           # a start page listing every site you publish
+    "portal_port": 8082,
+    "portal_title": "Home on this network",
+    "portal_note": "",
 }
 
 CFG = dict(DEFAULT_CONFIG)
@@ -2436,6 +2440,7 @@ def fortress_names():
     names = []
     if CFG.get("answer_fortress_names", True):
         names += ["adquit.local", "netblock.local", "fortress.local", "adquit.lan"]
+        names += portal_names()          # home.lan / portal.lan -> the start page
         try:
             host = (socket.gethostname() or "").strip().lower()
             if host:
@@ -2921,6 +2926,222 @@ def start_sinkhole_server():
         return
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     LOG.info("creative sinkhole serving on :%s", port)
+
+# ──────────────────────────────────────────────
+#  The LAN start page ("portal")
+# ──────────────────────────────────────────────
+# One listener, one page, no login: it links to things every device on this network can
+# already reach. The registry is the same `local_records` the resolver reads, so publishing
+# a site with `adquit site add` puts a tile here without a second place to keep in sync.
+
+PORTAL_NAMES = ("home.lan", "portal.lan", "start.lan")
+
+PORTAL_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="120">
+<title>__TITLE__</title>
+<style>
+ :root{--bg:#0b0f14;--card:#131a22;--line:#1f2a36;--fg:#dfe7ef;--dim:#8b9bab;--ac:#5fd0a8}
+ *{box-sizing:border-box}
+ body{margin:0;padding:26px 18px 46px;background:var(--bg);color:var(--fg);
+      font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+ header{max-width:1060px;margin:0 auto 22px}
+ h1{font-size:21px;margin:0 0 4px;letter-spacing:.2px}
+ .sub{color:var(--dim);font-size:13px}
+ .sub code{color:var(--ac);background:#0f151c;padding:1px 5px;border-radius:5px}
+ main{max-width:1060px;margin:0 auto;display:grid;gap:12px;
+      grid-template-columns:repeat(auto-fill,minmax(232px,1fr))}
+ a.t{display:block;background:var(--card);border:1px solid var(--line);border-radius:13px;
+     padding:14px 15px;text-decoration:none;color:inherit;transition:.14s}
+ a.t:hover{border-color:var(--ac);transform:translateY(-1px)}
+ .n{display:block;font-weight:600;font-size:16px;margin-bottom:5px;word-break:break-all}
+ .s{display:block;color:var(--dim);font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
+ .b{display:inline-block;margin-top:9px;font-size:11px;color:var(--ac);
+     border:1px solid #1d3b32;background:#0f1c18;border-radius:999px;padding:1px 8px}
+ .b.dns{color:#c9a25f;border-color:#3a2f1a;background:#1c1710}
+ p.e{grid-column:1/-1;color:var(--dim);border:1px dashed var(--line);border-radius:13px;
+     padding:18px;margin:0}
+ p.e code{color:var(--ac)}
+ footer{max-width:1060px;margin:24px auto 0;color:#5f6f80;font-size:12px}
+ footer a{color:#7c93a8}
+</style></head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <div class="sub">__SUB__ &middot; add one: <code>sudo adquit site add media.lan --port 8096</code></div>
+</header>
+<main>
+__TILES__
+</main>
+<footer>Names here are answered by the fortress itself, so they work on every device that uses it
+for DNS - and nowhere outside this network. __BLOCKED__</footer>
+</body></html>
+"""
+
+
+def portal_names():
+    """Names that open the start page rather than one particular site."""
+    if not cfg_bool("portal_enabled", True):
+        return []
+    out = []
+    for n in PORTAL_NAMES:
+        out.append(n)
+        out.append(n.split(".")[0] + ".local")
+    return out
+
+
+def portal_entries():
+    """Everything the start page links to: published sites first, then the fortress."""
+    out = []
+    recs = CFG.get("local_records")
+    recs = recs if isinstance(recs, dict) else {}
+    for name in sorted(recs):
+        e = recs[name]
+        if isinstance(e, str):
+            e = {"ip": e}
+        if not isinstance(e, dict):
+            continue
+        port = e.get("port")
+        port = int(port) if str(port or "").isdigit() else 0
+        proxied = e.get("proxy") is not False and bool(port)
+        target = local_record_ip(e)
+        if proxied:
+            # the reverse proxy answers the name on :80, so no port belongs in the link
+            url = "http://%s/" % name
+        elif port:
+            url = "http://%s:%s/" % (target, port)
+        else:
+            url = "http://%s/" % target
+        out.append({"name": name, "url": url, "target": target, "port": port,
+                    "proxy": bool(proxied), "note": str(e.get("note") or ""),
+                    "kind": "site"})
+    dash = int(CFG.get("web_port", 8080) or 8080)
+    ip = fortress_ip()
+    out.append({"name": "Fortress dashboard", "url": "http://%s:%s/" % (ip, dash),
+                "target": ip, "port": dash, "proxy": True,
+                "note": "blocklists, query log, modes", "kind": "fortress"})
+    return out
+
+
+def render_portal_html():
+    """The page itself. Everything read from config is escaped: `--note` is free text and
+    a tile label is not a place for markup."""
+    import html as _html
+    esc = lambda v: _html.escape(str(v), quote=True)
+    entries = portal_entries()
+    sites = [e for e in entries if e.get("kind") != "fortress"]
+    rows = []
+    for ent in entries:
+        sub = "%s:%s" % (ent["target"], ent["port"]) if ent["port"] else ent["target"]
+        if ent["kind"] == "fortress":
+            badge = '<span class="b">this box</span>'
+        elif ent["proxy"]:
+            badge = '<span class="b">proxied</span>'
+        else:
+            badge = '<span class="b dns">DNS only</span>'
+        note = ('<span class="s">%s</span>' % esc(ent["note"])) if ent["note"] else ""
+        rows.append('<a class="t" href="%s"><span class="n">%s</span>'
+                    '<span class="s">%s</span>%s%s</a>'
+                    % (esc(ent["url"]), esc(ent["name"]), esc(sub), note, badge))
+    tiles = "\n".join(rows)
+    if not sites:
+        # the dashboard tile is always there, so "empty" means "you have published nothing yet"
+        tiles = ('<p class="e">Nothing published yet - '
+                 '<code>sudo adquit site add media.lan --port 8096</code> puts the first tile here, '
+                 'and the fortress starts answering that name immediately.</p>\n' + tiles)
+    blocked = ""
+    mode = str(CFG.get("sinkhole_mode") or "")
+    if mode == "fortress":
+        blocked = ("%s blocked ad hosts also resolve here, so a stray ad link lands on the "
+                   "splash page rather than a connection error."
+                   % "{:,}".format(len(BLOCKED) + len(WILDCARDS)))
+    elif BLOCKED:
+        blocked = ("%s ad hosts resolve to a dead address, so they never reach this page."
+                   % "{:,}".format(len(BLOCKED) + len(WILDCARDS)))
+    return (PORTAL_PAGE
+            .replace("__TITLE__", esc(CFG.get("portal_title") or "Home on this network"))
+            .replace("__SUB__", esc(CFG.get("portal_note") or
+                                    "%d site%s published on this box"
+                                    % (len(sites), "" if len(sites) == 1 else "s")))
+            .replace("__TILES__", tiles)
+            .replace("__BLOCKED__", blocked))
+
+
+def start_portal_server(port=None):
+    """Serve the start page. Returns the HTTP server (tests close it); None when disabled
+    or the port is taken - a box that already owns :8082 must not lose its resolver."""
+    if not cfg_bool("portal_enabled", True):
+        LOG.info("start page off (portal_enabled=false)")
+        return None
+    try:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    except Exception as exc:
+        LOG.warning("start page unavailable: %s", exc)
+        return None
+    if port is None:
+        port = int(CFG.get("portal_port", 8082) or 0)
+    port = int(port)
+    if port <= 0:
+        return None
+
+    class PortalHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "Adquitportal/19"
+
+        def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", loc=None):
+            try:
+                self.send_response(code)
+                if loc is not None:
+                    self.send_header("Location", loc)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("X-Adquit", "portal")
+                self.end_headers()
+                if body and self.command != "HEAD":
+                    self.wfile.write(body)
+            except Exception:
+                pass
+
+        def _route(self):
+            path = (self.path or "/").split("?")[0].rstrip("/") or "/"
+            if path in ("/portal.json", "/api/portal"):
+                payload = json.dumps({"title": str(CFG.get("portal_title") or ""),
+                                      "entries": portal_entries()}, indent=2).encode()
+                return self._send(200, payload, "application/json")
+            if path == "/healthz":
+                return self._send(200, b"ok\n")
+            if path in ("/", "/index.html", "/home", "/portal"):
+                return self._send(200, render_portal_html().encode("utf-8"),
+                                  "text/html; charset=utf-8")
+            # a tile that is bookmarked with a path should still land on the page
+            return self._send(302, b"", loc="/")
+
+        def do_GET(self):
+            self._route()
+
+        def do_HEAD(self):
+            self._route()
+
+        def do_POST(self):
+            self._send(405, b"the start page is read-only - publish sites with:"
+                             b" sudo adquit site add <name> --port <n>\n")
+
+        def log_message(self, *args, **kwargs):
+            return
+
+    try:
+        httpd = ThreadingHTTPServer(("0.0.0.0", port), PortalHandler)
+    except Exception as exc:
+        LOG.warning("start page could not bind :%s: %s (set portal_port, or portal_enabled false)",
+                    port, exc)
+        return None
+    threading.Thread(target=httpd.serve_forever, daemon=True, name="portal").start()
+    LOG.info("start page on http://0.0.0.0:%s/ - %s links, add one with 'adquit site add'",
+             port, len(portal_entries()))
+    return httpd
+
 
 # ──────────────────────────────────────────────
 #  Flask app + auth
@@ -5059,6 +5280,7 @@ def start_engine_threads():
     threading.Thread(target=gravity_boot_worker, daemon=True, name="gravity").start()
     threading.Thread(target=housekeeping_worker, daemon=True, name="housekeeping").start()
     threading.Thread(target=start_sinkhole_server, daemon=True, name="sinkhole").start()
+    threading.Thread(target=start_portal_server, daemon=True, name="portal").start()
 
 
 SERVE_FLAGS = ("--serve", "--daemon", "-d", "run")

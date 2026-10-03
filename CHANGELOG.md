@@ -1,5 +1,43 @@
 # Changelog
 
+## v19.3 — a start page for the LAN you just made reachable
+
+- **`adquit portal`** turns the site registry into a page: one tile per published name (plus the
+  dashboard), linking to `http://<name>/` when the reverse proxy serves it and to
+  `http://<address>:<port>/` when it does not. It reads `local_records`, the same dict the resolver
+  answers from, so there is no second registry to keep in sync and `adquit site add` puts a tile on
+  the page by itself.
+- Its own listener on `portal_port` (default 8082), started with the rest of the engine threads, so
+  the page exists before any web server is installed and stays useful when a port is taken -
+  a box whose `sinkhole_port` already owns :80, or a caddy that beats it there. `portal_enabled
+  false` turns the listener and the DNS names off together.
+- `home.lan`, `portal.lan`, `start.lan` (+ `.local` forms) are answered by the fortress like its
+  own names, and all three renderers gained the matching vhost; in every mode that has no ad
+  splash to serve, the *unmatched* `Host` on the proxied port now goes to the start page instead of
+  a bare 204/200 - typing the box's address or a stale bookmark shows what is here rather than a
+  blank page.
+- Read-only and unauthenticated on purpose, and escaped: names, notes and the title come from
+  config, and a `--note` containing markup is rendered as text. `/portal.json` is the same data for
+  anything that wants to build its own front end; `POST` answers 405 with the command to run.
+- `sudo adquit portal open` opens the portal's port in the firewall, and plain `lan open` now
+  includes it - the start page is the other half of "reachable from the phone".
+- **Who gets the bare address.** While the start page is on, the box's own addresses are part of
+  *its* vhost (typing the number asks "what is on this box?"), and the dashboard keeps the names; with
+  `portal_enabled false` the addresses move back to the dashboard vhost. One rule either way, and
+  `:8080` always means the dashboard, so nothing becomes unreachable.
+- A dangling `import adquit.caddyfile` (their Caddyfile references the fragment, the fragment was
+  never written) is now named out loud with both ways out, because it does not read as "caddy
+  refuses to start", it reads as "the fortress broke".
+- **`adquit set` / `adquit get` are real verbs now** (`--set`/`--get` keep working). The docs told
+  people to run `sudo adquit --set answer_fortress_names false` and the CLI answered "unknown
+  command" - the engine accepted it, the wrapper did not, and every key we expose for editing needs
+  a path from a normal user's shell that elevates through the same trigger as the other config
+  verbs.
+- Tests: 86 engine (was 80) - link shapes per proxy mode, escaping, the empty state, the live
+  listener's page/JSON/302/405, and that a busy port or a disabled switch never raises - plus 43
+  CLI contract checks (was 39): `portal status|url|on|off|title`, `set`/`get`, that a second `site add` does not erase the first, the start-page vhosts in all three
+  renders, and the dangling-import message.
+
 ## v19.2 — the fortress also serves your own sites ("Self-Host")
 
 ### LAN self-hosting
@@ -18,7 +56,7 @@
   working) with a 30 s positive / 15 s negative cache, longest-suffix wins, and a public resolver
   is never asked for a name inside your network. `lan-zone list` explains the default behaviour.
 - `adquit.lan`, `adquit.local` and `<hostname>.local/.lan` now resolve to the fortress itself, so
-  the URL `adquit lan` prints actually opens (opt out: `adquit --set answer_fortress_names false`).
+  the URL `adquit lan` prints actually opens (opt out: `adquit set answer_fortress_names false`).
 
 ### Reverse proxy, generated
 - **`adquit proxy install --server nginx|caddy|apache --port 80`** renders one managed file of
@@ -69,12 +107,12 @@
   (readable via `ADQUIT_CADDYFILE`, default `/etc/caddy/Caddyfile`) and says which one to narrow or
   delete, instead of leaving "it resolved but showed the wrong page" as a mystery.
 
-- **`http://<fortress-ip>/` keeps working after the proxy takes the port.** Hand-written caddy config
-  is usually a bare `:80 { … }` that reverse-proxies the dashboard - which is that page answering
-  *every* Host, so the first thing anyone notices when vhosts appear is that `http://media.lan/`
-  stopped showing the dashboard. Two changes: `dash_names()` now also claims this box's own LAN
-  addresses, so the address people type still reaches the dashboard, and the advice printed for a
-  bare `:PORT` block is to give it a hostname or let ours own the port - not to guess.
+- **`http://<fortress-ip>/` keeps answering after the proxy takes the port.** Hand-written caddy
+  config is usually a bare `:80 { … }` that reverse-proxies the dashboard - which is that page
+  answering *every* Host, so the first thing anyone notices when vhosts appear is that
+  `http://media.lan/` stopped showing the dashboard. The advice printed for a bare `:PORT` block is
+  now to give it a hostname or let ours own the port - not to guess. (v19.3 decided who the address
+  itself goes to: the start page while it exists, the dashboard when it is turned off.)
 
 ### Fixes from the first real box running this
 - **`say`/`warn`/`die` are not printf.** They join their arguments, so `say 'firewall: tcp/%s open'
@@ -105,7 +143,7 @@
 - 80 engine tests (was 66): record/zone lookup precedence, the four reply shapes, "a LAN name must
   never reach a public resolver", zone forwarding carrying our question id, a dead router not
   hanging the resolver, `--set` with a JSON object, and all four `ProxyAware` header rules.
-- 39 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
+- 46 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
   nginx render (dashboard vhost, per-site vhost, upgrade map, balanced braces, no `ServerName *`),
   the "refuses when not installed / bad flag" negatives, and the off-subnet guards - exercised
   against a stubbed `ip` so a CI runner's own network never decides the outcome.

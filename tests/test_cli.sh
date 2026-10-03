@@ -115,7 +115,7 @@ grep -q 'restore_update "$origin"' "$REPO/bin/adquit"                       # en
 # self-hosting: LAN names and the proxy must stay in step with the engine
 grep -q 'adquit site add media.lan' "$REPO/bin/adquit"                        # usage mentions it
 grep -q 'adquit lan-zone add' "$REPO/bin/adquit"                              # and the router zones
-grep -q 'site|lan-zone|proxy)' "$REPO/bin/adquit"                             # both elevate centrally
+grep -q 'proxy|portal|set|get|--set|--get)' "$REPO/bin/adquit"                # all of them elevate centrally
 grep -q 'adquit-managed' "$REPO/bin/adquit"                                    # only our own files
 grep -q 'answer_fortress_names' "$REPO/app.py"                                 # fortress names resolve
 grep -q 'local_records' "$REPO/app.py"                                          # ...and sites do too
@@ -124,7 +124,11 @@ grep -q 'local_records' "$REPO/app.py"                                          
 test "$(grep -c 'cli_refresh "\$(readlink' "$REPO/bin/adquit")" = 2              # skip path and applied path
 ! grep -q 'cp -f "$HOME_DIR/bin/adquit" /usr/local/bin/adquit' "$REPO/bin/adquit"  # no raw copy around it
 grep -q 'never install a CLI that does not parse' "$REPO/bin/adquit"
-grep -q 'caddy_has_bare_site' "$REPO/bin/adquit"                                  # their :80 demo is called out                                          # ...and so do sites
+grep -q 'caddy_has_bare_site' "$REPO/bin/adquit"                                  # their :80 demo is called out
+grep -q 'adquit.caddyfile, but that file does not exist' "$REPO/bin/adquit"        # a dangling import is named
+grep -q 'def start_portal_server' "$REPO/app.py"                                    # the start page has its own listener
+grep -q 'def portal_entries' "$REPO/app.py"                                         # and reads the same registry
+grep -q 'portal_enabled' "$REPO/app.py"                                             # switchable from the CLI
 grep -q "refusing to install app.py" "$REPO/install.sh"
 grep -q 'bg_run "$STATE_DIR/gravity.log"' "$BIN"                   # gravity must not own the pidfile
 # a 5M-rule warm-up is not an outage: the probe waits, status says so, stop does not lie
@@ -193,9 +197,30 @@ check "adquit will not open a second caddy global block" bash -c "
         | grep -q 'already opens a global block'
     '$BIN' proxy install --server caddy --port 80 --dry-run --no-catchall 2>&1 | grep -q 'no-catchall'
 "
-check "adquit keeps the dashboard reachable by the address people actually type" bash -c "
+check "adquit gives the typed address to the start page and the names to the dashboard" bash -c "
     export PATH='$TMP/stub':\$PATH
-    '$BIN' proxy install --server nginx --port 80 --dry-run 2>&1 | grep -q 'server_name .*192.0.2.5'
+    '$BIN' proxy install --server nginx --port 80 --dry-run 2>&1 | grep -q 'server_name home.lan.*192.0.2.5'
+    '$BIN' proxy install --server nginx --port 80 --dry-run 2>&1 | grep -q 'server_name adquit.lan adquit.local netblock.local'
+    '$BIN' --set portal_enabled false >/dev/null 2>&1
+    '$BIN' proxy install --server nginx --port 80 --dry-run 2>&1 | grep -q 'server_name adquit.lan.*192.0.2.5'
+    '$BIN' --set portal_enabled true >/dev/null 2>&1
+"
+check "adquit portal reports the start page and how to open it" bash -c "
+    '$BIN' portal status | grep -q 'LAN start page' &&
+    '$BIN' portal url | grep -Eq '^http://[0-9.]+:[0-9]+/$'
+"
+check "adquit portal on|off|title go through the engine" bash -c "
+    '$BIN' portal off >/dev/null &&
+    grep -q 'portal_enabled[^:]*: false' '$ADQUIT_HOME/data/config.json' &&
+    '$BIN' portal title 'Garage door' >/dev/null &&
+    grep -q 'Garage door' '$ADQUIT_HOME/data/config.json' &&
+    '$BIN' portal on >/dev/null &&
+    grep -q 'portal_enabled[^:]*: true' '$ADQUIT_HOME/data/config.json'
+"
+check "adquit routes home.lan and start.lan to the start page" bash -c "
+    '$BIN' proxy install --server nginx --port 80 --dry-run 2>&1 | grep -q 'server_name home.lan portal.lan start.lan' &&
+    '$BIN' proxy install --server caddy --port 80 --dry-run 2>&1 | grep -q '@adquit_portal host home.lan' &&
+    '$BIN' proxy install --server apache --port 80 --dry-run 2>&1 | grep -q 'ServerAlias home.lan'
 "
 check "adquit proxy refuses a bad port and an unknown server" bash -c "
     '$BIN' proxy install --port eight --dry-run >/dev/null 2>&1; test \$? -ne 0
@@ -219,6 +244,18 @@ check "adquit lan open validates every port it is given" bash -c "
     '$BIN' lan open abc >/dev/null 2>&1; test \$? -ne 0
     '$BIN' lan open 99999 >/dev/null 2>&1; test \$? -ne 0
     '$BIN' lan open 0 >/dev/null 2>&1; test \$? -ne 0
+"
+check "adquit set/get reach the engine config" bash -c "
+    '$BIN' set portal_title 'Garage door' >/dev/null &&
+    '$BIN' get portal_title | grep -q 'Garage door'
+"
+check "adquit site add keeps every site already published" bash -c "
+    '$BIN' site add one.lan --port 1111 >/dev/null &&
+    '$BIN' site add two.lan --port 2222 >/dev/null &&
+    '$BIN' site list | grep -q '127.0.0.1:1111' &&
+    '$BIN' site list | grep -q '127.0.0.1:2222' &&
+    '$BIN' site rm one.lan >/dev/null &&
+    '$BIN' site rm two.lan >/dev/null
 "
 check "adquit lan-zone add/list/rm round-trip" bash -c "
     '$BIN' lan-zone add lan 127.0.0.1:5399 >/dev/null &&

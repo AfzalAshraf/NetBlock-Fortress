@@ -963,6 +963,107 @@ class TestProxyAware(unittest.TestCase):
             nb.CFG.clear(); nb.CFG.update(cfg)
 
 
+class TestStartPage(unittest.TestCase):
+    """`adquit site add` should be enough to get a tile on a LAN start page.
+
+    The registry the resolver reads is the registry the page reads, so there is no second
+    place to keep in sync - and the page is unauthenticated on purpose (it links to things
+    every device on this network may already open), which is only safe if it leaks nothing
+    but names, and escapes them.
+    """
+
+    def setUp(self):
+        self.cfg = dict(nb.CFG)
+        nb.CFG.update({"portal_enabled": True, "portal_port": 8082,
+                       "portal_title": "Home on the NAS", "portal_note": "",
+                       "local_records": {}, "lan_zones": {}, "answer_fortress_names": True,
+                       "sinkhole_mode": "zeroip", "sinkhole_ip": "192.0.2.50"})
+
+    def tearDown(self):
+        nb.CFG.clear()
+        nb.CFG.update(self.cfg)
+
+    def test_names_are_answered_only_while_the_page_is_on(self):
+        self.assertIn("home.lan", nb.portal_names())
+        self.assertIn("home.local", nb.portal_names())
+        self.assertIn("home.lan", nb.fortress_names())
+        nb.CFG["portal_enabled"] = False
+        self.assertEqual(nb.portal_names(), [])
+        self.assertNotIn("home.lan", nb.fortress_names())
+
+    def test_tile_links_follow_how_the_site_is_served(self):
+        nb.CFG["local_records"] = {
+            "media.lan": {"port": 8096},                      # proxied -> the name, no port
+            "nas.lan": {"ip": "192.0.2.9", "proxy": False},    # another box, DNS only
+            "old.lan": {"ip": "192.0.2.9", "port": 8081, "proxy": False},  # other box, real port
+        }
+        by = {e["name"]: e for e in nb.portal_entries()}
+        self.assertEqual(by["media.lan"]["url"], "http://media.lan/")
+        self.assertEqual(by["nas.lan"]["url"], "http://192.0.2.9/")
+        self.assertEqual(by["old.lan"]["url"], "http://192.0.2.9:8081/")
+        self.assertEqual(nb.portal_entries()[-1]["kind"], "fortress",
+                         "the dashboard is the last tile, not a site you publish")
+
+    def test_free_text_is_escaped_and_nothing_secret_shows_up(self):
+        nb.CFG["local_records"] = {"x.lan": {"port": 1, "note": "<script>alert(1)</script>"}}
+        html = nb.render_portal_html()
+        self.assertNotIn("<script>alert", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertIn("Home on the NAS", html)
+        for secret in ("api_token", "password_hash"):
+            self.assertNotIn(secret, html)
+
+    def test_the_empty_page_tells_you_the_command(self):
+        html = nb.render_portal_html()
+        self.assertIn("Nothing published yet", html)
+        self.assertIn("adquit site add", html)
+
+    def test_the_listener_serves_the_page_and_json(self):
+        import json
+        import urllib.error
+        import urllib.request
+        nb.CFG["local_records"] = {"media.lan": {"port": 8096}}
+        # an ephemeral port: whatever else this box happens to be running must not decide
+        import socket as _sock
+        probe = _sock.socket()
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+        probe.close()
+        httpd = nb.start_portal_server(port=free)
+        self.assertIsNotNone(httpd, "the portal listener must come up")
+        base = "http://127.0.0.1:%s" % httpd.server_address[1]
+        try:
+            with urllib.request.urlopen(base + "/", timeout=5) as r:
+                body = r.read().decode()
+                self.assertEqual(r.headers.get("X-Adquit"), "portal")
+            self.assertIn("http://media.lan/", body)
+            with urllib.request.urlopen(base + "/portal.json", timeout=5) as r:
+                data = json.loads(r.read().decode())
+            self.assertEqual([e["name"] for e in data["entries"]][:1], ["media.lan"])
+            # an unknown path lands on the page, and nothing is writable here
+            req = urllib.request.Request(base + "/whatever", data=b"hi", method="POST")
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                self.fail("POST must be refused")
+            except urllib.error.HTTPError as exc:
+                self.assertEqual(exc.code, 405)
+            with urllib.request.urlopen(base + "/photos", timeout=5) as r:
+                self.assertEqual(r.status, 200)     # followed the 302 to /
+                self.assertIn("<!doctype html>", r.read().decode())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_disabled_and_busy_ports_do_not_break_the_boot(self):
+        nb.CFG["portal_enabled"] = False
+        self.assertIsNone(nb.start_portal_server())
+        nb.CFG["portal_enabled"] = True
+        nb.CFG["portal_port"] = 0
+        self.assertIsNone(nb.start_portal_server())
+        nb.CFG["portal_port"] = 1
+        self.assertIsNone(nb.start_portal_server(), "no privilege: log it, do not raise")
+
+
 class TestDependencyGate(unittest.TestCase):
     """`--version` / `--doctor` must answer even on a box where flask/requests/dnslib
     are gone (wiped venv, bare `python3 app.py`), and starting the service must

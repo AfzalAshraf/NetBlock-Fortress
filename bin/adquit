@@ -16,7 +16,7 @@ set -o pipefail
 # must replay *every* argument (`adquit block a.com b.com`), not just the verb.
 ORIG_ARGS=("$@")
 
-VERSION_TAG="19.2"
+VERSION_TAG="19.3"
 REPO="${ADQUIT_REPO:-AfzalAshraf/NetBlock-Fortress}"
 REF="${ADQUIT_REF:-main}"
 RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
@@ -424,6 +424,30 @@ dns_port() {
 web_port() {
     "$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('web_port',8080))" 2>/dev/null \
         || printf '%s' "${ADQUIT_WEB_PORT:-8080}"
+}
+
+portal_cfg() { # "<enabled> <port>", read from the live config, with sane fallbacks
+    "$PY" - "$STATE_DIR/config.json" <<'PCFG' 2>/dev/null || printf '1 8082'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    c = {}
+print("1" if c.get("portal_enabled", True) else "0", c.get("portal_port", 8082))
+PCFG
+}
+
+portal_count() {
+    "$PY" -c "import json;print(len(json.load(open('$STATE_DIR/config.json')).get('local_records') or {}))" \
+        2>/dev/null || printf 0
+}
+
+portal_url() { # how another device opens the start page; non-zero when it is switched off
+    local cfg on pp ip
+    cfg="$(portal_cfg)"; on="${cfg%% *}"; pp="${cfg##* }"
+    [ "$on" = "1" ] || return 1
+    ip="$(lan_ip | head -n1)"
+    printf 'http://%s:%s/' "${ip:-127.0.0.1}" "$pp"
 }
 
 health_ok() {
@@ -840,6 +864,8 @@ except Exception:
 print("web=%s" % c.get("web_port", 8080))
 print("sink_mode=%s" % c.get("sinkhole_mode", "zeroip"))
 print("sink_port=%s" % c.get("sinkhole_port", 80))
+print("portal=%s" % ("1" if c.get("portal_enabled", True) else "0"))
+print("portal_port=%s" % c.get("portal_port", 8082))
 recs = c.get("local_records")
 recs = recs if isinstance(recs, dict) else {}
 for name in sorted(recs):
@@ -856,6 +882,7 @@ METAPY
 
 PWEB=8080; PSINK_MODE="zeroip"; PSINK_PORT=80; PSINK_EFF=80
 PSITES=()
+PPORT_ON=1; PPORT_PORT=8082
 PCATCH=1          # 0 = do not claim the port's default host (for a box that already serves :80)
 PGLOBAL=1         # caddy only: 0 = the user's Caddyfile already has a global options block
 PCFILE="/etc/caddy/Caddyfile"
@@ -867,13 +894,39 @@ proxy_load() {
             web=*)       PWEB="${line#web=}" ;;
             sink_mode=*) PSINK_MODE="${line#sink_mode=}" ;;
             sink_port=*) PSINK_PORT="${line#sink_port=}" ;;
+            portal=*)    PPORT_ON="${line#portal=}" ;;
+            portal_port=*) PPORT_PORT="${line#portal_port=}" ;;
             site=*)      PSITES+=("${line#site=}") ;;
         esac
     done < <(proxy_meta)
 }
 
+PPORT_SEEN=""
+portal_is_on() { # one config read per invocation, memoised (the renderers ask several times)
+    [ -n "$PPORT_SEEN" ] || { local cfg; cfg="$(portal_cfg)"; PPORT_SEEN="${cfg%% *}"; }
+    [ "$PPORT_SEEN" = "1" ]
+}
+
+lan_addrs_list() { # this box's own addresses, deduped, primary first - a router box stops at four
+    local a out="" n=0 x
+    a="$(lan_ip)"
+    [ -n "$a" ] && out="$a"
+    for x in $(lan_addrs); do
+        case " $out " in *" $x "*) continue ;; esac
+        [ "$n" -ge 3 ] && break
+        out="$out $x"; n=$((n + 1))
+    done
+    printf '%s' "${out# }"
+}
+
+portal_names() { # home.lan / portal.lan / start.lan - keep in step with portal_names() in app.py
+    printf 'home.lan portal.lan start.lan home.local portal.local start.local'
+}
+
+portal_block_on() { [ "$PPORT_ON" = 1 ] && [ "${PPORT_PORT:-0}" -gt 0 ] 2>/dev/null; }
+
 dash_names() { # what the dashboard answers on - keep in step with fortress_names()
-    local h a x seen n=0
+    local h a
     h="$(hostname 2>/dev/null | tr 'A-Z' 'a-z')"
     printf 'adquit.lan adquit.local netblock.local'
     case "$h" in
@@ -882,16 +935,18 @@ dash_names() { # what the dashboard answers on - keep in step with fortress_name
         *.*) printf ' %s %s.local' "$h" "${h%%.*}" ;;         # FQDN + its short form
         *)   printf ' %s.local %s.lan' "$h" "$h" ;;
     esac
-    # and the number, because on a LAN that is what gets typed. Once the proxy owns :80, an
-    # unclaimed Host lands on the catch-all (splash page / sinkhole) instead of the dashboard.
-    a="$(lan_ip)"
-    [ -n "$a" ] && printf ' %s' "$a"
-    seen=" $a "
-    for x in $(lan_addrs); do
-        case "$seen" in *" $x "*) continue ;; esac
-        [ "$n" -ge 3 ] && break                                # a router box with 40 interfaces
-        printf ' %s' "$x"; seen="$seen$x "; n=$((n + 1))       # should not get the dashboard
-    done
+    # The number is what gets typed on a LAN, so somebody has to answer it: while the start page
+    # exists it does ("what is on this box?"), and without it the dashboard takes it back.
+    if ! portal_is_on; then
+        for a in $(lan_addrs_list); do printf ' %s' "$a"; done
+    fi
+}
+
+portal_serve_names() { # what the start page answers on: its own names, plus the bare address
+    printf '%s' "$(portal_names)"
+    portal_is_on || return 0
+    local a
+    for a in $(lan_addrs_list); do printf ' %s' "$a"; done
 }
 
 # caddy allows exactly ONE global options block per Caddyfile. If the user already has one, an
@@ -905,6 +960,13 @@ lines = [l.strip() for l in open(sys.argv[1], encoding="utf-8", errors="replace"
 lines = [l for l in lines if l and not l.startswith("#")]
 sys.exit(0 if lines and lines[0] == "{" else 1)
 HASGLOB
+}
+
+caddy_dangling_import() { # their Caddyfile imports a fragment that was never written
+    [ -r "$PCFILE" ] || return 1
+    grep -q "adquit.caddyfile" "$PCFILE" || return 1
+    [ -f "$PFILE" ] && return 1
+    return 0
 }
 
 caddy_has_bare_site() { # $1 = port - does their Caddyfile already own it for *every* host?
@@ -930,6 +992,9 @@ render_nginx() { # $1 = listen port
     local port="$1" s name pt host ws prox sites="" catch=""
     if [ "$PSINK_MODE" = "fortress" ]; then
         catch="$(printf '    # blocked ad domains resolve here, so the splash page keeps working\n    location / {\n        proxy_pass http://127.0.0.1:%s;\n        proxy_set_header Host $host;\n    }' "${PSINK_EFF:-$PSINK_PORT}")"
+    elif portal_block_on; then
+        # nothing to sinkhole to, and a stray Host is far more useful as the start page
+        catch="$(printf '    # every other name on this port lands on the LAN start page\n    location / {\n        proxy_pass http://127.0.0.1:%s;\n        proxy_set_header Host $host;\n    }' "$PPORT_PORT")"
     else
         catch='    # nothing to sinkhole to: answer instantly instead of letting clients hang
     location / { return 204; }'
@@ -982,6 +1047,13 @@ NGX
     }
 }
 NGX
+    if portal_block_on; then
+        printf '\nserver {\n    listen %s;\n    server_name %s;\n    location / {\n' \
+            "$port" "$(portal_serve_names)"
+        printf '        proxy_pass http://127.0.0.1:%s;\n' "$PPORT_PORT"
+        nginx_common_headers
+        printf '    }\n}\n'
+    fi
     [ -n "$sites" ] && printf '%s\n' "$sites"
 }
 
@@ -1011,10 +1083,19 @@ render_caddy() { # $1 = listen port
         printf '# add these two options there and websockets/LAN names behave correctly:\n'
         printf '#   auto_https off\n#   servers { trusted_proxies static private_ranges }\n\n'
     fi
+    if portal_block_on; then
+        blocks="$blocks
+	@adquit_portal host $(portal_serve_names)
+	handle @adquit_portal {
+		reverse_proxy 127.0.0.1:$PPORT_PORT
+	}"
+    fi
     printf ':%s {\n%s\n' "$port" "$blocks"
     if [ "$PCATCH" = 1 ]; then
         if [ "$PSINK_MODE" = "fortress" ]; then
             printf '\thandle {\n\t\t# blocked ad domains -> the fortress splash page\n\t\treverse_proxy 127.0.0.1:%s\n\t}\n' "${PSINK_EFF:-$PSINK_PORT}"
+        elif portal_block_on; then
+            printf '\thandle {\n\t\t# every other Host on this port: the LAN start page\n\t\treverse_proxy 127.0.0.1:%s\n\t}\n' "$PPORT_PORT"
         else
             printf '\thandle {\n\t\trespond "NetBlock Fortress" 200\n\t}\n'
         fi
@@ -1055,7 +1136,14 @@ APX
     printf '\n<VirtualHost *:%s>\n    ServerName %s\n    ServerAlias %s\n' \
         "$port" "$(dash_names | awk '{print $1}')" "$(dash_names)"
     printf '    ProxyPreserveHost On\n    ProxyPass / http://127.0.0.1:%s/ retry=0 timeout=300\n' "$PWEB"
-    printf '    ProxyPassReverse / http://127.0.0.1:%s/\n</VirtualHost>%s\n' "$PWEB" "$blocks"
+    printf '    ProxyPassReverse / http://127.0.0.1:%s/\n</VirtualHost>' "$PWEB"
+    if portal_block_on; then
+        printf '\n\n<VirtualHost *:%s>\n    ServerName home.lan\n    ServerAlias %s\n' \
+            "$port" "$(portal_serve_names)"
+        printf '    ProxyPreserveHost On\n    ProxyPass / http://127.0.0.1:%s/ retry=0 timeout=300\n' "$PPORT_PORT"
+        printf '    ProxyPassReverse / http://127.0.0.1:%s/\n</VirtualHost>' "$PPORT_PORT"
+    fi
+    printf '%s\n' "$blocks"
 }
 
 proxy_validate() { # the syntax check for each proxy - run directly, never via eval
@@ -1137,6 +1225,11 @@ cmd_proxy() {
     [ -n "$want" ] || want="nginx"
     proxy_paths "$want"
     if [ "$want" = caddy ]; then
+        if caddy_dangling_import; then
+            warn "$PCFILE imports adquit.caddyfile, but that file does not exist - caddy will not start"
+            warn "  write it:  sudo adquit proxy install --server caddy --port $port"
+            warn "  or drop the line:  sudo sed -i '/adquit.caddyfile/d' $PCFILE && sudo systemctl restart caddy"
+        fi
         caddy_has_global && PGLOBAL=0
         if caddy_has_bare_site "$port"; then
             warn "$PCFILE already has a bare '$port {' site - that block answers every host on :$port"
@@ -1166,6 +1259,12 @@ cmd_proxy() {
         fi
         [ -n "$PLINK" ] && printf '  enabled    %s\n' "$PLINK"
         printf '  dashboard  %s -> 127.0.0.1:%s\n' "$(dash_names | tr ' ' ', ')" "$PWEB"
+        if portal_block_on; then
+            printf '  start page %s -> 127.0.0.1:%s  (%s on every device)\n' \
+                "$(portal_serve_names | tr ' ' ', ')" "$PPORT_PORT" "http://home.lan/"
+        else
+            printf '  start page %soff%s - sudo adquit portal on\n' "$Y" "$N"
+        fi
         local s n p h w x
         for s in "${PSITES[@]}"; do
             IFS='|' read -r n p h w x <<<"$s"
@@ -1345,6 +1444,7 @@ SITEPY
             printf '  proxy     http://%s -> %s:%s   after: %ssudo adquit proxy install%s\n' \
                 "$name" "${host:-127.0.0.1}" "$port" "$B" "$N"
         fi
+        printf '  tile      it is on the start page now: %s\n' "$(portal_url || printf 'run: sudo adquit portal url')"
         printf '  note      names you publish are answered before the block engine runs, so a site\n'
         printf '          you host on the LAN can never be swallowed by a 5M-rule list\n'
         ;;
@@ -1386,6 +1486,57 @@ RMPY
         printf '  LAN zones     names under a zone go to your router: sudo adquit lan-zone add .lan %s\n' "${ADQUIT_LAN_DNS:-<router-ip>}"
         ;;
       *) die "usage: adquit site add|rm|list ..." ;;
+    esac
+}
+
+cmd_portal() {
+    local verb="${1:-status}"; shift || true
+    local cfg on pp ip n url
+    cfg="$(portal_cfg)"; on="${cfg%% *}"; pp="${cfg##* }"
+    ip="$(lan_ip | head -n1)"; n="$(portal_count)"
+    url="http://${ip:-127.0.0.1}:$pp/"
+    case "$verb" in
+      on|off)
+        [ -f "$APP" ] || die "not installed yet - run: adquit install"
+        local want=true; [ "$verb" = "off" ] && want=false
+        run_as_engine --set portal_enabled "$want" >/dev/null || die "the engine refused the change"
+        say "start page $verb"
+        if [ "$verb" = "on" ]; then
+            printf '  %s%s%s  (%s tile%s - one per published site)\n' "$B" "$url" "$N" "$n" "$([ "$n" = 1 ] || printf s)"
+            printf '  other devices need it open:  sudo adquit portal open\n'
+        else
+            printf '  the listener is released on the next restart\n'
+        fi
+        return 0 ;;
+      title)
+        [ -n "${1:-}" ] || die "usage: adquit portal title \"Home on the NAS\""
+        [ -f "$APP" ] || die "not installed yet - run: adquit install"
+        run_as_engine --set portal_title "$1" >/dev/null || die "the engine refused the change"
+        say "start page titled: $1"
+        return 0 ;;
+      add)
+        cmd_site add "$@"
+        return 0 ;;
+      url)
+        [ "$on" = "1" ] || die "the start page is off - sudo adquit portal on"
+        printf '%s\n' "$url"
+        return 0 ;;
+      open)
+        cmd_lan open "$pp"
+        return 0 ;;
+      status|"")
+        printf '%sLAN start page%s\n' "$B" "$N"
+        if [ "$on" = "1" ]; then
+            printf '  url        %s  (any device on this network)\n' "$url"
+            printf '  names      home.lan, portal.lan, start.lan  (the fortress answers these)\n'
+            printf '  tiles      %s published site%s\n' "$n" "$([ "$n" = 1 ] || printf s)"
+            printf '  add one    sudo adquit site add media.lan --port 8096\n'
+            printf '  one port   sudo adquit proxy install --port %s   then http://home.lan/\n' "80"
+        else
+            printf '  %soff%s - sudo adquit portal on\n' "$Y" "$N"
+        fi
+        return 0 ;;
+      *) die "usage: adquit portal [status|on|off|title <text>|add <name> --port <n>|url|open]" ;;
     esac
 }
 
@@ -1476,6 +1627,11 @@ cmd_lan() {
             fi
             [ "$extra" = "$p" ] || ports="$ports $extra"
         done
+        if [ "$#" -le 1 ]; then
+            # nothing extra asked for: the start page is the other half of "reachable"
+            local pcap; pcap="$(portal_cfg)"
+            [ "${pcap%% *}" = "1" ] && [ "${pcap##* }" != "$p" ] && ports="$ports ${pcap##* }"
+        fi
     fi
     printf '%sReachability of the fortress dashboard%s\n' "$B" "$N"
     printf '  listening   : '
@@ -1532,6 +1688,8 @@ cmd_block()  { run_as_engine --block "$@"; }
 cmd_allow()  { run_as_engine --allow "$@"; }
 cmd_unblock(){ run_as_engine --unblock "$@"; }
 cmd_passwd() { run_as_engine --passwd "$@"; }
+cmd_set()    { run_as_engine --set "$@"; }
+cmd_get()    { run_as_engine --get "$@"; }
 cmd_feed()   {
     local url="$1" name="${2:-}"
     [ -n "$url" ] || die "usage: adquit blocklist add <url> [name]"
@@ -1638,6 +1796,8 @@ ${B}MAINTENANCE${N}
   adquit site add media.lan --port 8096   publish a self-hosted site on the LAN
   adquit proxy install        one port for every site: nginx/Caddy/Apache vhosts
   adquit lan-zone add .lan <router-ip>    let the router answer printer.lan, nas.lan
+  adquit portal             the start page for everything you published (home.lan)
+  adquit set <key> <value>  change any config key, live (adquit get shows them all)
   adquit passwd [new]       change the dashboard password
   adquit protect on|off     point THIS machine's DNS at the fortress
   adquit uninstall [--keep-data]
@@ -1663,7 +1823,7 @@ cmd_run() {
 # that writes state or controls the service. Reads stay unprivileged.
 case "${1:-}" in
     start|stop|restart|run|install|update|upgrade|gravity|pull|update-lists|mode|block|\
-    allow|unblock|blocklist|feed|passwd|password|protect|uninstall|remove|export|lan|reach|site|lan-zone|proxy)
+    allow|unblock|blocklist|feed|passwd|password|protect|uninstall|remove|export|lan|reach|site|lan-zone|proxy|portal|set|get|--set|--get)
         elevate_for "${1:-}" ;;
 esac
 
@@ -1691,6 +1851,9 @@ case "${1:-}" in
     lan|reach)     shift; cmd_lan "$@" ;;
     site|sites)    shift; cmd_site "$@" ;;
     lan-zone|zone) shift; cmd_lan_zone "$@" ;;
+    portal|home|startpage) shift; cmd_portal "$@" ;;
+    set|--set)   shift; cmd_set "$@" ;;
+    get|--get)   shift; cmd_get "$@" ;;
     proxy)         shift; cmd_proxy "$@" ;;
     stats)         cmd_stats ;;
     json)          run_as_engine --json ;;

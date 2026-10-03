@@ -146,6 +146,7 @@ adquit lan open [80 443]     open the dashboard (and any other LAN port) in ufw/
 adquit site add media.lan --port 8096   publish a self-hosted site by name; the fortress
                             resolves it itself, so a 5M-rule list can never swallow it
 adquit site list | rm NAME    what is published, and take one down
+adquit portal             the start page of everything you published
 adquit lan-zone add .lan 192.168.1.1    printer.lan / nas.lan: ask the router, never a
                             public resolver (adquit lan-zone list | rm SUFFIX)
 adquit proxy install          nginx/Caddy/Apache vhosts: every published site on one port
@@ -295,6 +296,21 @@ sudo adquit lan-zone add .lan                 # no address = the gateway this bo
 sudo adquit lan-zone add .lan 10.0.0.1        # ...or name it; an address off your subnet is warned about
 ```
 
+**Your start page** — every published site is also a tile on a page the fortress serves itself:
+
+```bash
+adquit portal                 status: URL, how many tiles, how to add one
+sudo adquit portal title "Home on the NAS"
+sudo adquit portal off        # or move it: sudo adquit set portal_port 8090
+sudo adquit portal open       # open the portal's port on the firewall too
+```
+
+`http://<this box>:8082/` works with no web server installed at all. Once `proxy install` has run,
+`http://home.lan/` (also `portal.lan`, `start.lan`) shows the same page, and **any name on that port
+that is not one of yours** lands on it instead of a dead 204. The page is read-only and shows
+nothing but the names and addresses you published — no token, no password, no statistics — so a
+device can open it without a login while the dashboard stays behind one.
+
 Then point the devices (or the router's DNS) at the fortress and `http://media.lan/` works from
 anywhere on the network — including on devices that already use the fortress *because* it is
 their resolver. A `site add` needs no restart: the running resolver picks the record up on the
@@ -314,7 +330,7 @@ README): `adquit lan` prints the subnet you are on, and publishing an address ou
 warning, because an unreachable target makes those names time out instead of answering.
 
 `adquit.lan`, `adquit.local` and `<hostname>.local/.lan` resolve to the fortress by design (that
-is the URL `adquit lan` prints); `sudo adquit --set answer_fortress_names false` if you want them
+is the URL `adquit lan` prints); `sudo adquit set answer_fortress_names false` if you want them
 silent. Blocked ad hosts keep resolving to the fortress while `sinkhole_mode=fortress`, so after
 `proxy install --port 80` an ad slot is served your empty 1×1 pixel over port 80 as well — the
 blocker and the web server are the same box on purpose.
@@ -337,9 +353,10 @@ blocker and the web server are the same box on purpose.
   config if the new one would not start.
 * Caddy is the one server it cannot wire up silently: the rendered `/etc/caddy/adquit.caddyfile`
   needs one line in your Caddyfile (`import adquit.caddyfile`), which `proxy install` prints.
-* After `proxy install` owns the port, the dashboard is served by name — `adquit.lan`,
-  `<hostname>.local`, and **the box's own addresses**, because that is what gets typed into a phone
-  browser. Everything else that lands on the port gets the sinkhole (or a 200), not your dashboard.
+* After `proxy install` owns the port, the **names** belong to the dashboard (`adquit.lan`,
+  `<hostname>.local`), and the **bare address** — the thing people actually type into a phone —
+  belongs to the start page while it exists. Turn the portal off and the address goes back to the
+  dashboard, so nothing about the old behaviour is lost, only preferred.
 * If the web server you picked already listens on that port (caddy on :80 is the common case),
   that is not a conflict: `proxy install` adds vhosts to the server that owns the port and only
   refuses when a *different* server holds it.
