@@ -763,8 +763,6 @@ CORE_SEED = {
     "adverticum.net": "banner", "advertise.com": "banner", "advertstream.com": "banner",
     "advisigo.com": "banner", "adwebersisterlabs.com": "banner", "adworx.be": "banner",
 }
-CORE_SEED_DOMAINS = set(CORE_SEED)
-
 # ──────────────────────────────────────────────
 #  Trusted zones: the pattern/heuristic engine never fires on these
 #  (registrable domains only, so ads.google.com stays but
@@ -908,12 +906,6 @@ def _sync_legacy_views(custom_blocked=None):
     CUSTOM_WHITELIST = set(CUSTOM_WHITELIST_SET)
 
 
-def audit_threat(domain):
-    """v18 compatibility shim: (action, category, color)."""
-    v = classify(domain)
-    return v["action"], v["cat"], v["color"]
-
-
 def _write_banners():
     banner = (
         "  ================================================================\n"
@@ -932,7 +924,6 @@ def _write_banners():
 BLOCKED = {}            # exact domain -> (cat, vector, source_list_id)
 WILDCARDS = {}          # parent domain -> (cat, vector, source)   (matches the domain + any sub)
 UNBREAK = set()         # adblock "@@" exceptions => never block (anti-breakage)
-ENGINE_STATS = defaultdict(int)
 LIST_LOCK = threading.RLock()
 
 TOTAL_QUERIES = 0
@@ -1294,10 +1285,6 @@ AD_LABELS = frozenset([
     "tpsc", "tpsc1", "tpsc-video", "adscout", "adspeed", "adspirit", "adtarget",
 ])
 
-# 3rd-party ad "sync/segment" endpoints that live on publisher domains
-SYNC_PATH_HOSTS = frozenset(["cm.g.doubleclick.net", "sync.1rx.io", "adsync.com",
-                             "ib.adnxs.com", "match.adsrvr.org", "cms.quantserve.com"])
-
 LABEL_TLD_GUARD = re.compile(r"^(?:[a-z0-9-]+\.)+(?:com|net|org|info|biz|co|io|me|tv|cc|xyz|online|site|shop|live|top|ru|cn|in|br|uk|de|fr|es|it|nl|pl|tr|jp|kr|au|ca|ch|se|no|dk|fi|be|at|ie|cz|gr|pt|ro|hu|ua|ru|za|mx|ar|cl|co\.id|co\.in|com\.br|com\.mx|co\.uk|com\.au|com\.sg|co\.jp|or\.kr)$")
 
 # Hosts that *look* ad-ish but must keep working (advertiser dashboards, etc.)
@@ -1427,8 +1414,6 @@ def vector_active(vec, cat):
 
 
 SAFETY_CATS = {"malware", "phishing", "spam", "security", "abuse", "crypto", "adult", "gambling"}
-
-CUSTOM_PROTECTED = set()   # set by load_custom_lists(): users' own dashboard host etc.
 
 
 def rebuild_master_blocklist(persist=True):
@@ -2377,12 +2362,6 @@ def housekeeping_worker():
 # ──────────────────────────────────────────────
 #  DNS servers (UDP + TCP, bounded thread pool)
 # ──────────────────────────────────────────────
-SAFE_SEARCH_TARGETS = {
-    "google": ("www.google.com", "forcesafe-search.com"),
-    "youtube": ("www.youtube.com", "restrict.youtube.com"),
-    "bing": ("www.bing.com", "strict.bing.com"),
-    "duckduckgo": ("duckduckgo.com", None),
-}
 SAFE_SEARCH_HOSTS = {
     "www.google.com": "forcesafe-search.com", "google.com": "forcesafe-search.com",
     "images.google.com": "forcesafe-search.com", "www.youtube.com": "restrict.youtube.com",

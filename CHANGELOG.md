@@ -38,11 +38,28 @@
   command" - the engine accepted it, the wrapper did not, and every key we expose for editing needs
   a path from a normal user's shell that elevates through the same trigger as the other config
   verbs.
-- Tests: 86 engine (was 80) - link shapes per proxy mode, escaping, the empty state, the live
-  listener's page/JSON/302/405, and that a busy port or a disabled switch never raises - plus 43
-  CLI contract checks (was 35): `portal status|url|on|off|title`, `set`/`get`, that a second `site
-  add` does not erase the first, the start-page vhosts in all three renders, the dangling-import
-  message, and that a Caddyfile which cannot be parsed is named before we feed it anything.
+- **Nothing in `app.py` may be unreachable.** `CORE_SEED_DOMAINS`, `ENGINE_STATS`, `SYNC_PATH_HOSTS`,
+  `CUSTOM_PROTECTED`, `SAFE_SEARCH_TARGETS` and the `audit_threat` v18 shim were each defined and
+  read by nobody - a constant nobody reads is not a spare part, it is a second and wrong opinion
+  about how the engine works (`SAFE_SEARCH_HOSTS` is the table safe search actually answers from;
+  the box's own names are answered before the blocklists are consulted, which is all
+  `CUSTOM_PROTECTED` was ever *commented* about, not enforced). 21 lines gone, no behaviour touched.
+- That is a gate now, not a one-off: hygiene tests read the source and fail with the line to delete -
+  unreachable module-level names, imports nobody uses, and any `DEFAULT_CONFIG` key nothing reads
+  (all 55 are read). A name used only by the suite or the CLI counts as used, because both are how
+  people reach this module; an exception has to be earned with `# hygiene: keep` on its own line.
+  The gate's own failure is tested with a planted orphan, so it cannot quietly become decoration.
+- `tests/doc_contract.sh` compares the CLI's usage block and the README's fenced commands against
+  the verbs the dispatcher actually accepts - the exact bug class of the `--set` line above, which
+  sat in the README for three releases because nothing ever read the help text. 51 verbs, all real.
+- The README's own test count is now one of the things the suite checks: a stale number means the
+  docs stopped being read, and that is how `59-test` survived three versions of growth.
+- Tests: 90 engine (was 80) - link shapes per proxy mode, escaping, the empty state, the live
+  listener's page/JSON/302/405, that a busy port or a disabled switch never raises, and the four
+  hygiene checks - plus 42 CLI contract checks (was 35): `portal status|url|on|off|title`,
+  `set`/`get`, that a second `site add` does not erase the first, the start-page vhosts in all three
+  renders, the dangling-import message, that a Caddyfile which cannot be parsed is named before we
+  feed it anything, and the docs-versus-dispatch contract.
 
 ## v19.2 — the fortress also serves your own sites ("Self-Host")
 

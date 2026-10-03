@@ -260,6 +260,8 @@ check "adquit says so when the Caddyfile it is about to feed will not load" bash
     ! ADQUIT_CADDYFILE='$TMP/Caddyfile.good' \
         '$BIN' proxy install --server caddy --port 80 --dry-run 2>&1 | grep -q 'does not load'
 "
+check "every documented adquit verb exists in the CLI" \
+      bash "$REPO/tests/doc_contract.sh" "$REPO"
 check "adquit proxy refuses a bad port and an unknown server" bash -c "
     '$BIN' proxy install --port eight --dry-run >/dev/null 2>&1; test \$? -ne 0
     '$BIN' proxy install --server tomcat --dry-run >/dev/null 2>&1; test \$? -ne 0

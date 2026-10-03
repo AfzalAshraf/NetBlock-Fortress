@@ -8,9 +8,11 @@ tests/fixtures into it as custom lists, imports app.py and asserts that the
 micro/macro engine blocks what it must and never touches what it must not.
 """
 
+import ast
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -1125,6 +1127,163 @@ except BaseException as exc:               # a broken import escaping the gate
         self.assertIn("needs the Python package(s)", res.stderr)
         self.assertIn("pip install", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
+
+
+def _mentions(name, text):
+    """Whole-word only: `CFG` must not match inside `CFGX`, or a key inside a comment about it."""
+    return re.search(r"\b%s\b" % re.escape(name), text) is not None
+
+
+def _kept(line, marker):
+    """An exception that has to be earned: the marker sits on the definition's own line."""
+    return marker in line
+
+
+class TestHygiene(unittest.TestCase):
+    """Nothing in app.py may be unreachable, and every exposed key must be reachable by hand.
+
+    A five-thousand-line engine accumulates spare parts: a constant defined and never read, a
+    compatibility shim nobody calls any more, a key in DEFAULT_CONFIG nothing consults. Each one
+    is a second, wrong opinion about how the engine works, paid for by the next reader - so v19.3
+    deleted `CORE_SEED_DOMAINS`, `ENGINE_STATS`, `SYNC_PATH_HOSTS`, `CUSTOM_PROTECTED`,
+    `SAFE_SEARCH_TARGETS` (the live table is `SAFE_SEARCH_HOSTS`) and the `audit_threat` shim,
+    and these tests are what keeps them from creeping back. They read the source instead of
+    running it, so they cost milliseconds and fail with the line to delete. An exception has to
+    be earned: `# hygiene: keep` on the definition's own line, with a reason.
+    """
+
+    KEEP = "# hygiene: keep"
+    SURFACE = ("bin/adquit", "install.sh", "uninstall.sh", "README.md", "CHANGELOG.md",
+               "Dockerfile", "Makefile", "docker-compose.yml", ".github/workflows/ci.yml",
+               ".github/workflows/release.yml", "tests/run_tests.py", "tests/test_cli.sh",
+               "tests/doc_contract.sh")
+
+    def _sources(self):
+        """app.py's text, plus everything allowed to reach into it.
+
+        A name used only by a test is used: `tests/` is how an operator's shell and this suite
+        drive the module, and the CLI reaches config keys by string (`--set`, `--get`), so the
+        shell files count as readers of the config surface too.
+        """
+        src = (REPO / "app.py").read_text(encoding="utf-8")
+        others = []
+        for rel in self.SURFACE:
+            path = REPO / rel
+            if path.exists():
+                others.append(path.read_text(encoding="utf-8", errors="ignore"))
+        return src, "\n".join(others)
+
+    @staticmethod
+    def _module_items(tree):
+        """(name, first, last, must_keep) for every module-level definition and constant."""
+        items = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                items.append((node.name, node.lineno, node.end_lineno, bool(node.decorator_list)))
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        items.append((target.id, node.lineno, node.end_lineno, False))
+        return items
+
+    def test_no_unreachable_module_level_names(self):
+        src, others = self._sources()
+        lines = src.splitlines()
+        tree = ast.parse(src)
+        items = self._module_items(tree)
+
+        inside = [False] * (len(lines) + 1)
+        for _, first, last, _dec in items:
+            for i in range(first - 1, min(last, len(lines))):
+                inside[i] = True
+        outside = "\n".join("" if inside[i] else line for i, line in enumerate(lines))
+
+        by_name = {}
+        for name, first, last, dec in items:
+            by_name.setdefault(name, (first, last, dec))
+
+        live = set()
+        for name, first, last, dec in items:
+            if _kept(lines[first - 1], self.KEEP):
+                continue
+            if dec:
+                live.add(name)          # reached through a URL, not through a name
+            elif _mentions(name, outside) or _mentions(name, others):
+                live.add(name)
+        for _ in range(20):             # a name is live if a live body reaches it
+            grew = False
+            for name, first, last, dec in items:
+                if name in live or _kept(lines[first - 1], self.KEEP):
+                    continue
+                for lname in list(live):
+                    lfirst, llast, _ = by_name[lname]
+                    if _mentions(name, "\n".join(lines[lfirst - 1:llast])):
+                        live.add(name)
+                        grew = True
+                        break
+            if not grew:
+                break
+
+        dead = ["%s (line %d)" % (name, first)
+                for name, first, last, dec in items
+                if name not in live and not _kept(lines[first - 1], self.KEEP)]
+        self.assertFalse(
+            dead,
+            "unreachable in app.py: %s - delete it, or write why it must stay on its own line "
+            "(%s)" % ("; ".join(dead), self.KEEP))
+
+    def test_readme_counts_the_suite_honestly(self):
+        """The suite's size is a claim the README makes; a stale number means nobody reads it."""
+        collected = unittest.TestLoader().loadTestsFromModule(
+            sys.modules[__name__]).countTestCases()
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        claims = re.findall(r"(\d+)[- ](?:test offline suite|engine/)", readme)
+        self.assertTrue(claims, "README no longer states the suite size - say it again, or delete this test")
+        wrong = [c for c in claims if int(c) != collected]
+        self.assertFalse(
+            wrong,
+            "README advertises %s tests; this file collects %d - update the prose (or the prose "
+            "was describing a different suite all along)" % (", ".join(wrong), collected))
+
+    def test_no_unused_imports(self):
+        src, _others = self._sources()
+        lines = src.splitlines()
+        tree = ast.parse(src)
+        bound = []
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    bound.append((alias.asname or alias.name.split(".")[0], node.lineno))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name != "*":
+                        bound.append((alias.asname or alias.name, node.lineno))
+        import_lines = {ln for _n, ln in bound}
+        rest = "\n".join("" if (i + 1) in import_lines else line for i, line in enumerate(lines))
+        # `app.py` is imported by the suite as `nb`, so a name re-exported for callers is used
+        unused = sorted({name for name, ln in bound
+                         if not _kept(lines[ln - 1], "# hygiene: keep") and not _mentions(name, rest)})
+        self.assertFalse(unused, "imported and never used: %s" % ", ".join(unused))
+
+    def test_every_default_config_key_is_read(self):
+        """A key nobody reads is a promise the engine does not keep."""
+        src, others = self._sources()
+        tree = ast.parse(src)
+        keys = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "DEFAULT_CONFIG" for t in node.targets):
+                for k in node.value.keys:
+                    if isinstance(k, ast.Str):
+                        keys.append(k.s)
+                break
+        self.assertTrue(keys, "DEFAULT_CONFIG not found - the test has to know where the keys live")
+        body = src + "\n" + others
+        unread = [k for k in keys if len(re.findall(r'["\']%s["\']' % re.escape(k), body)) < 2]
+        self.assertFalse(
+            unread,
+            "config keys nothing reads (remove them, or wire them up): %s" % ", ".join(unread))
+
 
 
 if __name__ == "__main__":
