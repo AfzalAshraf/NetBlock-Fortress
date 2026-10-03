@@ -215,7 +215,7 @@ fetch_repo() { # download app.py + adquit into HOME_DIR
             local root
             root="$(find "$tmp" -maxdepth 1 -mindepth 1 -type d | head -n1)"
             if [ -f "$root/app.py" ]; then
-                install -m 0755 "$root/app.py" "$dest/app.py"
+                atomic_install "$root/app.py" "$dest/app.py" 0755 || true
                 [ -f "$root/bin/adquit" ] && install -D -m 0755 "$root/bin/adquit" "$dest/bin/adquit"
                 rm -rf "$tmp"; return 0
             fi
@@ -229,7 +229,7 @@ fetch_repo() { # download app.py + adquit into HOME_DIR
     have git || { rm -rf "$tmp"; die "need curl or git to download the fortress"; }
     git clone --depth 1 -b "$REF" "https://github.com/$REPO.git" "$tmp/clone" >/dev/null 2>&1 \
         || { rm -rf "$tmp"; die "git clone of $REPO failed"; }
-    install -m 0755 "$tmp/clone/app.py" "$dest/app.py"
+    atomic_install "$tmp/clone/app.py" "$dest/app.py" 0755
     [ -f "$tmp/clone/bin/adquit" ] && install -D -m 0755 "$tmp/clone/bin/adquit" "$dest/bin/adquit"
     rm -rf "$tmp"
 }
@@ -242,6 +242,32 @@ ensure_deps() {
             || $SUDO "$PY" -m pip install --quiet --break-system-packages flask requests dnslib \
             || die "pip install failed - run: python3 -m pip install flask requests dnslib"
     fi
+}
+
+# Replace a file by renaming a finished copy into place, never by truncating the file someone
+# may be reading. `cp -f` onto a running script pulls the ground out from under it: bash reads a
+# script as it executes it, so an update that refreshed /usr/local/bin/adquit in place made that
+# same update die at line 1890 with "unexpected EOF while looking for matching `"' - on a file
+# that was perfectly valid on disk. The failure moves, too: it lands on whichever command runs
+# next, so the update looks fine and the *following* verb is the one that dies. A rename is
+# atomic and a reader that already opened the old inode keeps the old bytes. A symlinked
+# destination is followed rather than replaced, or someone keeps running the file they had.
+atomic_install() { # $1 = source, $2 = destination, [$3 = mode, default 0755]
+    local src="$1" dst="$2" mode="${3:-0755}" tmp real
+    [ -f "$src" ] || return 1
+    if [ -L "$dst" ]; then
+        real="$(readlink -f "$dst" 2>/dev/null || printf '%s' "$dst")"
+        [ -f "$real" ] && dst="$real"
+    fi
+    tmp="$(dirname "$dst")/.$(basename "$dst").adquit.$$"
+    if have install; then
+        install -m "$mode" "$src" "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    else
+        cp -f "$src" "$tmp" 2>/dev/null && chmod "$mode" "$tmp" 2>/dev/null \
+            || { rm -f "$tmp" 2>/dev/null; return 1; }
+    fi
+    mv -f "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    return 0
 }
 
 # The engine can be byte-identical while the CLI is not: a rolling branch changes guards,
@@ -259,8 +285,7 @@ cli_refresh() {
     target="/usr/local/bin/adquit"
     [ -w /usr/local/bin ] || target="$HOME/.local/bin/adquit"
     mkdir -p "$(dirname "$target")" 2>/dev/null || true
-    cp -f "$new" "$target" 2>/dev/null || return 0
-    chmod 0755 "$target" 2>/dev/null || true
+    atomic_install "$new" "$target" 0755 || return 0
     printf '  %sCLI refreshed%s  %s carried the same version stamp but older code\n' "$D" "$N" "$target"
     printf '  this run used the old script - re-run your last command to use the new one\n'
     return 0
@@ -270,8 +295,7 @@ install_cli_link() {
     local target="/usr/local/bin/adquit"
     [ -w /usr/local/bin ] || target="$HOME/.local/bin/adquit"
     mkdir -p "$(dirname "$target")"
-    cp "$HOME_DIR/bin/adquit" "$target" 2>/dev/null || true
-    chmod 0755 "$target" 2>/dev/null || true
+    atomic_install "$HOME_DIR/bin/adquit" "$target" 0755 || true
     printf '  %scommand:%s %sadquit%s now available at %s\n' "$D" "$N" "$B" "$N" "$target"
 }
 
@@ -358,7 +382,7 @@ cmd_install() {
     local src; src="$(source_dir)" || src=""
     if [ -n "$src" ] && [ "$src" != "$HOME_DIR" ]; then
         say "installing from local checkout: $src"
-        install -m 0755 "$src/app.py" "$HOME_DIR/app.py"
+        atomic_install "$src/app.py" "$HOME_DIR/app.py" 0755
         [ -f "$src/bin/adquit" ] && install -D -m 0755 "$src/bin/adquit" "$HOME_DIR/bin/adquit"
         [ -d "$src/data/lists" ] && cp -rn "$src/data/lists/." "$STATE_DIR/lists/" 2>/dev/null
     else
@@ -729,7 +753,7 @@ run_as_engine() { # run app.py subcommand with the right interpreter/home
 restore_update() { # put the engine back exactly as it was before 'adquit update'
     local origin="$1"
     [ -f "$origin" ] || return 0
-    cp -f "$origin" "$APP" 2>/dev/null && rm -f "$origin" 2>/dev/null
+    atomic_install "$origin" "$APP" 0755 2>/dev/null && rm -f "$origin" 2>/dev/null
     warn "restored the previous app.py - your fortress is untouched and still serving"
 }
 
@@ -1353,7 +1377,7 @@ cmd_proxy() {
 
     say "installing the $want config for :$port"
     mkdir -p "$(dirname "$PFILE")" 2>/dev/null || true
-    if ! cp -f "$tmp" "$PFILE" 2>/dev/null; then
+    if ! atomic_install "$tmp" "$PFILE" 0644; then
         rm -f "$tmp"; die "cannot write $PFILE - run: sudo adquit proxy install"
     fi
     rm -f "$tmp"
@@ -1364,7 +1388,7 @@ cmd_proxy() {
 
     if ! proxy_validate "$want" >/tmp/adquit-proxy-test.log 2>&1; then
         if [ -n "$backup" ]; then
-            cp -f "$backup" "$PFILE"
+            atomic_install "$backup" "$PFILE" 0644
         else
             rm -f "$PFILE" 2>/dev/null || true
             [ -n "$PLINK" ] && rm -f "$PLINK" 2>/dev/null

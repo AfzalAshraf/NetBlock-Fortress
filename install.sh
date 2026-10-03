@@ -297,8 +297,14 @@ if [ "$NO_CLI" != "1" ]; then
         mkdir -p "$HOME/.local/bin"
         CLI_TARGET="$HOME/.local/bin/adquit"
     fi
-    install -m 0755 "$HOME_DIR/bin/adquit" "$CLI_TARGET" 2>/dev/null \
-        || cp "$HOME_DIR/bin/adquit" "$CLI_TARGET" 2>/dev/null && chmod 0755 "$CLI_TARGET" 2>/dev/null
+    # rename rather than truncate: `adquit watch` or `adquit status` can be running out of this
+    # very file while the installer updates it, and a truncated script under a live bash dies
+    # with a syntax error in code that is fine on disk
+    CLI_TMP="$CLI_TARGET.adquit-new"
+    install -m 0755 "$HOME_DIR/bin/adquit" "$CLI_TMP" 2>/dev/null \
+        || cp "$HOME_DIR/bin/adquit" "$CLI_TMP" 2>/dev/null
+    chmod 0755 "$CLI_TMP" 2>/dev/null || true
+    mv -f "$CLI_TMP" "$CLI_TARGET" 2>/dev/null || warn "could not link $CLI_TARGET"
     note "adquit command: $CLI_TARGET"
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) ;;

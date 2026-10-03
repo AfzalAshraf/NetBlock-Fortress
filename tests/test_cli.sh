@@ -122,9 +122,11 @@ check "adquit mode strict accepted"         bash -c "$BIN mode strict >/dev/null
 cat > "$TMP/helpers_test.sh" <<'HELPERTEST'
 set -e
 REPO="$1"; BIN="$2"; TMP="$3"
-sed -n '/^app_version()/,/^}/p;/^ver_ge()/,/^}/p;/^update_decision()/,/^}/p;/^detect_channel()/,/^}/p;/^caddy_config_to_validate()/,/^}/p' "$BIN" > "$TMP/helpers.sh"
+sed -n '/^app_version()/,/^}/p;/^ver_ge()/,/^}/p;/^update_decision()/,/^}/p;/^detect_channel()/,/^}/p;/^caddy_config_to_validate()/,/^}/p;/^atomic_install()/,/^}/p' "$BIN" > "$TMP/helpers.sh"
 # shellcheck disable=SC1090
 . "$TMP/helpers.sh"
+have() { command -v "$1" >/dev/null 2>&1; }      # atomic_install probes for `install`; the CLI
+                                                # defines `have` further up than we extract from
 STAMP="$(sed -n 's/^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$REPO/app.py" | head -n1)"
 [ -n "$STAMP" ]                                                     # stamp discoverable
 [ "$(app_version "$REPO/app.py")" = "$STAMP" ]
@@ -159,6 +161,23 @@ grep -q 'restore_update "$origin"' "$REPO/bin/adquit"                       # en
 grep -q 'adquit site add media.lan' "$REPO/bin/adquit"                        # usage mentions it
 grep -q 'adquit lan-zone add' "$REPO/bin/adquit"                              # and the router zones
 grep -q 'proxy|portal|set|get|--set|--get)' "$REPO/bin/adquit"                # all of them elevate centrally
+
+# a file being replaced must not disturb whoever is already reading it - the update path renames
+# for exactly that reason, and an updater that breaks the updater is the worst kind of surprise
+printf 'old line\n' > "$TMP/live.sh"
+printf 'new line\n' > "$TMP/new.sh"
+exec 9< "$TMP/live.sh"
+atomic_install "$TMP/new.sh" "$TMP/live.sh" 0755
+[ "$(cat "$TMP/live.sh")" = "new line" ]                     # the new bytes are there
+read -r held <&9
+[ "$held" = "old line" ]                                     # and the reader kept the old ones
+exec 9<&-
+[ -x "$TMP/live.sh" ]                                         # mode travels with it
+[ -z "$(ls -A "$TMP" | grep -F '.live.sh.adquit.' || true)" ]   # no temp left behind
+printf 'nope\n' > "$TMP/src.missing.check"; rm -f "$TMP/src.missing.check"
+! atomic_install "$TMP/nonexistent" "$TMP/live.sh"            # a missing source is a failure, not a wipe
+[ "$(cat "$TMP/live.sh")" = "new line" ]
+! grep -qE '^ *cp( -f)? "[^"]*" "\$target"' "$BIN"           # and the CLI is never written in place
 
 # which config does caddy actually load? theirs, the moment it imports ours - to caddy that pair
 # is one file, and checking only our own fragment is how a broken include reaches the service

@@ -54,6 +54,15 @@
   sat in the README for three releases because nothing ever read the help text. 51 verbs, all real.
 - The README's own test count is now one of the things the suite checks: a stale number means the
   docs stopped being read, and that is how `59-test` survived three versions of growth.
+- **A file is replaced by renaming onto it, never by truncating it.** `cli_refresh` copied the new
+  CLI over `/usr/local/bin/adquit` with `cp -f` while that same script was being executed, and bash
+  reads a running script as it goes: the update printed its results and then died at line 1890 with
+  `unexpected EOF while looking for matching `"'`, in a file that was valid on disk. `atomic_install`
+  writes a sibling and renames it (mode preserved, a symlinked destination followed rather than
+  replaced), and it is now used for the engine copy, the CLI link, the proxy fragment and its revert;
+  `install.sh` renames too, because `adquit watch` can be live out of the file it is updating. The
+  unit assertions include the property that matters - a process holding the old file still reads the
+  old bytes - which a `cp -f` fails, checked with both.
 - **The caddy fragment no longer has to be imported first.** `render_caddy` opened a global options
   block (`auto_https off`, `servers { trusted_proxies static private_ranges }`) whenever the user's
   Caddyfile did not have one - which is legal only as the *first thing* in a Caddyfile. A fragment
