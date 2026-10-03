@@ -54,9 +54,29 @@
   sat in the README for three releases because nothing ever read the help text. 51 verbs, all real.
 - The README's own test count is now one of the things the suite checks: a stale number means the
   docs stopped being read, and that is how `59-test` survived three versions of growth.
-- Tests: 90 engine (was 80) - link shapes per proxy mode, escaping, the empty state, the live
+- **The caddy fragment no longer has to be imported first.** `render_caddy` opened a global options
+  block (`auto_https off`, `servers { trusted_proxies static private_ranges }`) whenever the user's
+  Caddyfile did not have one - which is legal only as the *first thing* in a Caddyfile. A fragment
+  appended below someone's `:80` block therefore failed with "server block without any key is
+  global configuration, and if used, it must be first", and a box that followed our own advice
+  ("add this to the top", said a warning, while the file was written) ended up with a caddy that
+  would not restart. `trusted_proxies` is now written on every `reverse_proxy` we emit - it belongs
+  to the proxy anyway, and unlike a global block it travels with the file - `auto_https off` is a
+  comment, and the fragment is import-anywhere (checked by a stub `caddy` that enforces that very
+  rule, so reintroducing the block fails CI).
+- `proxy_validate` now validates the file caddy actually loads: theirs, once theirs imports ours. To
+  caddy that pair is one config, and checking only our own fragment is how a broken include reaches
+  the service - the revert that protects a box never saw the failure. The decision lives in
+  `caddy_config_to_validate` and is unit-tested both ways.
+- The reachability rule covers the shell too: `bin/adquit`, `install.sh`, `uninstall.sh` and
+  `tests/doc_contract.sh` may not define a function nothing calls. The exclusion list is per-file,
+  because otherwise the CLI's own definitions are their own callers and the check passes always.
+  (`PGLOBAL` and `caddy_has_global` were the last casualties of the change above; had either
+  survived, this is what would have noticed.)
+
+- Tests: 91 engine (was 80) - link shapes per proxy mode, escaping, the empty state, the live
   listener's page/JSON/302/405, that a busy port or a disabled switch never raises, and the four
-  hygiene checks - plus 42 CLI contract checks (was 35): `portal status|url|on|off|title`,
+  hygiene checks - plus 43 CLI contract checks (was 35): `portal status|url|on|off|title`,
   `set`/`get`, that a second `site add` does not erase the first, the start-page vhosts in all three
   renders, the dangling-import message, that a Caddyfile which cannot be parsed is named before we
   feed it anything, and the docs-versus-dispatch contract.

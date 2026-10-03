@@ -53,22 +53,38 @@ chmod +x "$TMP/stub/ip"
 mkdir -p "$TMP/stub-caddy"
 cat > "$TMP/stub-caddy/caddy" <<'STUBCADDY'
 #!/bin/sh
+# Enough of `caddy validate` to fail the way caddy fails: braces have to pair, an import has
+# to exist, and the one rule a *fragment* can break - a bare `{` global block is only legal as
+# the first thing in the file, so importing one after someone's site block is an error.
 [ "$1" = validate ] || exit 0
 file="$3"
 [ -r "$file" ] || exit 0
-open="$(tr -cd '{' < "$file" | wc -c)"
-close="$(tr -cd '}' < "$file" | wc -c)"
-if [ "$open" != "$close" ]; then
-    echo "Error: adapting config using caddyfile: EOF" >&2
-    exit 1
-fi
+combined="$(cat "$file")"
 imp="$(grep -Eo '^[[:space:]]*import[[:space:]]+[^[:space:]]+' "$file" | head -n1 | awk '{print $2}')"
 if [ -n "$imp" ]; then
     case "$imp" in
         /*) ;;
         *) imp="$(dirname "$file")/$imp" ;;
     esac
-    [ -r "$imp" ] || { echo "Error: File to import not found or unable to stat" >&2; exit 1; }
+    if [ ! -r "$imp" ]; then
+        echo "Error: File to import not found or unable to stat" >&2
+        exit 1
+    fi
+    combined="$combined
+$(cat "$imp")"
+fi
+open="$(printf '%s\n' "$combined" | tr -cd '{' | wc -c)"
+close="$(printf '%s\n' "$combined" | tr -cd '}' | wc -c)"
+if [ "$open" != "$close" ]; then
+    echo "Error: adapting config using caddyfile: EOF" >&2
+    exit 1
+fi
+if printf '%s\n' "$combined" | grep -Eq '^[[:space:]]*\{[[:space:]]*$'; then
+    first="$(printf '%s\n' "$combined" | sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//' | head -n1)"
+    if [ "$first" != "{" ]; then
+        echo "Error: adapting config using caddyfile: server block without any key is global configuration, and if used, it must be first" >&2
+        exit 1
+    fi
 fi
 exit 0
 STUBCADDY
@@ -106,7 +122,7 @@ check "adquit mode strict accepted"         bash -c "$BIN mode strict >/dev/null
 cat > "$TMP/helpers_test.sh" <<'HELPERTEST'
 set -e
 REPO="$1"; BIN="$2"; TMP="$3"
-sed -n '/^app_version()/,/^}/p;/^ver_ge()/,/^}/p;/^update_decision()/,/^}/p;/^detect_channel()/,/^}/p' "$BIN" > "$TMP/helpers.sh"
+sed -n '/^app_version()/,/^}/p;/^ver_ge()/,/^}/p;/^update_decision()/,/^}/p;/^detect_channel()/,/^}/p;/^caddy_config_to_validate()/,/^}/p' "$BIN" > "$TMP/helpers.sh"
 # shellcheck disable=SC1090
 . "$TMP/helpers.sh"
 STAMP="$(sed -n 's/^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$REPO/app.py" | head -n1)"
@@ -143,6 +159,15 @@ grep -q 'restore_update "$origin"' "$REPO/bin/adquit"                       # en
 grep -q 'adquit site add media.lan' "$REPO/bin/adquit"                        # usage mentions it
 grep -q 'adquit lan-zone add' "$REPO/bin/adquit"                              # and the router zones
 grep -q 'proxy|portal|set|get|--set|--get)' "$REPO/bin/adquit"                # all of them elevate centrally
+
+# which config does caddy actually load? theirs, the moment it imports ours - to caddy that pair
+# is one file, and checking only our own fragment is how a broken include reaches the service
+PFILE="$TMP/adquit.caddyfile"; PCFILE="$TMP/Caddyfile"
+: > "$PFILE"
+printf 'import adquit.caddyfile\n' > "$PCFILE"
+[ "$(caddy_config_to_validate)" = "$PCFILE" ]
+printf ':80 {\n}\n' > "$PCFILE"
+[ "$(caddy_config_to_validate)" = "$PFILE" ]
 grep -q 'adquit-managed' "$REPO/bin/adquit"                                    # only our own files
 grep -q 'answer_fortress_names' "$REPO/app.py"                                 # fortress names resolve
 grep -q 'local_records' "$REPO/app.py"                                          # ...and sites do too
@@ -262,6 +287,8 @@ check "adquit says so when the Caddyfile it is about to feed will not load" bash
 "
 check "every documented adquit verb exists in the CLI" \
       bash "$REPO/tests/doc_contract.sh" "$REPO"
+check "the caddy fragment is importable anywhere and sets trusted_proxies per proxy" \
+      bash "$REPO/tests/caddy_fragment_test.sh" "$REPO" "$TMP/stub-caddy"
 check "adquit proxy refuses a bad port and an unknown server" bash -c "
     '$BIN' proxy install --port eight --dry-run >/dev/null 2>&1; test \$? -ne 0
     '$BIN' proxy install --server tomcat --dry-run >/dev/null 2>&1; test \$? -ne 0

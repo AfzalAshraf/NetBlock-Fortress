@@ -393,7 +393,7 @@ blocker and the web server are the same box on purpose.
 * **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
   rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
   compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
-  MIT licence, 90-test offline suite (engine, API, UI, exports, dependency gate,
+  MIT licence, 91-test offline suite (engine, API, UI, exports, dependency gate,
   source hygiene).
 * **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
   `adquit stats` answers even when the web layer is down.
@@ -443,7 +443,7 @@ blocker and the web server are the same box on purpose.
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline suite (90 engine/API/UI/gate/boot/hygiene tests) + CLI contract
+make test      # offline suite (91 engine/API/UI/gate/boot/hygiene tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 

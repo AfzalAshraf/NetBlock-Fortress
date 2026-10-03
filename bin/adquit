@@ -884,7 +884,6 @@ PWEB=8080; PSINK_MODE="zeroip"; PSINK_PORT=80; PSINK_EFF=80
 PSITES=()
 PPORT_ON=1; PPORT_PORT=8082
 PCATCH=1          # 0 = do not claim the port's default host (for a box that already serves :80)
-PGLOBAL=1         # caddy only: 0 = the user's Caddyfile already has a global options block
 PCFILE="/etc/caddy/Caddyfile"
 proxy_load() {
     local line
@@ -949,18 +948,6 @@ portal_serve_names() { # what the start page answers on: its own names, plus the
     for a in $(lan_addrs_list); do printf ' %s' "$a"; done
 }
 
-# caddy allows exactly ONE global options block per Caddyfile. If the user already has one, an
-# `import` that opens with another `{...}` fails validation - and we would rather not edit their
-# file. So look, and if one exists, tell them what to add instead of writing it.
-caddy_has_global() {
-    [ -r "$PCFILE" ] || return 1
-    "$PY" - "$PCFILE" <<'HASGLOB' 2>/dev/null
-import sys
-lines = [l.strip() for l in open(sys.argv[1], encoding="utf-8", errors="replace")]
-lines = [l for l in lines if l and not l.startswith("#")]
-sys.exit(0 if lines and lines[0] == "{" else 1)
-HASGLOB
-}
 
 caddy_dangling_import() { # their Caddyfile imports a fragment that was never written
     [ -r "$PCFILE" ] || return 1
@@ -1069,6 +1056,11 @@ NGX
     [ -n "$sites" ] && printf '%s\n' "$sites"
 }
 
+caddy_proxy() { # $1 = upstream - `trusted_proxies` in a global block would force this file to
+                # be imported first, so say it per proxy and the fragment loads from anywhere
+    printf 'reverse_proxy %s {\n\t\t\ttrusted_proxies static private_ranges\n\t\t}' "$1"
+}
+
 render_caddy() { # $1 = listen port
     local port="$1" s name pt host ws prox blocks=""
     for s in "${PSITES[@]}"; do
@@ -1079,35 +1071,36 @@ render_caddy() { # $1 = listen port
         blocks="$blocks
 	@$m host $name
 	handle @$m {
-		reverse_proxy $host:$pt
+		$(caddy_proxy "$host:$pt")
 	}"
     done
     blocks="$blocks
 	@adquit host $(dash_names)
 	handle @adquit {
-		reverse_proxy 127.0.0.1:$PWEB
+		$(caddy_proxy "127.0.0.1:$PWEB")
 	}"
     printf '%s\n' "# adquit-managed - include this from your Caddyfile:  import adquit.caddyfile"
-    if [ "$PGLOBAL" = 1 ]; then
-        printf '{\n\tauto_https off\n\tservers {\n\t\ttrusted_proxies static private_ranges\n\t}\n}\n\n'
-    else
-        printf '# %s already opens a global block, so this file must not open a second one.\n' "$PCFILE"
-        printf '# add these two options there and websockets/LAN names behave correctly:\n'
-        printf '#   auto_https off\n#   servers { trusted_proxies static private_ranges }\n\n'
-    fi
+    # Deliberately NOT a global options block. `{ auto_https off ... }` is only legal as the
+    # first thing in a Caddyfile, and this file is imported - usually appended - so an imported
+    # global block is the one shape that breaks a working server: "server block without any key
+    # is global configuration, and if used, it must be first". Everything we need is per-proxy
+    # instead (see caddy_proxy), which travels with the file; these two are for their whole
+    # config, so they stay a suggestion in a comment.
+    printf '# optional, for your whole Caddyfile (add at the top of %s):\n' "$PCFILE"
+    printf '#   auto_https off\n#   servers { trusted_proxies static private_ranges }\n\n'
     if portal_block_on; then
         blocks="$blocks
 	@adquit_portal host $(portal_serve_names)
 	handle @adquit_portal {
-		reverse_proxy 127.0.0.1:$PPORT_PORT
+		$(caddy_proxy "127.0.0.1:$PPORT_PORT")
 	}"
     fi
     printf ':%s {\n%s\n' "$port" "$blocks"
     if [ "$PCATCH" = 1 ]; then
         if [ "$PSINK_MODE" = "fortress" ]; then
-            printf '\thandle {\n\t\t# blocked ad domains -> the fortress splash page\n\t\treverse_proxy 127.0.0.1:%s\n\t}\n' "${PSINK_EFF:-$PSINK_PORT}"
+            printf '\thandle {\n\t\t# blocked ad domains -> the fortress splash page\n\t\t%s\n\t}\n' "$(caddy_proxy "127.0.0.1:${PSINK_EFF:-$PSINK_PORT}")" "${PSINK_EFF:-$PSINK_PORT}"
         elif portal_block_on; then
-            printf '\thandle {\n\t\t# every other Host on this port: the LAN start page\n\t\treverse_proxy 127.0.0.1:%s\n\t}\n' "$PPORT_PORT"
+            printf '\thandle {\n\t\t# every other Host on this port: the LAN start page\n\t\t%s\n\t}\n' "$(caddy_proxy "127.0.0.1:$PPORT_PORT")"
         else
             printf '\thandle {\n\t\trespond "NetBlock Fortress" 200\n\t}\n'
         fi
@@ -1158,10 +1151,19 @@ APX
     printf '%s\n' "$blocks"
 }
 
+caddy_config_to_validate() { # what caddy actually loads: importing is textual, so once their
+                             # file includes ours the pair is one config and must be checked as one
+    if [ -r "$PCFILE" ] && grep -q "adquit.caddyfile" "$PCFILE"; then
+        printf '%s' "$PCFILE"
+    else
+        printf '%s' "$PFILE"
+    fi
+}
+
 proxy_validate() { # the syntax check for each proxy - run directly, never via eval
     case "$1" in
         nginx)  nginx -t ;;
-        caddy)  caddy validate --config "$PFILE" --adapter caddyfile ;;
+        caddy)  caddy validate --config "$(caddy_config_to_validate)" --adapter caddyfile ;;
         apache) if have apache2ctl; then apache2ctl configtest; else apachectl configtest; fi ;;
     esac
 }
@@ -1242,7 +1244,6 @@ cmd_proxy() {
             warn "  write it:  sudo adquit proxy install --server caddy --port $port"
             warn "  or drop the line:  sudo sed -i '/adquit.caddyfile/d' $PCFILE && sudo systemctl restart caddy"
         fi
-        caddy_has_global && PGLOBAL=0
         if caddy_main_broken; then
             warn "$PCFILE does not load - caddy will not start, our fragment included"
             [ -n "$CADDY_ERR" ] && warn "  caddy says: ${CADDY_ERR#*Error: }"
@@ -1358,7 +1359,7 @@ cmd_proxy() {
     rm -f "$tmp"
     if [ "$want" = caddy ] && [ -f /etc/caddy/Caddyfile ] \
        && ! grep -q "adquit.caddyfile" /etc/caddy/Caddyfile; then
-        warn "add this to the top of /etc/caddy/Caddyfile so it loads ours:  import adquit.caddyfile"
+        warn "load it from your Caddyfile (any line at the top level):  import adquit.caddyfile"
     fi
 
     if ! proxy_validate "$want" >/tmp/adquit-proxy-test.log 2>&1; then

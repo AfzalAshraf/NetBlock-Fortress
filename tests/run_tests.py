@@ -1158,20 +1158,26 @@ class TestHygiene(unittest.TestCase):
                ".github/workflows/release.yml", "tests/run_tests.py", "tests/test_cli.sh",
                "tests/doc_contract.sh")
 
-    def _sources(self):
-        """app.py's text, plus everything allowed to reach into it.
+    def _surface(self, exclude=None):
+        """Everything allowed to reach into the engine: the CLI, the installers, the docs, the
+        tests. A name used only by a test is used - `tests/` is how an operator's shell and this
+        suite drive the module, and the CLI reaches config keys by string (`--set`, `--get`).
 
-        A name used only by a test is used: `tests/` is how an operator's shell and this suite
-        drive the module, and the CLI reaches config keys by string (`--set`, `--get`), so the
-        shell files count as readers of the config surface too.
+        `exclude` matters on the shell side: bin/adquit is in this list, so without it a
+        function defined nowhere-else would look 'used by the docs' by its own definition.
         """
-        src = (REPO / "app.py").read_text(encoding="utf-8")
-        others = []
+        parts = []
         for rel in self.SURFACE:
+            if rel == exclude:
+                continue
             path = REPO / rel
             if path.exists():
-                others.append(path.read_text(encoding="utf-8", errors="ignore"))
-        return src, "\n".join(others)
+                parts.append(path.read_text(encoding="utf-8", errors="ignore"))
+        return "\n".join(parts)
+
+    def _sources(self):
+        src = (REPO / "app.py").read_text(encoding="utf-8")
+        return src, self._surface(exclude="app.py")
 
     @staticmethod
     def _module_items(tree):
@@ -1231,6 +1237,65 @@ class TestHygiene(unittest.TestCase):
             dead,
             "unreachable in app.py: %s - delete it, or write why it must stay on its own line "
             "(%s)" % ("; ".join(dead), self.KEEP))
+
+    SHELL_SOURCES = ("bin/adquit", "install.sh", "uninstall.sh", "tests/doc_contract.sh")
+
+    def test_no_unreachable_cli_functions(self):
+        """The same rule on the shell side, because the CLI is where an orphan hides best.
+
+        bin/adquit dispatches from one long case block, so a function whose verb was renamed or
+        dropped keeps looking 'used' to a reader forever. Shell has no compiler, so the check is
+        here: every top-level `name() {` must be reachable from module level (the dispatcher, a
+        trap, a subshell in the file) or from another reachable function, or be named by the
+        tests, the docs or the other scripts. `# hygiene: keep` on the definition excuses one.
+        """
+        for rel in self.SHELL_SOURCES:
+            external = self._surface(exclude=rel)
+            path = REPO / rel
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            lines = text.splitlines()
+            spans = {}
+            for match in re.finditer(r"^([a-z_][a-z0-9_]*)\s*\(\)\s*\{", text, re.M):
+                name = match.group(1)
+                if name in spans:
+                    continue
+                first = text[:match.start()].count("\n") + 1
+                end = len(lines)
+                for i in range(first, len(lines)):
+                    if lines[i] == "}":
+                        end = i + 1
+                        break
+                spans[name] = (first, end)
+            if not spans:
+                continue
+
+            inside = [False] * (len(lines) + 2)
+            for first, end in spans.values():
+                for i in range(first - 1, end):
+                    inside[i] = True
+            outside = "\n".join("" if inside[i] else line for i, line in enumerate(lines))
+            body_of = {n: "\n".join(lines[a - 1:b]) for n, (a, b) in spans.items()}
+            kept = {n for n, (a, _b) in spans.items() if _kept(lines[a - 1], self.KEEP)}
+
+            live = {n for n in spans
+                    if _mentions(n, outside) or _mentions(n, external) or n in kept}
+            for _ in range(20):
+                grew = False
+                for n in spans:
+                    if n in live or n in kept:
+                        continue
+                    if any(src in live and _mentions(n, body_of[src]) for src in spans):
+                        live.add(n)
+                        grew = True
+                if not grew:
+                    break
+            dead = sorted(n for n in spans if n not in live)
+            self.assertFalse(
+                dead,
+                "%s defines functions nothing calls: %s - delete them, or put '%s' and a "
+                "reason on the definition's own line" % (rel, ", ".join(dead), self.KEEP))
 
     def test_readme_counts_the_suite_honestly(self):
         """The suite's size is a claim the README makes; a stale number means nobody reads it."""
