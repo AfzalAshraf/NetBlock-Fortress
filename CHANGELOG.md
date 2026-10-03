@@ -69,6 +69,13 @@
   (readable via `ADQUIT_CADDYFILE`, default `/etc/caddy/Caddyfile`) and says which one to narrow or
   delete, instead of leaving "it resolved but showed the wrong page" as a mystery.
 
+- **`http://<fortress-ip>/` keeps working after the proxy takes the port.** Hand-written caddy config
+  is usually a bare `:80 { … }` that reverse-proxies the dashboard - which is that page answering
+  *every* Host, so the first thing anyone notices when vhosts appear is that `http://media.lan/`
+  stopped showing the dashboard. Two changes: `dash_names()` now also claims this box's own LAN
+  addresses, so the address people type still reaches the dashboard, and the advice printed for a
+  bare `:PORT` block is to give it a hostname or let ours own the port - not to guess.
+
 ### Fixes from the first real box running this
 - **`say`/`warn`/`die` are not printf.** They join their arguments, so `say 'firewall: tcp/%s open'
   "$p"` printed the percent sign literally and tacked the number on the end
@@ -98,7 +105,7 @@
 - 80 engine tests (was 66): record/zone lookup precedence, the four reply shapes, "a LAN name must
   never reach a public resolver", zone forwarding carrying our question id, a dead router not
   hanging the resolver, `--set` with a JSON object, and all four `ProxyAware` header rules.
-- 38 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
+- 39 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
   nginx render (dashboard vhost, per-site vhost, upgrade map, balanced braces, no `ServerName *`),
   the "refuses when not installed / bad flag" negatives, and the off-subnet guards - exercised
   against a stubbed `ip` so a CI runner's own network never decides the outcome.

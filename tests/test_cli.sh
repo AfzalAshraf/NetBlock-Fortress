@@ -193,6 +193,10 @@ check "adquit will not open a second caddy global block" bash -c "
         | grep -q 'already opens a global block'
     '$BIN' proxy install --server caddy --port 80 --dry-run --no-catchall 2>&1 | grep -q 'no-catchall'
 "
+check "adquit keeps the dashboard reachable by the address people actually type" bash -c "
+    export PATH='$TMP/stub':\$PATH
+    '$BIN' proxy install --server nginx --port 80 --dry-run 2>&1 | grep -q 'server_name .*192.0.2.5'
+"
 check "adquit proxy refuses a bad port and an unknown server" bash -c "
     '$BIN' proxy install --port eight --dry-run >/dev/null 2>&1; test \$? -ne 0
     '$BIN' proxy install --server tomcat --dry-run >/dev/null 2>&1; test \$? -ne 0

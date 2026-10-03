@@ -873,7 +873,8 @@ proxy_load() {
 }
 
 dash_names() { # what the dashboard answers on - keep in step with fortress_names()
-    local h; h="$(hostname 2>/dev/null | tr 'A-Z' 'a-z')"
+    local h a x seen n=0
+    h="$(hostname 2>/dev/null | tr 'A-Z' 'a-z')"
     printf 'adquit.lan adquit.local netblock.local'
     case "$h" in
         "") ;;
@@ -881,6 +882,16 @@ dash_names() { # what the dashboard answers on - keep in step with fortress_name
         *.*) printf ' %s %s.local' "$h" "${h%%.*}" ;;         # FQDN + its short form
         *)   printf ' %s.local %s.lan' "$h" "$h" ;;
     esac
+    # and the number, because on a LAN that is what gets typed. Once the proxy owns :80, an
+    # unclaimed Host lands on the catch-all (splash page / sinkhole) instead of the dashboard.
+    a="$(lan_ip)"
+    [ -n "$a" ] && printf ' %s' "$a"
+    seen=" $a "
+    for x in $(lan_addrs); do
+        case "$seen" in *" $x "*) continue ;; esac
+        [ "$n" -ge 3 ] && break                                # a router box with 40 interfaces
+        printf ' %s' "$x"; seen="$seen$x "; n=$((n + 1))       # should not get the dashboard
+    done
 }
 
 # caddy allows exactly ONE global options block per Caddyfile. If the user already has one, an

@@ -337,6 +337,9 @@ blocker and the web server are the same box on purpose.
   config if the new one would not start.
 * Caddy is the one server it cannot wire up silently: the rendered `/etc/caddy/adquit.caddyfile`
   needs one line in your Caddyfile (`import adquit.caddyfile`), which `proxy install` prints.
+* After `proxy install` owns the port, the dashboard is served by name — `adquit.lan`,
+  `<hostname>.local`, and **the box's own addresses**, because that is what gets typed into a phone
+  browser. Everything else that lands on the port gets the sinkhole (or a 200), not your dashboard.
 * If the web server you picked already listens on that port (caddy on :80 is the common case),
   that is not a conflict: `proxy install` adds vhosts to the server that owns the port and only
   refuses when a *different* server holds it.
