@@ -2,6 +2,28 @@
 
 ## v19.3 — a start page for the LAN you just made reachable
 
+- **`adquit passwd --show`** answers "what is my dashboard login?" from the box itself: the
+  username, the URL as both loopback and LAN address, and the password - but only where the box
+  actually still knows it. That is the shipped default (with a warning to change it) or the one the
+  installer generated and has not been replaced yet. A password the operator typed themselves is
+  stored as a SHA-256 and is *not* recoverable, and this says so instead of inventing a guess; the
+  answer is `sudo adquit passwd`, which takes one or prompts for it.
+- The install no longer trusts your scrollback: `install.sh` writes the generated password to
+  `<data dir>/.dashboard-initial-password`, mode 0600, right after it sets it. Root-only because it
+  is plaintext, and deleted by the engine's `--passwd` and `--set-auth` handlers the first time a new
+  one is set - a stale secret in a well-known path is worse than no secret, so the file's lifetime
+  is exactly the lifetime of the password it describes. Setting an unrelated config key deliberately
+  does not touch it; deleting it there is how you lock someone out of the box they are on. That file
+  name is one literal pinned by a CLI check, because app.py, `install.sh` and `bin/adquit` each spell
+  it and a rename in one of the three would strand the secret or blind the reveal.
+- `adquit status` and the `start` banner print the username, the link and a pointer to
+  `passwd --show` - never the password. Every line of ordinary output on a LAN box gets
+  screenshotted, journald-logged and pasted into help threads; the reveal is the one verb where you
+  asked for it by name. `status` shows it in every state including `down`, because "which password
+  is it" is usually asked during a problem, not after one - and its username comes from a `sed` over
+  `config.json` rather than an engine spawn, so `status` stays useful when the engine is the thing
+  that is broken.
+
 - **`adquit portal`** turns the site registry into a page: one tile per published name (plus the
   dashboard), linking to `http://<name>/` when the reverse proxy serves it and to
   `http://<address>:<port>/` when it does not. It reads `local_records`, the same dict the resolver

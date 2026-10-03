@@ -338,6 +338,17 @@ if [ -z "$PW" ]; then
     RANDOM_PW=1
 fi
 "$VPY" "$HOME_DIR/app.py" --set-auth "admin" "$PW" >/dev/null 2>&1 || true
+# "printed once" is how a LAN box ends up with a dashboard nobody can open: the terminal scrolls,
+# the ssh session closes, and the only copy was stdout. Keep the generated one where the operator
+# can ask for it (`adquit passwd --show`) for exactly as long as it is the password in use - the
+# engine deletes the file the moment a new one is set - which is why this runs *after* --set-auth,
+# or the write would be deleted by the call that sets the same password. Root-only, plaintext.
+if [ "${RANDOM_PW:-0}" = 1 ]; then
+    install -m 0600 /dev/null "$STATE/.dashboard-initial-password" 2>/dev/null \
+        && printf '%s\n' "$PW" > "$STATE/.dashboard-initial-password" 2>/dev/null \
+        && note "initial password saved (root-only) in $STATE/.dashboard-initial-password" \
+        || warn "could not save the generated password anywhere - write it down now"
+fi
 "$VPY" "$HOME_DIR/app.py" --set web_port "$WEB_PORT" >/dev/null 2>&1 || true
 "$VPY" "$HOME_DIR/app.py" --set dns_port "$DNS_PORT" >/dev/null 2>&1 || true
 "$VPY" "$HOME_DIR/app.py" --set dns_upstream "$UPSTREAM" >/dev/null 2>&1 || true
@@ -379,7 +390,8 @@ printf "${B}  ==============================================================${N}
 printf "${C}${B}   FORTRESS IS UP - every ad, pixel and beacon on your LAN dies here${N}\n"
 printf "${B}  ==============================================================${N}\n"
 printf "   dashboard     ${B}http://%s:%s${N}\n" "$IP" "$WEB_PORT"
-printf "   login         ${B}admin${N} / ${B}%s${N}%s\n" "$PW" "${RANDOM_PW:+   (generated once - store it now)}"
+printf "   login         ${B}admin${N} / ${B}%s${N}%s\n" "$PW" \
+    "${RANDOM_PW:+   (kept in $STATE, root-only, until you set your own: sudo adquit passwd --show)}"
 printf "   dns server    ${B}%s:%s${N}\n" "$IP" "$DNS_PORT"
 printf "   rules         see 'adquit stats' after the first gravity pull\n"
 LAN_HOST="$(hostname 2>/dev/null || echo host)"

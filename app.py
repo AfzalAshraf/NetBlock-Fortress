@@ -184,6 +184,7 @@ CUSTOM_BLOCK = DATA_DIR / "custom_blocked.txt"
 CUSTOM_WHITE = DATA_DIR / "custom_whitelist.txt"
 GRAVITY_CACHE = DATA_DIR / "gravity.cache"
 SNAPSHOT_FILE = DATA_DIR / "snapshot.json"
+INITIAL_PW_FILE = DATA_DIR / ".dashboard-initial-password"   # root-only, while it is still valid
 ACCESS_LOG = DATA_DIR / "adquit.log"
 QUERY_LOG = DATA_DIR / "queries.jsonl"
 
@@ -193,6 +194,18 @@ for _d in (DATA_DIR, LIST_DIR, META_DIR):
     except PermissionError:
         print("[!] No write access to %s - rerun with sudo or set ADQUIT_HOME." % BASE_DIR)
         sys.exit(1)
+
+
+def _forget_initial_password():
+    """`install.sh` saves the password it generated so `adquit passwd --show` can hand it back
+    while it is the one in use - "printed once, at install" is how a LAN box ends up locked out
+    of its own dashboard. The first password the operator sets makes that file a stale secret in
+    a well-known path, so it is deleted rather than left to rot.
+    """
+    try:
+        INITIAL_PW_FILE.unlink()
+    except OSError:
+        pass
 
 
 def _setup_logging():
@@ -5173,6 +5186,7 @@ def cli(argv):
         CFG["admin_username"] = rest[0].strip()
         CFG["password_hash"] = hashlib.sha256(rest[1].encode()).hexdigest()
         save_config()
+        _forget_initial_password()
         print("[+] dashboard login is now %s" % rest[0])
         return 0
     if cmd in ("--passwd",):
@@ -5185,6 +5199,7 @@ def cli(argv):
             return 1
         CFG["password_hash"] = hashlib.sha256(pw.encode()).hexdigest()
         save_config()
+        _forget_initial_password()
         print("[+] password updated")
         return 0
     if cmd in ("--set",):

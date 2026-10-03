@@ -344,6 +344,39 @@ class TestModesAndConfig(unittest.TestCase):
         self.assertEqual(verdict("annoying-ads.biz")["action"], "allow")
         nb.cli(["--unblock", "annoying-ads.biz"])
 
+    def test_password_change_forgets_the_saved_initial_password(self):
+        """The installer keeps the password it generated in a root-only file so `adquit passwd
+        --show` can hand it back - and that file is only allowed to exist while it is still the
+        password in use. A plaintext secret nobody can revoke is worse than no plaintext secret,
+        so both password-setting verbs delete it, and no other verb may.
+        """
+        f = HOME / "data" / ".dashboard-initial-password"
+        old = (nb.CFG["password_hash"], nb.CFG["admin_username"], nb.CFG["web_port"])
+        try:
+            f.write_text("generated-by-installer\n")
+            self.assertEqual(nb.cli(["--passwd", "a-brand-new-secret"]), 0)
+            self.assertFalse(f.exists(), "the plaintext outlived the password it described")
+            self.assertNotEqual(old[0], nb.CFG["password_hash"])
+
+            f.write_text("generated-by-installer\n")
+            self.assertEqual(nb.cli(["--set-auth", "operator", "another-secret"]), 0)
+            self.assertFalse(f.exists(), "--set-auth changed the login but left the old secret")
+            self.assertEqual(nb.CFG["admin_username"], "operator")
+
+            # the install password is still current here: an unrelated key change must not cost
+            # the operator their only way back in
+            f.write_text("still-the-current-one\n")
+            self.assertEqual(nb.cli(["--set", "web_port", "8123"]), 0)
+            self.assertTrue(f.exists(), "an unrelated config change deleted the only way back in")
+            self.assertEqual(f.read_text().strip(), "still-the-current-one")
+        finally:
+            nb.CFG["password_hash"], nb.CFG["admin_username"], nb.CFG["web_port"] = old
+            nb.save_config()
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
     def test_api_payload_shape(self):
         payload = nb.stats_payload()
         for key in ("version", "queries", "blocked", "rules", "macro_rules", "micro_rules",

@@ -67,6 +67,10 @@ APP="$HOME_DIR/app.py"
 PY="$HOME_DIR/venv/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
 STATE_DIR="$HOME_DIR/data"
+INITIAL_PW_FILE="$STATE_DIR/.dashboard-initial-password"
+#  app.py writes and deletes this path (INITIAL_PW_FILE), install.sh creates it, and this is where
+#  `passwd --show` reads it. Three files, one name - tests/test_cli.sh pins the literal so a rename
+#  in one of them cannot leave a plaintext password behind in the other two.
 PIDFILE="$HOME_DIR/adquit.pid"
 REAL_HOME="$HOME"
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
@@ -450,6 +454,15 @@ dns_port() {
     printf '%s' "${ADQUIT_DNS_PORT:-53}"
 }
 
+dash_user() { # the dashboard username straight out of config.json - no engine spawn, because this
+               # runs in `status` and in the start banner on boxes where python may not be ready yet
+    local u
+    u="$(sed -n 's/.*"admin_username": *"\([^"]*\)".*/\1/p' "$STATE_DIR/config.json" 2>/dev/null | head -n1)"
+    # a box that has never saved a config is running DEFAULT_CONFIG, whose user is 'admin' -
+    # printing an empty username is how you end up telling someone their login is blank
+    printf '%s\n' "${u:-admin}"
+}
+
 web_port() {
     "$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('web_port',8080))" 2>/dev/null \
         || printf '%s' "${ADQUIT_WEB_PORT:-8080}"
@@ -612,6 +625,8 @@ cmd_start() {
         fi
         printf '%s✔ fortress live%s  dns :%s  dashboard http://127.0.0.1:%s  (systemd unit: %s)\n' \
             "$C" "$N" "$(dns_port)" "$(web_port)" "$SERVICE"
+        printf '  login      %s on http://127.0.0.1:%s  - the password: sudo adquit passwd --show\n' \
+            "$(dash_user)" "$(web_port)"
         printf '%s  reachable from your other devices:%s\n' "$D" "$N"
         lan_urls | sed 's/^/   /'
         return 0
@@ -713,6 +728,11 @@ cmd_status() {
     else
         printf '  state    %sdown%s\n' "$R" "$N"
     fi
+    # the login hint belongs to every state, not only the healthy one: people open `status`
+    # because something will not load, and "which password?" is half of that. Only the username and
+    # where to get the rest - `passwd --show` is the one place the secret is ever printed.
+    printf '  login    %s on http://127.0.0.1:%s - the password: sudo adquit passwd --show\n' \
+        "$(dash_user)" "$(web_port)"
     if [ -f "$STATE_DIR/config.json" ]; then
         "$PY" - "$STATE_DIR/config.json" <<'PYX' || true
 import json, sys
@@ -1737,7 +1757,58 @@ cmd_mode()   { run_as_engine --mode "$@"; if running; then cmd_restart; fi; }
 cmd_block()  { run_as_engine --block "$@"; }
 cmd_allow()  { run_as_engine --allow "$@"; }
 cmd_unblock(){ run_as_engine --unblock "$@"; }
-cmd_passwd() { run_as_engine --passwd "$@"; }
+_sha256() { # the same three-way fallback file_id uses, for a string instead of a file
+    if have sha256sum; then printf '%s' "$1" | sha256sum | cut -d' ' -f1
+    elif have shasum; then printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+    else printf ''; fi
+}
+
+passwd_show() { # the login for this box's dashboard, for the person who owns the box, asked for by
+                # name. `adquit status` and the start banner deliberately print only the username and
+                # this command: a password in ordinary output ends up in screenshots, journald and
+                # help-desk pastes, and a LAN box gets shared around like that. Values come from the
+                # engine rather than from config.json, because a box that has never saved has
+                # defaults in memory and nothing on disk to grep.
+    local user hash want
+    _ask_cfg() { run_as_engine --get "$1" 2>/dev/null | sed -n 's/^[^=]*= *//p' | head -n1 | tr -d '"'; }
+
+    user="$(_ask_cfg admin_username)"
+    [ -n "$user" ] || user="admin"
+    hash="$(_ask_cfg password_hash)"
+    say "dashboard login for this fortress"
+    printf '  username   %s\n' "$user"
+    printf '  open       http://127.0.0.1:%s  (from any device on this network: http://%s:%s)\n' \
+        "$(web_port)" "$(lan_ip)" "$(web_port)"
+    want="$(_sha256 admin123)"
+    if [ -z "$hash" ]; then   # a bare 'not recoverable' here would be a lie; the engine never answered
+        printf '  password   unknown - the engine gave no answer (is it installed and readable as root?)\n'
+        printf '  try        sudo adquit get password_hash   |   sudo adquit passwd "new-password"\n'
+        return 0
+    fi
+    if [ -n "$want" ] && [ "$hash" = "$want" ]; then
+        printf '  password   %sadmin123%s - the shipped default; change it: sudo adquit passwd\n' "$Y" "$N"
+        return 0
+    fi
+    if [ -r "$INITIAL_PW_FILE" ]; then
+        local pw; pw="$(head -n1 "$INITIAL_PW_FILE" 2>/dev/null)"
+        if [ -n "$pw" ] && [ "$(_sha256 "$pw")" = "$hash" ]; then
+            printf '  password   %s%s%s - what the installer generated; forgotten once you set your own\n' \
+                "$B" "$pw" "$N"
+            return 0
+        fi
+    fi
+    printf '  password   not recoverable - the config keeps only its SHA-256\n'
+    printf '  set a new one   sudo adquit passwd                (prompts, hidden)\n'
+    printf '                  sudo adquit passwd "at-least-8-characters"\n'
+    return 0
+}
+
+cmd_passwd() {
+    case "${1:-}" in
+        --show|show) passwd_show; return $? ;;
+    esac
+    run_as_engine --passwd "$@"
+}
 cmd_set()    { run_as_engine --set "$@"; }
 cmd_get()    { run_as_engine --get "$@"; }
 cmd_feed()   {
@@ -1848,7 +1919,7 @@ ${B}MAINTENANCE${N}
   adquit lan-zone add .lan <router-ip>    let the router answer printer.lan, nas.lan
   adquit portal             the start page for everything you published (home.lan)
   adquit set <key> <value>  change any config key, live (adquit get shows them all)
-  adquit passwd [new]       change the dashboard password
+  adquit passwd [new]       change the dashboard password (adquit passwd --show: the login)
   adquit protect on|off     point THIS machine's DNS at the fortress
   adquit uninstall [--keep-data]
 

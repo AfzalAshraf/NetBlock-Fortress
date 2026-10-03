@@ -350,6 +350,33 @@ check "adquit lan-zone add/list/rm round-trip" bash -c "
     '$BIN' lan-zone rm lan >/dev/null &&
     ! '$BIN' lan-zone list | grep -q '127.0.0.1:5399'
 "
+check "adquit passwd --show names the username, the link and how to get the password" bash -c "
+    '$BIN' passwd --show 2>&1 | grep -q 'username   admin' &&
+    '$BIN' passwd --show 2>&1 | grep -q 'http://127.0.0.1:18098' &&
+    '$BIN' passwd --show 2>&1 | grep -qiE 'admin123|not recoverable'
+"
+# the whole point of saving the generated password: it is handed back only while it is the live
+# one. Both halves are asserted - reveal it, then watch it vanish behind a password change.
+check "adquit passwd --show reveals the installer password only while it is current" bash -c "
+    '$BIN' passwd first-choice-pw >/dev/null 2>&1 &&
+    printf 'first-choice-pw\n' > '$ADQUIT_HOME/data/.dashboard-initial-password' &&
+    '$BIN' passwd --show 2>&1 | grep -q 'first-choice-pw' &&
+    '$BIN' passwd second-choice-pw >/dev/null 2>&1 &&
+    ! test -f '$ADQUIT_HOME/data/.dashboard-initial-password' &&
+    '$BIN' passwd --show 2>&1 | grep -q 'not recoverable'
+"
+check "adquit status points at the login without printing the secret" bash -c "
+    '$BIN' status 2>&1 | grep -q 'passwd --show' &&
+    ! '$BIN' status 2>&1 | grep -q 'second-choice-pw'
+"
+# one filename, three files: app.py deletes it, install.sh writes it, the CLI reads it. A rename in
+# any one of them would strand a plaintext password (or make the reveal blind), and no test would
+# notice by itself - so the literal is pinned here, where a mismatch costs a red check.
+check "the saved-password filename is one literal in app.py, install.sh and the CLI" bash -c "
+    grep -q 'INITIAL_PW_FILE = DATA_DIR / \".dashboard-initial-password\"' '$REPO/app.py' &&
+    grep -qF '\$STATE/.dashboard-initial-password' '$REPO/install.sh' &&
+    grep -qF 'INITIAL_PW_FILE=\"\$STATE_DIR/.dashboard-initial-password\"' '$REPO/bin/adquit'
+"
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
 "$BIN" stop >/dev/null 2>&1

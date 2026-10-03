@@ -57,7 +57,8 @@ curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/main/
 The installer is idempotent — run it again to upgrade. It detects the OS and package
 manager, creates a private venv, frees udp/53 from `systemd-resolved`, installs the
 `adquit` systemd unit + logrotate, opens the firewall, starts a rootless-safe
-background blocklist pull, and generates a random dashboard password (printed once).
+background blocklist pull, and generates a random dashboard password - shown at install, and
+re-shown by `adquit passwd --show` for exactly as long as it is still the password in use.
 
 The one-liner has no pin, so it installs whatever `main` holds. To take a branch or a
 fork instead — and to *stay* on that channel, since the installer records it in
@@ -115,7 +116,7 @@ curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/main/
 |---|---|---|
 | `ADQUIT_MODE` | `off` · `balanced` · `strict` · `family` · `nuclear` | `strict` |
 | `ADQUIT_HOME` | install directory | `/opt/adquit` (root) / `~/.adquit` (user) |
-| `ADQUIT_PASSWORD` | dashboard password | random, printed once |
+| `ADQUIT_PASSWORD` | dashboard password | random, printed once (see `adquit passwd --show`) |
 | `ADQUIT_DNS_PORT` / `ADQUIT_WEB_PORT` | listener ports | `53` / `8080` |
 | `ADQUIT_UPSTREAM` | upstream resolver | `1.1.1.1` |
 | `ADQUIT_SKIP_LISTS` | `1` = don’t download feeds during install | `0` |
@@ -150,7 +151,10 @@ adquit portal             the start page of everything you published
 adquit lan-zone add .lan 192.168.1.1    printer.lan / nas.lan: ask the router, never a
                             public resolver (adquit lan-zone list | rm SUFFIX)
 adquit proxy install          nginx/Caddy/Apache vhosts: every published site on one port
-adquit passwd               rotate the dashboard password
+adquit passwd [new]         rotate the dashboard password
+adquit passwd --show        the login for this box: username, link, and the password while
+                            it is still the one in use (a password you set yourself is stored as a
+                            SHA-256 and cannot be read back - only rotated)
 adquit protect on|off       repoint THIS machine's DNS at the fortress
 adquit update               pull the newest fortress, rebuild, refresh, restart
                             (follows the install's channel; "already up to date" when the
@@ -211,7 +215,7 @@ see what would have broken before you arm it.
 ## Using it
 
 **Dashboard** — `http://<box-ip>:8080`, login `admin` / the password printed at install
-(`adquit passwd` to change). Pages: Dashboard · Security Center · Blocklists · **Ad Coverage
+(`adquit passwd --show` while that one is still current, `adquit passwd` to set a new one). Pages: Dashboard · Security Center · Blocklists · **Ad Coverage
 Matrix** · **Domain Lab** · Protection Modes · Live Query Logs · Custom Rules · Settings.
 
 **Protect your network** — set your router’s DNS (IPv4) to the fortress IP. Every device —
@@ -393,7 +397,7 @@ blocker and the web server are the same box on purpose.
 * **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
   rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
   compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
-  MIT licence, 91-test offline suite (engine, API, UI, exports, dependency gate,
+  MIT licence, 92-test offline suite (engine, API, UI, exports, dependency gate,
   source hygiene).
 * **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
   `adquit stats` answers even when the web layer is down.
@@ -443,7 +447,7 @@ blocker and the web server are the same box on purpose.
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline suite (91 engine/API/UI/gate/boot/hygiene tests) + CLI contract
+make test      # offline suite (92 engine/API/UI/gate/boot/hygiene tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 
