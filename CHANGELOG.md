@@ -57,6 +57,18 @@
   Apache catch-all, no caddy `handle {}`. Published names and the dashboard still get their
   vhosts; every other `Host` keeps being answered by whatever was answering it before.
 
+- **`adquit update` was leaving the CLI behind.** The update decision fingerprints `app.py`, and a
+  branch changes `bin/adquit` without bumping the version, so it printed "already up to date -
+  engine is byte-identical" and returned *before* refreshing `/usr/local/bin/adquit` - which is
+  exactly when the fix someone updated for was a CLI fix. Both paths now go through `cli_refresh`:
+  it compares the fetched CLI with the one that is running, refuses to install a script that does
+  not parse, heals the rootless target (`~/.local/bin/adquit`) as well as the root one, and says
+  plainly that the *current* run used the old script so re-run the command.
+- **A bare `:80 { … }` in the user's Caddyfile answers every host**, so caddy would keep serving its
+  hello-world demo over a name the fortress just published. The render now looks for that block
+  (readable via `ADQUIT_CADDYFILE`, default `/etc/caddy/Caddyfile`) and says which one to narrow or
+  delete, instead of leaving "it resolved but showed the wrong page" as a mystery.
+
 ### Fixes from the first real box running this
 - **`say`/`warn`/`die` are not printf.** They join their arguments, so `say 'firewall: tcp/%s open'
   "$p"` printed the percent sign literally and tacked the number on the end
@@ -86,7 +98,7 @@
 - 80 engine tests (was 66): record/zone lookup precedence, the four reply shapes, "a LAN name must
   never reach a public resolver", zone forwarding carrying our question id, a dead router not
   hanging the resolver, `--set` with a JSON object, and all four `ProxyAware` header rules.
-- 34 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
+- 38 CLI contract checks (was 23): `site`/`lan-zone` round-trips, name and port validation, the
   nginx render (dashboard vhost, per-site vhost, upgrade map, balanced braces, no `ServerName *`),
   the "refuses when not installed / bad flag" negatives, and the off-subnet guards - exercised
   against a stubbed `ip` so a CI runner's own network never decides the outcome.

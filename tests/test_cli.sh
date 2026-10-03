@@ -119,7 +119,12 @@ grep -q 'site|lan-zone|proxy)' "$REPO/bin/adquit"                             # 
 grep -q 'adquit-managed' "$REPO/bin/adquit"                                    # only our own files
 grep -q 'answer_fortress_names' "$REPO/app.py"                                 # fortress names resolve
 grep -q 'local_records' "$REPO/app.py"                                          # ...and sites do too
-! grep -qE "(say|warn|die)[[:space:]]+'[^']*%s" "$REPO/bin/adquit"               # say() is not printf                                          # ...and so do sites
+! grep -qE "(say|warn|die)[[:space:]]+'[^']*%s" "$REPO/bin/adquit"               # say() is not printf
+# `update` must heal the CLI too: on a branch, "same version stamp, newer code" is the norm
+test "$(grep -c 'cli_refresh "\$(readlink' "$REPO/bin/adquit")" = 2              # skip path and applied path
+! grep -q 'cp -f "$HOME_DIR/bin/adquit" /usr/local/bin/adquit' "$REPO/bin/adquit"  # no raw copy around it
+grep -q 'never install a CLI that does not parse' "$REPO/bin/adquit"
+grep -q 'caddy_has_bare_site' "$REPO/bin/adquit"                                  # their :80 demo is called out                                          # ...and so do sites
 grep -q "refusing to install app.py" "$REPO/install.sh"
 grep -q 'bg_run "$STATE_DIR/gravity.log"' "$BIN"                   # gravity must not own the pidfile
 # a 5M-rule warm-up is not an outage: the probe waits, status says so, stop does not lie

@@ -244,6 +244,28 @@ ensure_deps() {
     fi
 }
 
+# The engine can be byte-identical while the CLI is not: a rolling branch changes guards,
+# messages and docs without bumping VERSION, and `adquit update` reporting "already up to date"
+# while leaving an older /usr/local/bin/adquit in place strands exactly the fixes someone
+# updated for. Compare what we just fetched with what is on PATH, and refresh it.
+cli_refresh() {
+    local live="${1:-}" new="$HOME_DIR/bin/adquit" target
+    [ -f "$new" ] || return 0
+    bash -n "$new" 2>/dev/null || return 0                 # never install a CLI that does not parse
+    if [ -n "$live" ] && [ "$live" != "$new" ] \
+       && [ "$(file_id "$live" 2>/dev/null || true)" = "$(file_id "$new" 2>/dev/null || true)" ]; then
+        return 0                                           # already the same script
+    fi
+    target="/usr/local/bin/adquit"
+    [ -w /usr/local/bin ] || target="$HOME/.local/bin/adquit"
+    mkdir -p "$(dirname "$target")" 2>/dev/null || true
+    cp -f "$new" "$target" 2>/dev/null || return 0
+    chmod 0755 "$target" 2>/dev/null || true
+    printf '  %sCLI refreshed%s  %s carried the same version stamp but older code\n' "$D" "$N" "$target"
+    printf '  this run used the old script - re-run your last command to use the new one\n'
+    return 0
+}
+
 install_cli_link() {
     local target="/usr/local/bin/adquit"
     [ -w /usr/local/bin ] || target="$HOME/.local/bin/adquit"
@@ -747,6 +769,7 @@ cmd_update() {
                 warn "--force: reinstalling v$new_ver although the engine is unchanged"
             else
                 rm -f "$origin" 2>/dev/null || true
+                cli_refresh "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
                 say "already up to date - engine v$new_ver is byte-identical to what is installed"
                 printf '  (nothing restarted, your blocklists keep running)\n'
                 printf '  fresh blocklists?  %sadquit gravity%s\n' "$B" "$N"
@@ -771,7 +794,7 @@ cmd_update() {
         die "the updated app.py is not runnable with $PY - restored v${old_ver:-previous}; check 'adquit doctor'"
     fi
     rm -f "$origin" 2>/dev/null || true
-    [ -f "$HOME_DIR/bin/adquit" ] && { cp -f "$HOME_DIR/bin/adquit" /usr/local/bin/adquit 2>/dev/null || true; }
+    cli_refresh "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
     ensure_deps
     run_as_engine --rebuild
     # start (not restart): also heals a service that had already died
@@ -871,6 +894,11 @@ lines = [l.strip() for l in open(sys.argv[1], encoding="utf-8", errors="replace"
 lines = [l for l in lines if l and not l.startswith("#")]
 sys.exit(0 if lines and lines[0] == "{" else 1)
 HASGLOB
+}
+
+caddy_has_bare_site() { # $1 = port - does their Caddyfile already own it for *every* host?
+    [ -r "$PCFILE" ] || return 1
+    grep -Eq "^[[:space:]]*:?$1[[:space:]]*\{" "$PCFILE"
 }
 
 matcher_name() { # caddy named matchers cannot contain dots: media.lan -> media_lan
@@ -1097,7 +1125,13 @@ cmd_proxy() {
     [ "$want" = "auto" ] && want="$(proxy_detect)"
     [ -n "$want" ] || want="nginx"
     proxy_paths "$want"
-    if [ "$want" = caddy ] && caddy_has_global; then PGLOBAL=0; fi
+    if [ "$want" = caddy ]; then
+        caddy_has_global && PGLOBAL=0
+        if caddy_has_bare_site "$port"; then
+            warn "$PCFILE already has a bare '$port {' site - that block answers every host on :$port"
+            warn "  give it a hostname (or drop the demo site) so the names below can win, then re-run"
+        fi
+    fi
 
     if [ "$dry" = 1 ]; then
         say "$want config for :$port (nothing written)"

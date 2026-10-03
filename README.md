@@ -339,7 +339,11 @@ blocker and the web server are the same box on purpose.
   needs one line in your Caddyfile (`import adquit.caddyfile`), which `proxy install` prints.
 * If the web server you picked already listens on that port (caddy on :80 is the common case),
   that is not a conflict: `proxy install` adds vhosts to the server that owns the port and only
-  refuses when a *different* server holds it. Caddy allows exactly one global options block per
+  refuses when a *different* server holds it.
+  A stock caddy install, though, has a bare `:80 { respond "Hello, world!" }` demo block, and a
+  block with no hostname answers *every* host on that port — so `proxy install` points at it and
+  tells you to give it a hostname or drop it. It never edits your Caddyfile; only
+  `/etc/caddy/adquit.caddyfile`, which you `import`. Caddy allows exactly one global options block per
   Caddyfile, so when yours exists the rendered file explains which two options to add there
   instead of opening a second block.
 * `--no-catchall` is for a box that already serves other things on that port: the fortress then
