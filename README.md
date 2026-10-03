@@ -352,7 +352,10 @@ blocker and the web server are the same box on purpose.
   validates (`nginx -t` / `caddy validate` / `apache2ctl configtest`) and restores the previous
   config if the new one would not start.
 * Caddy is the one server it cannot wire up silently: the rendered `/etc/caddy/adquit.caddyfile`
-  needs one line in your Caddyfile (`import adquit.caddyfile`), which `proxy install` prints.
+  needs one line in your Caddyfile (`import adquit.caddyfile`), which `proxy install` prints. It
+  validates your file first, so an unclosed brace in it is reported as caddy's own error instead of
+  looking like the fragment is missing (`systemctl restart` after a *failed* unit, not `reload` -
+  Caddy will not re-read a file it never opened).
 * After `proxy install` owns the port, the **names** belong to the dashboard (`adquit.lan`,
   `<hostname>.local`), and the **bare address** — the thing people actually type into a phone —
   belongs to the start page while it exists. Turn the portal off and the address goes back to the

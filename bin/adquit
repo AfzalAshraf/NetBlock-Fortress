@@ -974,6 +974,18 @@ caddy_has_bare_site() { # $1 = port - does their Caddyfile already own it for *e
     grep -Eq "^[[:space:]]*:?$1[[:space:]]*\{" "$PCFILE"
 }
 
+caddy_main_broken() { # their Caddyfile does not adapt, so caddy will not start with our fragment
+                  # in it or without it - a missing '}' is the usual cause, and it reports as EOF
+    CADDY_ERR=""
+    [ -r "$PCFILE" ] || return 1
+    have caddy || return 1
+    if ! CADDY_ERR="$(caddy validate --config "$PCFILE" --adapter caddyfile 2>&1)"; then
+        CADDY_ERR="$(printf '%s\n' "$CADDY_ERR" | grep -Ei 'error' | head -n1)"
+        return 0
+    fi
+    return 1
+}
+
 matcher_name() { # caddy named matchers cannot contain dots: media.lan -> media_lan
     printf '%s' "$1" | tr '.-' '__'
 }
@@ -1231,6 +1243,12 @@ cmd_proxy() {
             warn "  or drop the line:  sudo sed -i '/adquit.caddyfile/d' $PCFILE && sudo systemctl restart caddy"
         fi
         caddy_has_global && PGLOBAL=0
+        if caddy_main_broken; then
+            warn "$PCFILE does not load - caddy will not start, our fragment included"
+            [ -n "$CADDY_ERR" ] && warn "  caddy says: ${CADDY_ERR#*Error: }"
+            warn "  an 'EOF' there is a '{' without its '}'; ours lives in $PFILE, not in your file"
+            warn "  see it:   sudo caddy validate --config $PCFILE --adapter caddyfile"
+        fi
         if caddy_has_bare_site "$port"; then
             warn "$PCFILE already has a bare '$port {' site - that block answers every host on :$port"
             warn "  give it a hostname (or drop the demo site) so the names below can win, then re-run"

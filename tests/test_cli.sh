@@ -47,6 +47,33 @@ esac
 STUBIP
 chmod +x "$TMP/stub/ip"
 
+# A `caddy` that knows one verb: validate. Braces balanced means the file loads, an import of a
+# missing file does not. It is kept out of $TMP/stub so only the check that wants it sees it -
+# otherwise proxy_detect would find a "caddy" on every box in the suite.
+mkdir -p "$TMP/stub-caddy"
+cat > "$TMP/stub-caddy/caddy" <<'STUBCADDY'
+#!/bin/sh
+[ "$1" = validate ] || exit 0
+file="$3"
+[ -r "$file" ] || exit 0
+open="$(tr -cd '{' < "$file" | wc -c)"
+close="$(tr -cd '}' < "$file" | wc -c)"
+if [ "$open" != "$close" ]; then
+    echo "Error: adapting config using caddyfile: EOF" >&2
+    exit 1
+fi
+imp="$(grep -Eo '^[[:space:]]*import[[:space:]]+[^[:space:]]+' "$file" | head -n1 | awk '{print $2}')"
+if [ -n "$imp" ]; then
+    case "$imp" in
+        /*) ;;
+        *) imp="$(dirname "$file")/$imp" ;;
+    esac
+    [ -r "$imp" ] || { echo "Error: File to import not found or unable to stat" >&2; exit 1; }
+fi
+exit 0
+STUBCADDY
+chmod +x "$TMP/stub-caddy/caddy"
+
 printf '\n\033[1m  adquit CLI contract\033[0m\n'
 check "help renders"              bash -c "$BIN help | grep -q 'START / STOP'"
 VER="$(sed -n 's/^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$REPO/app.py" | head -n1)"
@@ -221,6 +248,17 @@ check "adquit routes home.lan and start.lan to the start page" bash -c "
     '$BIN' proxy install --server nginx --port 80 --dry-run 2>&1 | grep -q 'server_name home.lan portal.lan start.lan' &&
     '$BIN' proxy install --server caddy --port 80 --dry-run 2>&1 | grep -q '@adquit_portal host home.lan' &&
     '$BIN' proxy install --server apache --port 80 --dry-run 2>&1 | grep -q 'ServerAlias home.lan'
+"
+check "adquit says so when the Caddyfile it is about to feed will not load" bash -c "
+    export PATH='$TMP/stub-caddy':\$PATH
+    printf ':80 {\n\treverse_proxy 127.0.0.1:8080\n' > '$TMP/Caddyfile.broken'
+    printf ':80 {\n\treverse_proxy 127.0.0.1:8080\n}\n' > '$TMP/Caddyfile.good'
+    ADQUIT_CADDYFILE='$TMP/Caddyfile.broken' \
+        '$BIN' proxy install --server caddy --port 80 --dry-run 2>&1 | grep -q 'does not load' &&
+    ADQUIT_CADDYFILE='$TMP/Caddyfile.broken' \
+        '$BIN' proxy install --server caddy --port 80 --dry-run 2>&1 | grep -q 'caddyfile: EOF' &&
+    ! ADQUIT_CADDYFILE='$TMP/Caddyfile.good' \
+        '$BIN' proxy install --server caddy --port 80 --dry-run 2>&1 | grep -q 'does not load'
 "
 check "adquit proxy refuses a bad port and an unknown server" bash -c "
     '$BIN' proxy install --port eight --dry-run >/dev/null 2>&1; test \$? -ne 0

@@ -28,6 +28,11 @@
 - A dangling `import adquit.caddyfile` (their Caddyfile references the fragment, the fragment was
   never written) is now named out loud with both ways out, because it does not read as "caddy
   refuses to start", it reads as "the fortress broke".
+- `proxy install --server caddy` reads *your* file before it touches anything: `caddy validate` on
+  `/etc/caddy/Caddyfile` failing is reported with caddy's own words and the note that our fragment
+  lives in a separate file. An `adapting config using caddyfile: EOF` there is an unclosed `{` in
+  the main file - which looks exactly like a missing `import adquit.caddyfile`, is not fixed by
+  writing one, and used to send people the wrong way while their web server sat dead.
 - **`adquit set` / `adquit get` are real verbs now** (`--set`/`--get` keep working). The docs told
   people to run `sudo adquit --set answer_fortress_names false` and the CLI answered "unknown
   command" - the engine accepted it, the wrapper did not, and every key we expose for editing needs
@@ -35,8 +40,9 @@
   verbs.
 - Tests: 86 engine (was 80) - link shapes per proxy mode, escaping, the empty state, the live
   listener's page/JSON/302/405, and that a busy port or a disabled switch never raises - plus 43
-  CLI contract checks (was 39): `portal status|url|on|off|title`, `set`/`get`, that a second `site add` does not erase the first, the start-page vhosts in all three
-  renders, and the dangling-import message.
+  CLI contract checks (was 35): `portal status|url|on|off|title`, `set`/`get`, that a second `site
+  add` does not erase the first, the start-page vhosts in all three renders, the dangling-import
+  message, and that a Caddyfile which cannot be parsed is named before we feed it anything.
 
 ## v19.2 — the fortress also serves your own sites ("Self-Host")
 
