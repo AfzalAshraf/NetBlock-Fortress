@@ -1,0 +1,1991 @@
+#!/usr/bin/env bash
+#
+# adquit - one word to run a network-wide micro & macro ad shield.
+#
+#   adquit                 start the fortress (installs itself on first run)
+#   adquit start|stop|restart|status|logs|watch
+#   adquit mode strict|family|nuclear|balanced|off
+#   adquit block doubleclick.net   |   adquit allow news.ycombinator.com
+#   adquit test            prove blocking works end-to-end
+#   adquit stats           live counters in the terminal
+#
+# Part of NetBlock Fortress - see README.md
+set -o pipefail
+
+# Keep the operator's full command line: elevation re-runs this script with sudo, and it
+# must replay *every* argument (`adquit block a.com b.com`), not just the verb.
+ORIG_ARGS=("$@")
+
+VERSION_TAG="19.3"
+REPO="${ADQUIT_REPO:-AfzalAshraf/NetBlock-Fortress}"
+REF="${ADQUIT_REF:-main}"
+RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
+TARBALL="${ADQUIT_TARBALL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF}"
+SERVICE="adquit"
+# Who may tell us the client's real address: caddy itself (loopback) and any proxy on the
+# private networks a LAN box uses. Written per proxy, and suggested as the global equivalent, so
+# the two can never disagree - inside `reverse_proxy` caddy parses these tokens as addresses, so
+# the module words from the global form ("static private_ranges") are a provisioning error here.
+CADDY_TRUSTED="127.0.0.0/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7"
+C=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+# (ANSI-C quoting matters: printf passes %s substitutions through untouched, so a
+#  literal "\033[32m" in a variable would be printed verbatim - which it was.)
+[ -t 1 ] || { C=""; Y=""; R=""; B=""; D=""; N=""; }
+
+# say/warn/die take a *message*, not a printf template: they join their arguments with
+# spaces. `say 'port %s' 8080` therefore prints the percent literally - pre-expand it
+# (`say "port $p"`) or use printf. A CLI test in tests/test_cli.sh keeps it that way.
+say()  { printf "${B}${C}==>${N} %s\n" "$*"; }
+warn() { printf "${B}${Y}warn:${N} %s\n" "$*"; }
+die()  { printf "${B}${R}error:${N} %s\n" "$*" >&2; exit 1; }
+ask()  { printf "%s " "$*"; read -r a; printf '%s' "$a"; }
+
+is_root() { [ "$(id -u)" = "0" ]; }
+
+SUDO=""
+if ! is_root; then
+    if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+fi
+
+# ---------------------------------------------------------------------------
+#  Where does the fortress live?
+# ---------------------------------------------------------------------------
+SYSTEMD=""
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    SYSTEMD="yes"
+fi
+
+if [ -n "${ADQUIT_HOME:-}" ]; then
+    HOME_DIR="$ADQUIT_HOME"
+elif [ -x /opt/adquit/app.py ] || [ -x /opt/adquit/venv/bin/python ] || is_root; then
+    HOME_DIR="/opt/adquit"
+    [ -d /opt/netblock ] && [ ! -e /opt/adquit ] && HOME_DIR="/opt/netblock"
+else
+    HOME_DIR="$HOME/.adquit"
+fi
+APP="$HOME_DIR/app.py"
+PY="$HOME_DIR/venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+STATE_DIR="$HOME_DIR/data"
+INITIAL_PW_FILE="$STATE_DIR/.dashboard-initial-password"
+#  app.py writes and deletes this path (INITIAL_PW_FILE), install.sh creates it, and this is where
+#  `passwd --show` reads it. Three files, one name - tests/test_cli.sh pins the literal so a rename
+#  in one of them cannot leave a plaintext password behind in the other two.
+PIDFILE="$HOME_DIR/adquit.pid"
+REAL_HOME="$HOME"
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    REAL_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    [ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
+fi
+NEEDS_SUDO=0
+if ! is_root && [ ! -w "$HOME_DIR" ] && [ -f "$APP" ]; then NEEDS_SUDO=1; fi
+
+export ADQUIT_HOME="$HOME_DIR"
+case "$HOME_DIR" in
+    "$REAL_HOME"/*)   # a rootless ~/.adquit install cannot bind :53
+        export ADQUIT_DNS_PORT="${ADQUIT_DNS_PORT:-5353}"
+        export ADQUIT_WEB_PORT="${ADQUIT_WEB_PORT:-8080}"
+        ;;
+esac
+
+# Reads (status/stats/rules/doctor) work unprivileged; anything that writes state or
+# controls the service is re-run through sudo instead of failing with "Permission denied"
+# and then reporting a half-started user-mode fortress as if it were live.
+using_systemd() {
+    [ -n "$SYSTEMD" ] || return 1
+    [ -f "/etc/systemd/system/$SERVICE.service" ] || return 1
+    is_root && return 0
+    [ "$NEEDS_SUDO" = "1" ] && return 0          # elevate_for() re-runs us as root
+    return 1
+}
+
+elevate_for() {
+    [ "$NEEDS_SUDO" = "1" ] || return 0
+    have sudo || die "$HOME_DIR is owned by root - run: sudo adquit $1"
+    printf '  (fortress lives in %s - elevating with sudo)\n' "$HOME_DIR"
+    # sudo rebuilds the environment (env_reset), so an exported ADQUIT_* variable does
+    # not survive the hop - anything this script needs must be re-supplied here.
+    exec sudo env ADQUIT_HOME="$HOME_DIR" REAL_HOME="$REAL_HOME" \
+        ADQUIT_REF="${ADQUIT_REF:-}" HOME="$REAL_HOME" \
+        ADQUIT_FORCE="${ADQUIT_FORCE:-}" ADQUIT_REHEALED="${ADQUIT_REHEALED:-}" \
+        ADQUIT_ORIGIN_FILE="${ADQUIT_ORIGIN_FILE:-}" bash "$0" "${ORIG_ARGS[@]}"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+gateway_ip() { # the router this box's default route uses - the address LAN names go to
+    if have ip; then
+        ip route 2>/dev/null | awk '/^default/ {print $3; exit}'
+    elif have route; then
+        route -n get default 2>/dev/null | awk '/gateway:/ {print $2; exit}'
+    fi
+}
+
+lan_subnet() { # 10.0.0.5 -> 10.0.0 ; a host:port or a name yields nothing to compare
+    local a="${1%%:*}"
+    case "$a" in
+        *.*.*.*) printf '%s' "${a%.*}" ;;
+        *)       printf '' ;;
+    esac
+}
+
+lan_addrs() { # every IPv4 on this box (a multi-homed host must not be warned about its own LAN)
+    if have ip; then
+        ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^127\.'
+    elif have hostname; then
+        hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' | grep -v '^127\.'
+    fi
+}
+
+# warn_off_subnet <address> <what it is> <how to fix it>
+# A zone or a site pointing at an address this box cannot reach is worse than no entry:
+# every lookup for those names waits for a timeout instead of answering. Docs show example
+# networks, so this catches the very likely "copied the example IP" case.
+warn_off_subnet() {
+    local want="$1" label="$2" hint="${3:-}" a mine nets="" show=""
+    case "$want" in
+        ''|*[!0-9.]*|*.*.*.*.*) return 0 ;;           # only a bare IPv4 can be judged
+    esac
+    for a in $(lan_addrs); do
+        mine="$(lan_subnet "$a")"
+        [ -n "$mine" ] || continue
+        nets="$nets$mine. "
+        show="$show $mine.0/24"
+    done
+    [ -n "$nets" ] || return 0                        # nothing to compare against: stay quiet
+    for mine in $nets; do
+        case "$want" in
+            "$mine"*) return 0 ;;
+        esac
+    done
+    warn "$want ($label) is not on any network this box is on (${show# })"
+    warn "  an unreachable address answers nothing - those names stall until they time out"
+    [ -n "$hint" ] && warn "  to use your own network instead: $hint"
+    return 0
+}
+
+lan_ip() { # the address other devices on this network will see
+    ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1
+}
+
+lan_urls() {
+    local p host ip
+    p="$(web_port)"
+    host="$(hostname 2>/dev/null || echo localhost)"
+    ip="$(lan_ip)"
+    printf '  http://localhost:%s\n' "$p"
+    [ -n "$ip" ] && printf '  http://%s:%s   (LAN - what other devices use)\n' "$ip" "$p"
+    case "$host" in
+        *.local) printf '  http://%s:%s   (mDNS, same network)\n' "$host" "$p" ;;
+        *)       printf '  http://%s.local:%s   (mDNS, same network)\n' "$host" "$p" ;;
+    esac
+}
+
+token() {
+    if [ -r "$STATE_DIR/config.json" ]; then
+        "$PY" -c "import json,sys;print(json.load(open('$STATE_DIR/config.json')).get('api_token',''))" 2>/dev/null
+    fi
+}
+
+# ---------------------------------------------------------------------------
+#  Installer (also used by `curl | sudo bash` via install.sh)
+# ---------------------------------------------------------------------------
+source_dir() { # locate a checkout containing app.py
+    for d in "$(dirname "$(readlink -f "$0")")/.." "$(dirname "$(readlink -f "$0")")" "$PWD" "$OLDPWD"; do
+        [ -f "$d/app.py" ] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+detect_channel() { # the ref this install came from (recorded by install.sh)
+    [ -n "${ADQUIT_REF:-}" ] && { printf '%s' "$ADQUIT_REF"; return; }
+    local f
+    for f in "$HOME_DIR/.channel" "/opt/adquit/.channel" "$HOME/.adquit/.channel"; do
+        [ -s "$f" ] && { head -n1 "$f" | tr -d '[:space:]'; return; }
+    done
+    printf 'main'
+}
+
+resolve_channel() { # point REPO/REF/URLs at the recorded channel (once per command)
+    [ -n "${ADQUIT_CHANNEL_DONE:-}" ] && return 0
+    ADQUIT_CHANNEL_DONE=1
+    REF="$(detect_channel)"
+    RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
+    TARBALL="${ADQUIT_TARBALL:-https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF}"
+}
+
+fetch_repo() { # download app.py + adquit into HOME_DIR
+    resolve_channel
+    local dest="$1" tmp
+    tmp="$(mktemp -d)"
+    say "Fetching NetBlock Fortress v$VERSION_TAG from GitHub"
+    if have curl && curl -fsSL --max-time 120 "$TARBALL" -o "$tmp/src.tar.gz" 2>/dev/null; then
+        if tar -xzf "$tmp/src.tar.gz" -C "$tmp" 2>/dev/null; then
+            local root
+            root="$(find "$tmp" -maxdepth 1 -mindepth 1 -type d | head -n1)"
+            if [ -f "$root/app.py" ]; then
+                atomic_install "$root/app.py" "$dest/app.py" 0755 || true
+                [ -f "$root/bin/adquit" ] && install -D -m 0755 "$root/bin/adquit" "$dest/bin/adquit"
+                rm -rf "$tmp"; return 0
+            fi
+        fi
+    fi
+    if have curl && curl -fsSL --max-time 60 "$RAW_BASE/app.py" -o "$dest/app.py" 2>/dev/null; then
+        curl -fsSL --max-time 30 "$RAW_BASE/bin/adquit" -o "$dest/bin/adquit" 2>/dev/null || true
+        chmod 0755 "$dest/bin/adquit" 2>/dev/null || true
+        return 0
+    fi
+    have git || { rm -rf "$tmp"; die "need curl or git to download the fortress"; }
+    git clone --depth 1 -b "$REF" "https://github.com/$REPO.git" "$tmp/clone" >/dev/null 2>&1 \
+        || { rm -rf "$tmp"; die "git clone of $REPO failed"; }
+    atomic_install "$tmp/clone/app.py" "$dest/app.py" 0755
+    [ -f "$tmp/clone/bin/adquit" ] && install -D -m 0755 "$tmp/clone/bin/adquit" "$dest/bin/adquit"
+    rm -rf "$tmp"
+}
+
+ensure_deps() {
+    say "Checking Python dependencies (flask, requests, dnslib)"
+    if ! "$PY" -c "import flask, requests, dnslib" 2>/dev/null; then
+        $SUDO "$PY" -m pip install --quiet --upgrade flask requests dnslib 2>/dev/null \
+            || $SUDO "$PY" -m pip install --quiet --user flask requests dnslib 2>/dev/null \
+            || $SUDO "$PY" -m pip install --quiet --break-system-packages flask requests dnslib \
+            || die "pip install failed - run: python3 -m pip install flask requests dnslib"
+    fi
+}
+
+# Replace a file by renaming a finished copy into place, never by truncating the file someone
+# may be reading. `cp -f` onto a running script pulls the ground out from under it: bash reads a
+# script as it executes it, so an update that refreshed /usr/local/bin/adquit in place made that
+# same update die at line 1890 with "unexpected EOF while looking for matching `"' - on a file
+# that was perfectly valid on disk. The failure moves, too: it lands on whichever command runs
+# next, so the update looks fine and the *following* verb is the one that dies. A rename is
+# atomic and a reader that already opened the old inode keeps the old bytes. A symlinked
+# destination is followed rather than replaced, or someone keeps running the file they had.
+atomic_install() { # $1 = source, $2 = destination, [$3 = mode, default 0755]
+    local src="$1" dst="$2" mode="${3:-0755}" tmp real
+    [ -f "$src" ] || return 1
+    if [ -L "$dst" ]; then
+        real="$(readlink -f "$dst" 2>/dev/null || printf '%s' "$dst")"
+        [ -f "$real" ] && dst="$real"
+    fi
+    tmp="$(dirname "$dst")/.$(basename "$dst").adquit.$$"
+    if have install; then
+        install -m "$mode" "$src" "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    else
+        cp -f "$src" "$tmp" 2>/dev/null && chmod "$mode" "$tmp" 2>/dev/null \
+            || { rm -f "$tmp" 2>/dev/null; return 1; }
+    fi
+    mv -f "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    return 0
+}
+
+# The engine can be byte-identical while the CLI is not: a rolling branch changes guards,
+# messages and docs without bumping VERSION, and `adquit update` reporting "already up to date"
+# while leaving an older /usr/local/bin/adquit in place strands exactly the fixes someone
+# updated for. Compare what we just fetched with what is on PATH, and refresh it.
+cli_refresh() {
+    local live="${1:-}" new="$HOME_DIR/bin/adquit" target
+    [ -f "$new" ] || return 0
+    bash -n "$new" 2>/dev/null || return 0                 # never install a CLI that does not parse
+    if [ -n "$live" ] && [ "$live" != "$new" ] \
+       && [ "$(file_id "$live" 2>/dev/null || true)" = "$(file_id "$new" 2>/dev/null || true)" ]; then
+        return 0                                           # already the same script
+    fi
+    target="/usr/local/bin/adquit"
+    [ -w /usr/local/bin ] || target="$HOME/.local/bin/adquit"
+    mkdir -p "$(dirname "$target")" 2>/dev/null || true
+    atomic_install "$new" "$target" 0755 || return 0
+    printf '  %sCLI refreshed%s  %s carried the same version stamp but older code\n' "$D" "$N" "$target"
+    printf '  this run used the old script - re-run your last command to use the new one\n'
+    return 0
+}
+
+install_cli_link() {
+    local target="/usr/local/bin/adquit"
+    [ -w /usr/local/bin ] || target="$HOME/.local/bin/adquit"
+    mkdir -p "$(dirname "$target")"
+    atomic_install "$HOME_DIR/bin/adquit" "$target" 0755 || true
+    printf '  %scommand:%s %sadquit%s now available at %s\n' "$D" "$N" "$B" "$N" "$target"
+}
+
+write_unit() {
+    local unit="/etc/systemd/system/$SERVICE.service"
+    say "Installing systemd unit $unit"
+    cat > "$unit" <<UNIT
+[Unit]
+Description=NetBlock Fortress - network-wide micro & macro ad shield
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ADQUIT_HOME=$HOME_DIR
+Environment=ADQUIT_NO_PIP=1
+ExecStart=$PY $APP --serve
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    [ -f /etc/systemd/system/netblock.service ] && {
+        warn "migrating the legacy 'netblock' service"
+        systemctl stop netblock 2>/dev/null || true
+        systemctl disable netblock 2>/dev/null || true
+        rm -f /etc/systemd/system/netblock.service
+        systemctl daemon-reload
+    }
+    cat > "/etc/logrotate.d/adquit" 2>/dev/null <<LOG || true
+$STATE_DIR/adquit.log $STATE_DIR/queries.jsonl {
+    size 10M
+    rotate 2
+    compress
+    missingok
+    notifempty
+}
+LOG
+}
+
+cmd_install() {
+    local mode="strict" with_lists=1 user_mode="" pw="" already=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --user) user_mode=1 ;;
+            --mode) mode="${2:-strict}"; shift ;;
+            --password) pw="$2"; shift ;;
+            --no-lists) with_lists=0 ;;
+            --already-elevated) already=1 ;;
+            *) warn "ignoring unknown flag: $1" ;;
+        esac
+        shift
+    done
+    if [ -n "$user_mode" ]; then
+        HOME_DIR="$HOME/.adquit"
+    elif ! is_root && [ -n "$SUDO" ] && [ -z "$already" ]; then
+        say "elevating with sudo"
+        exec $SUDO env ADQUIT_HOME="${ADQUIT_HOME:-}" ADQUIT_REF="$REF" ADQUIT_REPO="$REPO" \
+            bash "$0" install "$@" --already-elevated
+    elif ! is_root && [ -z "$SUDO" ]; then
+        warn "no root available - installing in $HOME/.adquit (user mode)"
+        HOME_DIR="$HOME/.adquit"
+    fi
+    export ADQUIT_HOME="$HOME_DIR"
+    APP="$HOME_DIR/app.py"
+    STATE_DIR="$HOME_DIR/data"
+    PIDFILE="$HOME_DIR/adquit.pid"
+    PY="$HOME_DIR/venv/bin/python"
+    [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+    [ -n "$PY" ] || die "python3 is required - install it first (apt install python3 python3-venv)"
+
+    mkdir -p "$HOME_DIR/bin" "$STATE_DIR/lists"
+    if [ -d /opt/netblock ] && [ ! -e /opt/adquit ] && is_root; then
+        say "migrating a v18 install from /opt/netblock"
+        ln -sfn /opt/netblock /opt/adquit
+        HOME_DIR=/opt/netblock; export ADQUIT_HOME="$HOME_DIR"
+        APP="$HOME_DIR/app.py"; STATE_DIR="$HOME_DIR/data"; PIDFILE="$HOME_DIR/adquit.pid"
+    fi
+    local src; src="$(source_dir)" || src=""
+    if [ -n "$src" ] && [ "$src" != "$HOME_DIR" ]; then
+        say "installing from local checkout: $src"
+        atomic_install "$src/app.py" "$HOME_DIR/app.py" 0755
+        [ -f "$src/bin/adquit" ] && install -D -m 0755 "$src/bin/adquit" "$HOME_DIR/bin/adquit"
+        [ -d "$src/data/lists" ] && cp -rn "$src/data/lists/." "$STATE_DIR/lists/" 2>/dev/null
+    else
+        fetch_repo "$HOME_DIR"
+    fi
+    if [ ! -d "$HOME_DIR/venv" ] && have python3; then
+        say "creating a private virtualenv"
+        python3 -m venv "$HOME_DIR/venv" >/dev/null 2>&1 || true
+    fi
+    [ -x "$HOME_DIR/venv/bin/python" ] && PY="$HOME_DIR/venv/bin/python"
+    export PY
+    ensure_deps
+    [ -n "$pw" ] && "$PY" "$HOME_DIR/app.py" --passwd "$pw" >/dev/null 2>&1
+    "$PY" "$HOME_DIR/app.py" --mode "$mode" >/dev/null 2>&1
+    if is_root && [ -n "$SYSTEMD" ]; then write_unit; fi
+    if is_root; then install_cli_link; fi
+    if [ "$with_lists" = "1" ]; then
+        say "pulling blocklists in the background (first run downloads a few hundred MB)"
+        ADQUIT_HOME="$HOME_DIR" bg_run "$STATE_DIR/gravity.log" "$PY" "$APP" --update-lists
+    fi
+    say "installed into $HOME_DIR"
+    cmd_start || true
+    print_ready
+}
+
+print_ready() {
+    local ip port user
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [ -n "$ip" ] || ip="$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)"
+    port="$("$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('web_port',8080))" 2>/dev/null || echo "${ADQUIT_WEB_PORT:-8080}")"
+    user="$("$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('admin_username','admin'))" 2>/dev/null || echo admin)"
+    printf '\n%s%s NetBlock Fortress is armed %s\n' "$B" "$C" "$N"
+    printf '   dashboard   http://%s:%s  (user %s)\n' "$ip" "$port" "$user"
+    printf '   dns server  %s:%s\n' "$ip" "${ADQUIT_DNS_PORT:-53}"
+    printf '   manage with %sadquit stats%s / %sadquit help%s\n\n' "$B" "$N" "$B" "$N"
+    printf '   point your router or devices at %s%s%s to protect every app on the network\n' "$Y" "$ip" "$N"
+    printf '   protect this machine only:      %ssudo adquit protect%s\n\n' "$Y" "$N"
+}
+
+# ---------------------------------------------------------------------------
+#  Service control
+# ---------------------------------------------------------------------------
+port_owner() { # which process holds a tcp port ("" when it cannot be told)
+    have ss || return 0
+    ss -ltnp 2>/dev/null | grep -E "[:.]$1[[:space:]]" \
+        | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n1
+}
+
+port_busy() { # is something already listening on a tcp port?
+    local p="$1"
+    if have ss; then ss -lnt 2>/dev/null | grep -q ":$p "; return $?; fi
+    if have netstat; then netstat -lnt 2>/dev/null | grep -q ":$p "; return $?; fi
+    return 1
+}
+
+dns_port() {
+    [ -r "$STATE_DIR/config.json" ] && \
+        "$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('dns_port',53))" 2>/dev/null \
+        && return 0
+    printf '%s' "${ADQUIT_DNS_PORT:-53}"
+}
+
+dash_user() { # the dashboard username straight out of config.json - no engine spawn, because this
+               # runs in `status` and in the start banner on boxes where python may not be ready yet
+    local u
+    u="$(sed -n 's/.*"admin_username": *"\([^"]*\)".*/\1/p' "$STATE_DIR/config.json" 2>/dev/null | head -n1)"
+    # a box that has never saved a config is running DEFAULT_CONFIG, whose user is 'admin' -
+    # printing an empty username is how you end up telling someone their login is blank
+    printf '%s\n' "${u:-admin}"
+}
+
+web_port() {
+    "$PY" -c "import json;print(json.load(open('$STATE_DIR/config.json')).get('web_port',8080))" 2>/dev/null \
+        || printf '%s' "${ADQUIT_WEB_PORT:-8080}"
+}
+
+portal_cfg() { # "<enabled> <port>", read from the live config, with sane fallbacks
+    "$PY" - "$STATE_DIR/config.json" <<'PCFG' 2>/dev/null || printf '1 8082'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    c = {}
+print("1" if c.get("portal_enabled", True) else "0", c.get("portal_port", 8082))
+PCFG
+}
+
+portal_count() {
+    "$PY" -c "import json;print(len(json.load(open('$STATE_DIR/config.json')).get('local_records') or {}))" \
+        2>/dev/null || printf 0
+}
+
+portal_url() { # how another device opens the start page; non-zero when it is switched off
+    local cfg on pp ip
+    cfg="$(portal_cfg)"; on="${cfg%% *}"; pp="${cfg##* }"
+    [ "$on" = "1" ] || return 1
+    ip="$(lan_ip | head -n1)"
+    printf 'http://%s:%s/' "${ip:-127.0.0.1}" "$pp"
+}
+
+health_ok() {
+    local p; p="$(web_port)"
+    curl -fsS --max-time 2 "http://127.0.0.1:$p/api/health" >/dev/null 2>&1
+}
+
+unit_active() { # systemd says the unit is up (unprivileged queries work for any user)
+    using_systemd || return 1
+    systemctl is-active --quiet "$SERVICE" 2>/dev/null && return 0
+    [ "$NEEDS_SUDO" = "1" ] && $SUDO systemctl is-active --quiet "$SERVICE" 2>/dev/null
+}
+
+cache_mb() { # size of the compiled blocklist, in MB - a proxy for warm-up cost
+    local f="$STATE_DIR/gravity.cache" sz=0
+    [ -f "$f" ] || { printf '0'; return; }
+    sz=$(( $(wc -c < "$f" 2>/dev/null || echo 0) / 1048576 ))
+    printf '%s' "${sz:-0}"
+}
+
+running() {
+    if using_systemd; then
+        systemctl is-active --quiet "$SERVICE" && return 0
+        health_ok && return 0
+        return 1
+    fi
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    health_ok
+}
+
+wait_healthy() { # budget grows with the gravity cache: 5M rules take real time to load
+    local budget="${ADQUIT_START_WAIT:-}" waited=0 mb reason
+    case "${budget:-}" in (''|*[!0-9]*) budget=0 ;; esac
+    if [ "$budget" -eq 0 ]; then
+        mb="$(cache_mb)"
+        # unpickling hundreds of MB plus the DNS bind is not a 15-second job; the old
+        # fixed 30x0.5s loop declared a healthy machine dead and stopped it mid-boot
+        budget=$(( 30 + mb / 2 ))
+        [ "$budget" -gt 600 ] && budget=600
+    fi
+    printf '  warming up the engine (%s MB gravity cache, allowing up to %ss)\n' "$(cache_mb)" "$budget"
+    while [ "$waited" -lt "$budget" ]; do
+        health_ok && return 0
+        if [ -f "$PIDFILE" ] && ! kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+            reason="the process exited"; break
+        fi
+        if using_systemd && systemctl is-failed --quiet "$SERVICE" 2>/dev/null; then
+            reason="systemd reports the unit as failed"; break
+        fi
+        sleep 1; waited=$((waited + 1))
+    done
+    if health_ok; then return 0; fi
+    [ -n "${reason:-}" ] && printf '  %s%s%s\n' "$R" "$reason" "$N"
+    return 1
+}
+
+bg_run() { # background a side task (gravity pull, feed update) - never touches the pidfile
+    local log="$1"; shift
+    if have setsid; then
+        setsid "$@" >> "$log" 2>&1 < /dev/null &
+    else
+        nohup "$@" >> "$log" 2>&1 < /dev/null &
+    fi
+}
+
+start_detached() { # start the service in the background and record its pid
+    local log="$1"; shift
+    bg_run "$log" "$@"
+    echo $! > "$PIDFILE"
+}
+
+app_version() { # the VERSION stamp inside an app.py, without running python
+    sed -n 's/^[[:space:]]*VERSION[[:space:]]*=[[:space:]]*["'"'"']\([0-9][0-9.]*\).*/\1/p' "$1" 2>/dev/null \
+        | tr -d '\r\n' | head -n1
+}
+
+ver_ge() { # ver_ge A B -> is A >= B?  Pure shell arithmetic on (major,minor,patch):
+           # a `sort | head` pipeline here made equal versions fail (SIGPIPE/locale).
+    local a="$1" b="$2" pa pb _
+    for _ in 1 2 3; do
+        pa="${a%%.*}"; pb="${b%%.*}"
+        pa="${pa%%[!0-9]*}"; pb="${pb%%[!0-9]*}"
+        [ "${pa:-0}" -gt "${pb:-0}" ] && return 0
+        [ "${pa:-0}" -lt "${pb:-0}" ] && return 1
+        a="${a#*.}"; b="${b#*.}"
+    done
+    return 0
+}
+
+file_id() { # content fingerprint, so "same version, newer code" is distinguishable
+    local f="$1"
+    [ -f "$f" ] || return 1
+    if have sha256sum; then sha256sum "$f" | cut -c1-16
+    elif have shasum; then shasum "$f" | cut -c1-16
+    elif have md5sum; then md5sum "$f" | cut -c1-16
+    else wc -c < "$f" | tr -d ' \r'; fi
+}
+
+update_decision() { # update_decision OLD NEW OLDFINGERPRINT NEWFINGERPRINT
+    # nostamp : the channel has no real fortress app.py (v18, or not Python at all)
+    # skip    : byte-identical engine - nothing to do, do not bounce the resolver
+    # refuse  : the channel holds a *lower* version than what is installed
+    # go      : newer, or the same version with different code (normal on a branch)
+    local oldv="$1" newv="$2" olds="$3" news="$4"
+    [ -z "$newv" ] && { printf 'nostamp'; return 0; }
+    if [ -n "$olds" ] && [ "$olds" = "$news" ]; then printf 'skip'; return 0; fi
+    [ -z "$oldv" ] && { printf 'go'; return 0; }
+    if ver_ge "$newv" "$oldv"; then printf 'go'; else printf 'refuse'; fi
+}
+
+cmd_start() {
+    if [ ! -f "$APP" ]; then
+        say "first run: installing the fortress"
+        cmd_install --already-elevated
+        return $?
+    fi
+    mkdir -p "$STATE_DIR"
+    if using_systemd; then
+        $SUDO systemctl start "$SERVICE"
+        if ! wait_healthy; then
+            if unit_active; then
+                # Do not call this a failure: the unit is up, the tables are still
+                # loading. Killing/restarting here would restart the load from zero.
+                warn "still loading blocklists after the wait above - the unit is active and working"
+                printf '  watch it: %ssudo journalctl -u %s -f%s   (or: adquit status)\n' "$B" "$SERVICE" "$N"
+                printf '  if it never finishes, a smaller profile is enough: adquit mode strict\n'
+                return 0
+            fi
+            $SUDO journalctl -u "$SERVICE" -n 25 --no-pager
+            die "service did not become healthy"
+        fi
+        printf '%s✔ fortress live%s  dns :%s  dashboard http://127.0.0.1:%s  (systemd unit: %s)\n' \
+            "$C" "$N" "$(dns_port)" "$(web_port)" "$SERVICE"
+        printf '  login      %s on http://127.0.0.1:%s  - the password: sudo adquit passwd --show\n' \
+            "$(dash_user)" "$(web_port)"
+        printf '%s  reachable from your other devices:%s\n' "$D" "$N"
+        lan_urls | sed 's/^/   /'
+        return 0
+    fi
+    if running; then
+        warn "already running (dashboard :$(web_port))"
+        return 0
+    fi
+    local dp; dp="$(dns_port)"
+    if port_busy "$dp" && ! health_ok; then
+        warn "udp/tcp $dp is already bound - another resolver (or an old fortress) owns it"
+    fi
+    ADQUIT_HOME="$HOME_DIR" start_detached "$HOME_DIR/adquit.out" "$PY" "$APP" --serve
+    if wait_healthy; then
+        printf '%s✔ fortress live%s  dashboard http://127.0.0.1:%s  dns :%s  pid %s\n' \
+            "$C" "$N" "$(web_port)" "$dp" "$(cat "$PIDFILE" 2>/dev/null || echo '-')"
+        printf '%s  reachable from your other devices:%s\n' "$D" "$N"
+        lan_urls | sed 's/^/   /'
+    else
+        # /api/health never answered - do not claim otherwise, show why instead
+        printf '%s✘ not serving yet%s - last lines of %s:\n' "$R" "$N" "$HOME_DIR/adquit.out"
+        tail -n 12 "$HOME_DIR/adquit.out" 2>/dev/null | sed 's/^/    /'
+        printf '    also try: journalctl -u %s -n 40   (or: adquit doctor)\n' "$SERVICE"
+        return 1
+    fi
+}
+
+cmd_stop() {
+    # Whether a stop is needed is systemd's business, not the dashboard port's: during a
+    # warm-up the port is closed while the process is very much alive, and claiming
+    # "not running" there hides a stop that a later start then raced against.
+    local was_unit=0
+    if using_systemd; then
+        unit_active && was_unit=1
+        $SUDO systemctl stop "$SERVICE" 2>/dev/null || true
+    fi
+    if [ -f "$PIDFILE" ]; then
+        local pid; pid="$(cat "$PIDFILE" 2>/dev/null)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+            printf '%sstopped%s\n' "$Y" "$N"
+            rm -f "$PIDFILE"
+            return 0
+        fi
+        rm -f "$PIDFILE"
+    fi
+    if health_ok; then
+        pkill -f "$APP --serve" 2>/dev/null || true
+        printf '%sstopped%s\n' "$Y" "$N"
+    elif [ "$was_unit" = "1" ]; then
+        printf '%sstopped%s (systemd unit)\n' "$Y" "$N"
+    else
+        warn "not running"
+    fi
+}
+
+cmd_restart() {
+    cmd_stop
+    # the old process must let go of :53/:8080 before the new one binds, or the start
+    # fails with "Address already in use" while both are technically mid-transition
+    local _ wp dp
+    wp="$(web_port)"; dp="$(dns_port)"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        port_busy "$wp" || port_busy "$dp" || break
+        sleep 0.5
+    done
+    cmd_start
+}
+
+cmd_status() {
+    printf '%sNetBlock Fortress %s%s\n' "$B" "$VERSION_TAG" "$N"
+    printf '  home     %s\n' "$HOME_DIR"
+    printf '  python   %s\n' "$PY"
+    printf '  runner   %s\n' "$(using_systemd && echo systemd || echo 'pid file')"
+    if health_ok; then
+        printf '  state    %slive%s  dashboard http://127.0.0.1:%s  dns :%s\n' \
+            "$C" "$N" "$(web_port)" "$(dns_port)"
+    elif unit_active || { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }; then
+        # active unit, port not answering yet - that is a warm-up, not an outage, and
+        # saying "down" here is what made a healthy box look broken
+        local pid="" rss="" hwm=""
+        if unit_active && have systemctl; then
+            pid="$(systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)"
+        elif [ -f "$PIDFILE" ]; then
+            pid="$(cat "$PIDFILE" 2>/dev/null)"
+        fi
+        if [ -n "$pid" ] && [ -r "/proc/$pid/status" ]; then
+            rss="$(awk '/VmRSS/{print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
+            hwm="$(awk '/VmHWM/{print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
+        fi
+        local whence="process alive"
+        unit_active && whence="systemd unit active"
+        printf '  state    %swarming up%s (%s, %s MB of blocklists to load)\n' \
+            "$Y" "$N" "$whence" "$(cache_mb)"
+        [ -n "$pid" ] && printf '  process  pid %s  rss %s  peak %s\n' "$pid" "${rss:-?}" "${hwm:-?}"
+        printf '  check    %sadquit status%s again in a moment, or: journalctl -u %s -f\n' "$B" "$N" "$SERVICE"
+    else
+        printf '  state    %sdown%s\n' "$R" "$N"
+    fi
+    # the login hint belongs to every state, not only the healthy one: people open `status`
+    # because something will not load, and "which password?" is half of that. Only the username and
+    # where to get the rest - `passwd --show` is the one place the secret is ever printed.
+    printf '  login    %s on http://127.0.0.1:%s - the password: sudo adquit passwd --show\n' \
+        "$(dash_user)" "$(web_port)"
+    if [ -f "$STATE_DIR/config.json" ]; then
+        "$PY" - "$STATE_DIR/config.json" <<'PYX' || true
+import json, sys
+c = json.load(open(sys.argv[1]))
+print("  mode     %s" % c.get("block_mode"))
+print("  dns      :%s -> %s   web :%s" % (c.get("dns_port"), c.get("dns_upstream"), c.get("web_port")))
+print("  feeds    %s enabled | sinkhole %s" % (len(c.get("enabled_lists", [])), c.get("sinkhole_mode")))
+for k in ("macro_ads", "micro_ads", "ctv_ads", "push_ads", "invideo_ads", "email_tracking",
+          "adtech_endpoints", "pattern_engine"):
+    print("  %-8s %s" % (k, "armed" if c.get(k) else "off"))
+PYX
+    fi
+    [ -f "$STATE_DIR/snapshot.json" ] && "$PY" - "$STATE_DIR/snapshot.json" <<'PYX' || true
+import json, sys
+s = json.load(open(sys.argv[1]))
+print("  traffic  %s queries, %s blocked (%s%%), %s clients"
+      % (s.get("total"), s.get("blocked"),
+         round(s.get("blocked", 0) * 100.0 / max(1, s.get("total", 1)), 1), s.get("clients")))
+print("  rules    %s exact + %s wildcard zones" % (s.get("rules"), s.get("wildcards")))
+PYX
+}
+
+cmd_logs() {
+    if using_systemd; then exec $SUDO journalctl -u "$SERVICE" -n "${1:-120}" --no-pager -f
+    elif [ -f "$HOME_DIR/adquit.out" ]; then exec tail -n "${1:-120}" -f "$HOME_DIR/adquit.out"
+    else die "no log file yet (service is not running through adquit)"; fi
+}
+
+cmd_watch() {
+    exec "$PY" "$APP" --watch
+}
+
+cmd_stats() { "$PY" "$APP" --stats; }
+
+# ---------------------------------------------------------------------------
+#  Engine control
+# ---------------------------------------------------------------------------
+run_as_engine() { # run app.py subcommand with the right interpreter/home
+    [ -f "$APP" ] || { say "installing first"; cmd_install --already-elevated; }
+    "$PY" "$APP" "$@"
+}
+
+restore_update() { # put the engine back exactly as it was before 'adquit update'
+    local origin="$1"
+    [ -f "$origin" ] || return 0
+    atomic_install "$origin" "$APP" 0755 2>/dev/null && rm -f "$origin" 2>/dev/null
+    warn "restored the previous app.py - your fortress is untouched and still serving"
+}
+
+cmd_update() {
+    local force="" force_arg="" opt
+    for opt in "$@"; do
+        case "$opt" in
+            -f|--force|--yes) force=1 ;;
+            *) die "unknown option for 'update': $opt  (usage: adquit update [--force])" ;;
+        esac
+    done
+    # ADQUIT_FORCE=1 is the second way in; --force is the first for a reason: sudo
+    # resets the environment, so an exported variable only reaches us if elevation
+    # re-supplies it (see elevate_for). A flag travels in argv and cannot be lost.
+    [ -n "${ADQUIT_FORCE:-}" ] && force=1
+    [ -f "$APP" ] || die "not installed yet - run: adquit install"
+    resolve_channel
+    say "Updating fortress binaries (channel: $REF)"
+
+    # An update must never leave the box unprotected and must never swap in an engine
+    # it cannot explain. So: keep a pristine copy of what we are replacing, fetch,
+    # decide, verify, and restore on any doubt. The copy is per-state-dir and is
+    # never overwritten, because this function may re-run itself (CLI self-heal).
+    local origin="${ADQUIT_ORIGIN_FILE:-$STATE_DIR/update-origin.py}"
+    local was_live=0; running >/dev/null 2>&1 && was_live=1
+    if [ ! -f "$origin" ]; then
+        mkdir -p "$(dirname "$origin")" 2>/dev/null || true
+        cp -f "$APP" "$origin" 2>/dev/null || true
+    fi
+    if [ ! -f "$origin" ]; then origin="$APP.pre-update"; cp -f "$APP" "$origin" 2>/dev/null || true; fi
+    fetch_repo "$HOME_DIR"
+
+    # The judgement below lives in the CLI you already have - which is a trap: a
+    # stale or buggy guard can refuse the very update that would fix it, and no
+    # amount of forcing makes a broken comparison honest. So if the channel carries
+    # a different CLI, install that one and hand the rest of the update to it. Once
+    # only: ADQUIT_REHEALED stops the two copies from bouncing the work back and forth.
+    if [ -z "${ADQUIT_REHEALED:-}" ] && [ -f "$HOME_DIR/bin/adquit" ] \
+       && bash -n "$HOME_DIR/bin/adquit" 2>/dev/null; then
+        local fetched_tag
+        fetched_tag="$(sed -n 's/^VERSION_TAG="\([^"]*\)".*/\1/p' "$HOME_DIR/bin/adquit" | head -n1)"
+        if [ -n "$fetched_tag" ] && [ "$fetched_tag" != "$VERSION_TAG" ]; then
+            say "CLI here is v$VERSION_TAG, the channel has v$fetched_tag - restarting the update with it"
+            install_cli_link
+            export ADQUIT_REHEALED=1 ADQUIT_ORIGIN_FILE="$origin"
+            [ -n "$force" ] && force_arg="--force"
+            # shellcheck disable=SC2086  # --force only, never a glob
+            exec bash "$HOME_DIR/bin/adquit" update $force_arg
+        fi
+    fi
+
+    local old_ver new_ver old_id new_id decision
+    old_ver="$(app_version "$origin" 2>/dev/null || true)"
+    old_id="$(file_id "$origin" 2>/dev/null || true)"
+    new_ver="$(app_version "$APP")"
+    new_id="$(file_id "$APP" 2>/dev/null || true)"
+    decision="$(update_decision "$old_ver" "$new_ver" "$old_id" "$new_id")"
+    case "$decision" in
+        skip)
+            if [ -n "$force" ]; then
+                warn "--force: reinstalling v$new_ver although the engine is unchanged"
+            else
+                rm -f "$origin" 2>/dev/null || true
+                cli_refresh "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+                say "already up to date - engine v$new_ver is byte-identical to what is installed"
+                printf '  (nothing restarted, your blocklists keep running)\n'
+                printf '  fresh blocklists?  %sadquit gravity%s\n' "$B" "$N"
+                return 0
+            fi ;;
+        nostamp)
+            restore_update "$origin"
+            die "the update produced no usable app.py from $REPO/$REF (no version stamp) - that channel is behind, or main has no v19 yet" ;;
+        refuse)
+            if [ -z "$force" ]; then
+                restore_update "$origin"
+                die "channel $REPO/$REF holds v$new_ver but you are running v$old_ver - refusing to downgrade (adquit update --force to allow it)"
+            fi
+            warn "v$old_ver -> v$new_ver is a downgrade - carrying on because --force was given" ;;
+        go)
+            if [ "$old_ver" = "$new_ver" ]; then
+                printf '  same version stamp (v%s) but different code - applying\n' "$new_ver"
+            fi ;;
+    esac
+    if ! "$PY" "$APP" --version >/dev/null 2>&1; then
+        restore_update "$origin"
+        die "the updated app.py is not runnable with $PY - restored v${old_ver:-previous}; check 'adquit doctor'"
+    fi
+    rm -f "$origin" 2>/dev/null || true
+    cli_refresh "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+    ensure_deps
+    run_as_engine --rebuild
+    # start (not restart): also heals a service that had already died
+    if [ "$was_live" = "1" ] || using_systemd; then
+        cmd_stop >/dev/null 2>&1 || true
+        cmd_start
+    fi
+    say "updated to v$new_ver (was v${old_ver:-unknown})"
+    say "updating gravity (this downloads every enabled feed)"
+    bg_run "$STATE_DIR/gravity.log" "$PY" "$APP" --update-lists
+    printf '  feed pull started in the background (log: %s)\n' "$HOME_DIR/data/gravity.log"
+}
+
+cmd_gravity() { run_as_engine --update-lists "$@"; }
+
+cmd_export() {
+    elevate_for export
+    run_as_engine --export "$@"
+}
+
+cmd_intel() {
+    [ $# -ge 1 ] || die "usage: adquit intel <domain> [domain ...]"
+    run_as_engine --intel "$@"
+}
+
+
+# ---------------------------------------------------------------------------
+#  Self-hosting on this box: LAN names the fortress answers + a reverse proxy
+#
+#  One port, many sites.  `adquit site add media.lan --port 8096` publishes the DNS
+#  name (answered by the fortress itself, so every device using it finds the site),
+#  and `adquit proxy install` writes the vhosts for nginx, Caddy or Apache.  Ad
+#  domains you block still reach the fortress splash page: the catch-all vhost
+#  forwards unknown hosts to the creative sinkhole.
+# ---------------------------------------------------------------------------
+proxy_meta() { # everything the renderers need, read from data/config.json at once
+    "$PY" - "$STATE_DIR/config.json" <<'METAPY'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    c = {}
+print("web=%s" % c.get("web_port", 8080))
+print("sink_mode=%s" % c.get("sinkhole_mode", "zeroip"))
+print("sink_port=%s" % c.get("sinkhole_port", 80))
+print("portal=%s" % ("1" if c.get("portal_enabled", True) else "0"))
+print("portal_port=%s" % c.get("portal_port", 8082))
+recs = c.get("local_records")
+recs = recs if isinstance(recs, dict) else {}
+for name in sorted(recs):
+    e = recs[name]
+    if isinstance(e, str):
+        e = {"ip": e}
+    if not isinstance(e, dict):
+        e = {}
+    print("site=%s|%s|%s|%s|%s" % (name, e.get("port", ""), e.get("host", "127.0.0.1"),
+                                   "1" if e.get("ws") else "0",
+                                   "0" if e.get("proxy") is False else "1"))
+METAPY
+}
+
+PWEB=8080; PSINK_MODE="zeroip"; PSINK_PORT=80; PSINK_EFF=80
+PSITES=()
+PPORT_ON=1; PPORT_PORT=8082
+PCATCH=1          # 0 = do not claim the port's default host (for a box that already serves :80)
+PCFILE="/etc/caddy/Caddyfile"
+proxy_load() {
+    local line
+    PSITES=()
+    while IFS= read -r line; do
+        case "$line" in
+            web=*)       PWEB="${line#web=}" ;;
+            sink_mode=*) PSINK_MODE="${line#sink_mode=}" ;;
+            sink_port=*) PSINK_PORT="${line#sink_port=}" ;;
+            portal=*)    PPORT_ON="${line#portal=}" ;;
+            portal_port=*) PPORT_PORT="${line#portal_port=}" ;;
+            site=*)      PSITES+=("${line#site=}") ;;
+        esac
+    done < <(proxy_meta)
+}
+
+PPORT_SEEN=""
+portal_is_on() { # one config read per invocation, memoised (the renderers ask several times)
+    [ -n "$PPORT_SEEN" ] || { local cfg; cfg="$(portal_cfg)"; PPORT_SEEN="${cfg%% *}"; }
+    [ "$PPORT_SEEN" = "1" ]
+}
+
+lan_addrs_list() { # this box's own addresses, deduped, primary first - a router box stops at four
+    local a out="" n=0 x
+    a="$(lan_ip)"
+    [ -n "$a" ] && out="$a"
+    for x in $(lan_addrs); do
+        case " $out " in *" $x "*) continue ;; esac
+        [ "$n" -ge 3 ] && break
+        out="$out $x"; n=$((n + 1))
+    done
+    printf '%s' "${out# }"
+}
+
+portal_names() { # home.lan / portal.lan / start.lan - keep in step with portal_names() in app.py
+    printf 'home.lan portal.lan start.lan home.local portal.local start.local'
+}
+
+portal_block_on() { [ "$PPORT_ON" = 1 ] && [ "${PPORT_PORT:-0}" -gt 0 ] 2>/dev/null; }
+
+dash_names() { # what the dashboard answers on - keep in step with fortress_names()
+    local h a
+    h="$(hostname 2>/dev/null | tr 'A-Z' 'a-z')"
+    printf 'adquit.lan adquit.local netblock.local'
+    case "$h" in
+        "") ;;
+        *.local|*.lan) printf ' %s' "$h" ;;                    # already one of ours
+        *.*) printf ' %s %s.local' "$h" "${h%%.*}" ;;         # FQDN + its short form
+        *)   printf ' %s.local %s.lan' "$h" "$h" ;;
+    esac
+    # The number is what gets typed on a LAN, so somebody has to answer it: while the start page
+    # exists it does ("what is on this box?"), and without it the dashboard takes it back.
+    if ! portal_is_on; then
+        for a in $(lan_addrs_list); do printf ' %s' "$a"; done
+    fi
+}
+
+portal_serve_names() { # what the start page answers on: its own names, plus the bare address
+    printf '%s' "$(portal_names)"
+    portal_is_on || return 0
+    local a
+    for a in $(lan_addrs_list); do printf ' %s' "$a"; done
+}
+
+
+caddy_dangling_import() { # their Caddyfile imports a fragment that was never written
+    [ -r "$PCFILE" ] || return 1
+    grep -q "adquit.caddyfile" "$PCFILE" || return 1
+    [ -f "$PFILE" ] && return 1
+    return 0
+}
+
+caddy_has_bare_site() { # $1 = port - does their Caddyfile already own it for *every* host?
+    [ -r "$PCFILE" ] || return 1
+    grep -Eq "^[[:space:]]*:?$1[[:space:]]*\{" "$PCFILE"
+}
+
+caddy_main_broken() { # their Caddyfile does not adapt, so caddy will not start with our fragment
+                  # in it or without it - a missing '}' is the usual cause, and it reports as EOF
+    CADDY_ERR=""
+    [ -r "$PCFILE" ] || return 1
+    have caddy || return 1
+    if ! CADDY_ERR="$(caddy validate --config "$PCFILE" --adapter caddyfile 2>&1)"; then
+        CADDY_ERR="$(printf '%s\n' "$CADDY_ERR" | grep -Ei 'error' | head -n1)"
+        return 0
+    fi
+    return 1
+}
+
+matcher_name() { # caddy named matchers cannot contain dots: media.lan -> media_lan
+    printf '%s' "$1" | tr '.-' '__'
+}
+
+
+nginx_common_headers() { # identical for every vhost: keep the app honest about clients
+    cat <<'HDR'
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+HDR
+}
+
+render_nginx() { # $1 = listen port
+    local port="$1" s name pt host ws prox sites="" catch=""
+    if [ "$PSINK_MODE" = "fortress" ]; then
+        catch="$(printf '    # blocked ad domains resolve here, so the splash page keeps working\n    location / {\n        proxy_pass http://127.0.0.1:%s;\n        proxy_set_header Host $host;\n    }' "${PSINK_EFF:-$PSINK_PORT}")"
+    elif portal_block_on; then
+        # nothing to sinkhole to, and a stray Host is far more useful as the start page
+        catch="$(printf '    # every other name on this port lands on the LAN start page\n    location / {\n        proxy_pass http://127.0.0.1:%s;\n        proxy_set_header Host $host;\n    }' "$PPORT_PORT")"
+    else
+        catch='    # nothing to sinkhole to: answer instantly instead of letting clients hang
+    location / { return 204; }'
+    fi
+
+    for s in "${PSITES[@]}"; do
+        IFS='|' read -r name pt host ws prox <<<"$s"
+        [ -n "$pt" ] || continue
+        [ "$prox" = "1" ] || continue
+        sites="$sites
+server {
+    listen $port;
+    server_name $name;
+    location / {
+        proxy_pass http://$host:$pt;
+$(nginx_common_headers)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection $([ "$ws" = "1" ] && printf '$connection_upgrade' || printf 'close');
+        proxy_read_timeout 3600s;
+        client_max_body_size 512m;
+    }
+}"
+    done
+
+    printf '%s\n' "# adquit-managed - NetBlock Fortress reverse proxy. Regenerated by" \
+                  "# \`adquit proxy install\`; change sites with \`adquit site add|rm\`."
+    cat <<'NGX'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+NGX
+    if [ "$PCATCH" = 1 ]; then
+        # this is the vhost that keeps blocked ad domains on the splash page; without it the
+        # box's existing default server keeps whatever it answers today
+        printf '\nserver {\n    listen %s default_server;\n    server_name _;\n%s\n}\n' "$port" "$catch"
+    fi
+    printf '\nserver {\n    listen %s;\n    server_name %s;\n    location / {\n' \
+        "$port" "$(dash_names)"
+    printf '        proxy_pass http://127.0.0.1:%s;\n' "$PWEB"
+    nginx_common_headers
+    cat <<'NGX'
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+        client_max_body_size 64m;
+    }
+}
+NGX
+    if portal_block_on; then
+        printf '\nserver {\n    listen %s;\n    server_name %s;\n    location / {\n' \
+            "$port" "$(portal_serve_names)"
+        printf '        proxy_pass http://127.0.0.1:%s;\n' "$PPORT_PORT"
+        nginx_common_headers
+        printf '    }\n}\n'
+    fi
+    [ -n "$sites" ] && printf '%s\n' "$sites"
+}
+
+caddy_proxy() { # $1 = upstream - trusted_proxies belongs in a global `servers` block, but that
+                # would make this fragment loadable only as the first import; per proxy it is the
+                # same setting and it travels with the file
+    printf 'reverse_proxy %s {\n\t\t\ttrusted_proxies %s\n\t\t}' "$1" "$CADDY_TRUSTED"
+}
+
+render_caddy() { # $1 = listen port
+    local port="$1" s name pt host ws prox blocks=""
+    for s in "${PSITES[@]}"; do
+        IFS='|' read -r name pt host ws prox <<<"$s"
+        [ -n "$pt" ] || continue
+        [ "$prox" = "1" ] || continue
+        m="$(matcher_name "$name")"
+        blocks="$blocks
+	@$m host $name
+	handle @$m {
+		$(caddy_proxy "$host:$pt")
+	}"
+    done
+    blocks="$blocks
+	@adquit host $(dash_names)
+	handle @adquit {
+		$(caddy_proxy "127.0.0.1:$PWEB")
+	}"
+    printf '%s\n' "# adquit-managed - include this from your Caddyfile:  import adquit.caddyfile"
+    # Deliberately NOT a global options block. `{ auto_https off ... }` is only legal as the
+    # first thing in a Caddyfile, and this file is imported - usually appended - so an imported
+    # global block is the one shape that breaks a working server: "server block without any key
+    # is global configuration, and if used, it must be first". Everything we need is per-proxy
+    # instead (see caddy_proxy), which travels with the file; these two are for their whole
+    # config, so they stay a suggestion in a comment.
+    printf '# optional, for your whole Caddyfile (add at the top of %s):\n' "$PCFILE"
+    printf '#   auto_https off\n#   servers { trusted_proxies static private_ranges }\n'
+    printf '# (per proxy we already set the same thing, for: %s)\n\n' "$CADDY_TRUSTED"
+    if portal_block_on; then
+        blocks="$blocks
+	@adquit_portal host $(portal_serve_names)
+	handle @adquit_portal {
+		$(caddy_proxy "127.0.0.1:$PPORT_PORT")
+	}"
+    fi
+    printf ':%s {\n%s\n' "$port" "$blocks"
+    if [ "$PCATCH" = 1 ]; then
+        if [ "$PSINK_MODE" = "fortress" ]; then
+            printf '\thandle {\n\t\t# blocked ad domains -> the fortress splash page\n\t\t%s\n\t}\n' "$(caddy_proxy "127.0.0.1:${PSINK_EFF:-$PSINK_PORT}")" "${PSINK_EFF:-$PSINK_PORT}"
+        elif portal_block_on; then
+            printf '\thandle {\n\t\t# every other Host on this port: the LAN start page\n\t\t%s\n\t}\n' "$(caddy_proxy "127.0.0.1:$PPORT_PORT")"
+        else
+            printf '\thandle {\n\t\trespond "NetBlock Fortress" 200\n\t}\n'
+        fi
+    else
+        printf '\t# --no-catchall: every other Host is served by your own sites, not the fortress\n'
+    fi
+    printf '}\n'
+}
+
+render_apache() { # $1 = listen port
+    local port="$1" s name pt host ws prox blocks=""
+    for s in "${PSITES[@]}"; do
+        IFS='|' read -r name pt host ws prox <<<"$s"
+        [ -n "$pt" ] || continue
+        [ "$prox" = "1" ] || continue
+        blocks="$blocks
+<VirtualHost *:$port>
+    ServerName $name
+    ProxyPreserveHost On
+    ProxyPass / http://$host:$pt/ retry=0 timeout=300
+    ProxyPassReverse / http://$host:$pt/
+</VirtualHost>"
+    done
+    printf '%s\n' "# adquit-managed - NetBlock Fortress reverse proxy for Apache." \
+                  "# Needs the modules:  sudo a2enmod proxy proxy_http headers remoteip"
+    cat <<'APX'
+<IfModule remoteip_module>
+    RemoteIPHeader X-Forwarded-For
+    RemoteIPTrustedProxy 127.0.0.1
+</IfModule>
+APX
+    if [ "$PSINK_MODE" = "fortress" ] && [ "$PCATCH" = 1 ]; then
+        # Apache's first vhost on a port is the default one: point it at the creative
+        # sinkhole so a blocked ad domain still shows the splash page
+        printf '\n<VirtualHost *:%s>\n    ProxyPreserveHost On\n    ProxyPass / http://127.0.0.1:%s/ retry=0 timeout=5\n</VirtualHost>\n' \
+            "$port" "${PSINK_EFF:-$PSINK_PORT}"
+    fi
+    printf '\n<VirtualHost *:%s>\n    ServerName %s\n    ServerAlias %s\n' \
+        "$port" "$(dash_names | awk '{print $1}')" "$(dash_names)"
+    printf '    ProxyPreserveHost On\n    ProxyPass / http://127.0.0.1:%s/ retry=0 timeout=300\n' "$PWEB"
+    printf '    ProxyPassReverse / http://127.0.0.1:%s/\n</VirtualHost>' "$PWEB"
+    if portal_block_on; then
+        printf '\n\n<VirtualHost *:%s>\n    ServerName home.lan\n    ServerAlias %s\n' \
+            "$port" "$(portal_serve_names)"
+        printf '    ProxyPreserveHost On\n    ProxyPass / http://127.0.0.1:%s/ retry=0 timeout=300\n' "$PPORT_PORT"
+        printf '    ProxyPassReverse / http://127.0.0.1:%s/\n</VirtualHost>' "$PPORT_PORT"
+    fi
+    printf '%s\n' "$blocks"
+}
+
+caddy_config_to_validate() { # what caddy actually loads: importing is textual, so once their
+                             # file includes ours the pair is one config and must be checked as one
+    if [ -r "$PCFILE" ] && grep -q "adquit.caddyfile" "$PCFILE"; then
+        printf '%s' "$PCFILE"
+    else
+        printf '%s' "$PFILE"
+    fi
+}
+
+proxy_validate() { # the syntax check for each proxy - run directly, never via eval
+    case "$1" in
+        nginx)  nginx -t ;;
+        caddy)  caddy validate --config "$(caddy_config_to_validate)" --adapter caddyfile ;;
+        apache) if have apache2ctl; then apache2ctl configtest; else apachectl configtest; fi ;;
+    esac
+}
+
+proxy_ready() { # is the server we were told to write for actually installed?
+    case "$1" in
+        nginx)  have nginx ;;
+        caddy)  have caddy ;;
+        apache) have apache2ctl || have apachectl ;;
+        *)      return 1 ;;
+    esac
+}
+
+proxy_paths() { # $1 = kind -> PFILE, PLINK, PSERVICE, PHINT
+    PFILE=""; PLINK=""; PSERVICE=""; PHINT=""
+    case "$1" in
+        nginx)
+            if [ -d /etc/nginx/sites-available ]; then
+                PFILE="/etc/nginx/sites-available/adquit.conf"
+                PLINK="/etc/nginx/sites-enabled/adquit.conf"
+            else
+                PFILE="/etc/nginx/conf.d/adquit.conf"
+            fi
+            PSERVICE="nginx"; PHINT="sudo apt-get install -y nginx" ;;
+        caddy)
+            PFILE="/etc/caddy/adquit.caddyfile"
+            PCFILE="${ADQUIT_CADDYFILE:-/etc/caddy/Caddyfile}"
+            PSERVICE="caddy"; PHINT="https://caddyserver.com/docs/install" ;;
+        apache|apache2|httpd)
+            if [ -d /etc/apache2 ]; then
+                PFILE="/etc/apache2/sites-available/adquit.conf"
+                PSERVICE="apache2"
+            else
+                PFILE="/etc/httpd/conf.d/adquit.conf"
+                PSERVICE="httpd"
+            fi
+            PHINT="sudo apt-get install -y apache2 && sudo a2enmod proxy proxy_http headers" ;;
+        *) die "unknown proxy server '$1' (auto | nginx | caddy | apache)" ;;
+    esac
+}
+
+proxy_detect() {
+    have nginx && { printf 'nginx'; return 0; }
+    have caddy && { printf 'caddy'; return 0; }
+    have apache2ctl || have apachectl && { printf 'apache'; return 0; }
+    printf ''
+}
+
+cmd_proxy() {
+    local verb="${1:-status}" want="auto" port=80 dry=0 force=0
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --server) want="${2:-auto}"; shift 2 ;;
+            --port)   port="${2:-80}"; shift 2 ;;
+            --dry-run) dry=1; shift ;;
+            --force)  force=1; shift ;;
+            --no-catchall|--no-default) PCATCH=0; shift ;;
+            *) die "unknown option for 'proxy $verb': $1  (usage: adquit proxy install [--server auto|nginx|caddy|apache] [--port 80] [--dry-run] [--no-catchall])" ;;
+        esac
+    done
+    [ -f "$APP" ] || die "not installed yet - run: adquit install"
+    case "$port" in
+        ''|*[!0-9]*) die "--port must be a number (got '$port')" ;;
+    esac
+    proxy_load
+    PWEB="$(web_port)"          # env/config precedence belongs to the CLI, not to config.json
+    PSINK_EFF="$PSINK_PORT"
+    if [ "$PSINK_MODE" = "fortress" ] && [ "$PSINK_PORT" = "$port" ]; then
+        PSINK_EFF=8081          # the proxy takes :80, so the splash page moves behind it
+    fi
+    [ "$want" = "auto" ] && want="$(proxy_detect)"
+    [ -n "$want" ] || want="nginx"
+    proxy_paths "$want"
+    if [ "$want" = caddy ]; then
+        if caddy_dangling_import; then
+            warn "$PCFILE imports adquit.caddyfile, but that file does not exist - caddy will not start"
+            warn "  write it:  sudo adquit proxy install --server caddy --port $port"
+            warn "  or drop the line:  sudo sed -i '/adquit.caddyfile/d' $PCFILE && sudo systemctl restart caddy"
+        fi
+        if caddy_main_broken; then
+            warn "$PCFILE does not load - caddy will not start, our fragment included"
+            [ -n "$CADDY_ERR" ] && warn "  caddy says: ${CADDY_ERR#*Error: }"
+            warn "  an 'EOF' there is a '{' without its '}'; ours lives in $PFILE, not in your file"
+            warn "  see it:   sudo caddy validate --config $PCFILE --adapter caddyfile"
+        fi
+        if caddy_has_bare_site "$port"; then
+            warn "$PCFILE already has a bare '$port {' site - that block answers every host on :$port"
+            warn "  give it a hostname (or drop the demo site) so the names below can win, then re-run"
+        fi
+    fi
+
+    if [ "$dry" = 1 ]; then
+        say "$want config for :$port (nothing written)"
+        case "$want" in
+            nginx) render_nginx "$port" ;;
+            caddy) render_caddy "$port" ;;
+            *)     render_apache "$port" ;;
+        esac
+        return 0
+    fi
+
+    case "$verb" in
+      status)
+        printf '%sadquit proxy%s  detected %s, listening on :%s\n' "$B" "$N" "$want" "$port"
+        if [ ! -f "$PFILE" ]; then
+            printf '  config     %snone%s - write one with: sudo adquit proxy install\n' "$Y" "$N"
+        elif grep -q "adquit-managed" "$PFILE"; then
+            printf '  config     %s (written by adquit)\n' "$PFILE"
+        else
+            printf '  config     %s %s(not ours - install would refuse to overwrite it)%s\n' "$PFILE" "$Y" "$N"
+        fi
+        [ -n "$PLINK" ] && printf '  enabled    %s\n' "$PLINK"
+        printf '  dashboard  %s -> 127.0.0.1:%s\n' "$(dash_names | tr ' ' ', ')" "$PWEB"
+        if portal_block_on; then
+            printf '  start page %s -> 127.0.0.1:%s  (%s on every device)\n' \
+                "$(portal_serve_names | tr ' ' ', ')" "$PPORT_PORT" "http://home.lan/"
+        else
+            printf '  start page %soff%s - sudo adquit portal on\n' "$Y" "$N"
+        fi
+        local s n p h w x
+        for s in "${PSITES[@]}"; do
+            IFS='|' read -r n p h w x <<<"$s"
+            if [ -n "$p" ] && [ "$x" = "1" ]; then
+                printf '  site       http://%s:%s -> %s:%s%s\n' "$n" "$port" "$h" "$p" "$([ "$w" = 1 ] && printf '  (websockets)')"
+            elif [ -n "$p" ]; then
+                printf '  site       %s: dns only (proxy off), app on %s:%s\n' "$n" "$h" "$p"
+            else
+                printf '  site       %s: dns only\n' "$n"
+            fi
+        done
+        [ "${#PSITES[@]}" -gt 0 ] || printf '  sites      %snone yet%s - add one: sudo adquit site add media.lan --port 8096\n' "$Y" "$N"
+        return 0 ;;
+      remove|disable)
+        [ -f "$PFILE" ] || { warn "no adquit proxy config at $PFILE"; return 0; }
+        grep -q "adquit-managed" "$PFILE" || die "$PFILE was not written by adquit - leaving it alone"
+        rm -f "$PFILE" 2>/dev/null || true
+        [ -n "$PLINK" ] && rm -f "$PLINK" 2>/dev/null
+        $SUDO systemctl is-active --quiet "$PSERVICE" 2>/dev/null && $SUDO systemctl reload "$PSERVICE" >/dev/null 2>&1
+        say "removed $PFILE - your apps still answer on their own ports"
+        return 0 ;;
+      install) ;;
+      *) die "usage: adquit proxy install|status|remove [--server auto|nginx|caddy|apache] [--port 80] [--dry-run]" ;;
+    esac
+
+    if ! proxy_ready "$want"; then
+        die "$want is not installed - $PHINT, then re-run: sudo adquit proxy install"
+    fi
+
+    # the sinkhole owns :80 in `fortress` mode; the proxy cannot bind a taken port and
+    # the splash page must survive, so move the sinkhole behind the proxy
+    if [ "$PSINK_MODE" = "fortress" ] && [ "$PSINK_PORT" = "$port" ]; then
+        say "the ad-creative sinkhole owns :$port - moving it to :8081 behind the proxy"
+        run_as_engine --set sinkhole_port 8081 >/dev/null 2>&1 || die "could not move the sinkhole"
+        PSINK_PORT=8081; PSINK_EFF=8081
+    fi
+    if port_busy "$port"; then
+        # the whole point is that the proxy owns this port, so "taken" only matters when the
+        # holder is not the server we are generating for (a caddy box already listening on :80
+        # must not be told to stop caddy in order to let caddy serve more sites)
+        local holder; holder="$(port_owner "$port")"
+        case "$holder" in
+            "") ;;                                        # no ss, or someone else's socket
+            *"$want"*) say "$want already listens on :$port - adding these vhosts to it" ;;
+            *nginx*|*caddy*|*apache*|*httpd*)
+                die ":$port is held by $holder, not $want - generate for it instead: sudo adquit proxy install --server $holder --port $port (or pick another port: --port 8088)" ;;
+            *) die ":$port is already taken by '$holder' - stop it, or use another port (--port 8088); :$PWEB is the dashboard itself" ;;
+        esac
+    fi
+
+    local tmp rendered backup=""
+    tmp="$(mktemp "${TMPDIR:-/tmp}/adquit-proxy.XXXXXX")" || die "no temp space"
+    case "$want" in
+        nginx) rendered="$(render_nginx "$port")" ;;
+        caddy) rendered="$(render_caddy "$port")" ;;
+        *)     rendered="$(render_apache "$port")" ;;
+    esac
+    printf '%s\n' "$rendered" > "$tmp" || { rm -f "$tmp"; die "could not render the config"; }
+
+    if [ -f "$PFILE" ]; then
+        if ! grep -q "adquit-managed" "$PFILE" && [ "$force" != 1 ]; then
+            rm -f "$tmp"
+            die "$PFILE exists and was not written by adquit - refusing to overwrite it (--force to replace it anyway)"
+        fi
+        cp -f "$PFILE" "$PFILE.adquit-backup" 2>/dev/null && backup="$PFILE.adquit-backup"
+    fi
+
+    say "installing the $want config for :$port"
+    mkdir -p "$(dirname "$PFILE")" 2>/dev/null || true
+    if ! atomic_install "$tmp" "$PFILE" 0644; then
+        rm -f "$tmp"; die "cannot write $PFILE - run: sudo adquit proxy install"
+    fi
+    rm -f "$tmp"
+    if [ "$want" = caddy ] && [ -f /etc/caddy/Caddyfile ] \
+       && ! grep -q "adquit.caddyfile" /etc/caddy/Caddyfile; then
+        warn "load it from your Caddyfile (any line at the top level):  import adquit.caddyfile"
+    fi
+
+    if ! proxy_validate "$want" >/tmp/adquit-proxy-test.log 2>&1; then
+        if [ -n "$backup" ]; then
+            atomic_install "$backup" "$PFILE" 0644
+        else
+            rm -f "$PFILE" 2>/dev/null || true
+            [ -n "$PLINK" ] && rm -f "$PLINK" 2>/dev/null
+        fi
+        printf '%s✘ %s refused the config - reverted%s\n' "$R" "$want" "$N"
+        tail -n 8 /tmp/adquit-proxy-test.log | sed 's/^/    /'
+        die "nothing was reloaded; your existing sites are untouched"
+    fi
+    if [ -n "$PLINK" ]; then ln -sfn "$PFILE" "$PLINK" 2>/dev/null || true; fi
+    if ! $SUDO systemctl reload "$PSERVICE" >/dev/null 2>&1; then
+        warn "could not reload $PSERVICE automatically - run: sudo systemctl reload $PSERVICE"
+    fi
+
+    say "proxy live: these names answer on :$port from this box"
+    [ "$PCATCH" = 1 ] || printf '  %scatch-all off%s  every other Host on :%s stays with your own sites\n' "$D" "$N" "$port"
+    printf '  http://%s:%s   (dashboard; :%s direct still works too)\n' "$(lan_ip | head -n1)" "$port" "$PWEB"
+    local s3 n3 p3 h3 w3 x3 tag
+    for s3 in "${PSITES[@]}"; do
+        IFS='|' read -r n3 p3 h3 w3 x3 <<<"$s3"
+        [ -n "$p3" ] || continue
+        [ "$x3" = "1" ] || continue          # --no-proxy names are DNS-only, no vhost
+        tag=""
+        [ "$w3" = "1" ] && tag="  (websocket upgrade)"
+        printf '  http://%s:%s   -> %s:%s%s\n' "$n3" "$port" "$h3" "$p3" "$tag"
+    done
+    printf '  %sopen it on the firewall:%s sudo adquit lan open %s\n' "$D" "$N" "$port"
+}
+
+cmd_site() {
+    local verb="${1:-list}"; shift || true
+    [ -f "$APP" ] || die "not installed yet - run: adquit install"
+    case "$verb" in
+      add)
+        local name="" port="" host="127.0.0.1" ip="" ws=0 prox=1 note="" ttl=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --port|-p)       port="${2:-}"; shift 2 ;;
+                --host)          host="${2:-}"; shift 2 ;;
+                --ip)            ip="${2:-}"; shift 2 ;;
+                --ws|--websockets) ws=1; shift ;;
+                --no-proxy)      prox=0; shift ;;
+                --ttl)           ttl="${2:-}"; shift 2 ;;
+                --note)          note="${2:-}"; shift 2 ;;
+                -*)              die "unknown option for 'site add': $1" ;;
+                *)               [ -z "$name" ] && name="$1" || die "one name at a time (have '$name', got '$1')"
+                                 shift ;;
+            esac
+        done
+        [ -n "$name" ] || die "usage: adquit site add <name.lan> [--port 8096] [--host 127.0.0.1] [--ip 192.168.1.40] [--ws] [--no-proxy]"
+        case "$name" in
+            *[!a-zA-Z0-9.-]*|.*|*.|*-*-) die "site name must be a plain hostname (got '$name')" ;;
+        esac
+        case "$port" in
+            ''|*[!0-9]*) [ -z "$port" ] || die "--port must be a number (got '$port')" ;;
+        esac
+        if [ "$prox" = 1 ] && [ -z "$port" ]; then
+            die "$name needs --port <n> - the port your app listens on (or --no-proxy to publish the name only)"
+        fi
+        [ -n "$ip" ] && warn_off_subnet "$ip" "the address $name points at" \
+            "adquit site add $name --ip <the LAN address that box really has>"
+        local cur merged
+        cur="$(run_as_engine --get local_records | sed 's/^[^=]*= //')"
+        merged="$("$PY" - "$cur" "$name" "$port" "$host" "$ip" "$ws" "$prox" "$ttl" "$note" <<'SITEPY'
+import json, sys
+cur, name, port, host, ip, ws, prox, ttl, note = sys.argv[1:10]
+try:
+    recs = json.loads(cur or "{}")
+except ValueError:
+    recs = {}
+if not isinstance(recs, dict):
+    recs = {}
+e = {}
+if port:
+    e["port"] = int(port)
+    if host and host != "127.0.0.1":
+        e["host"] = host
+if ip:
+    e["ip"] = ip
+if ws == "1":
+    e["ws"] = True
+if prox == "0":
+    e["proxy"] = False
+if ttl:
+    e["ttl"] = int(ttl)
+if note:
+    e["note"] = note
+recs[name] = e
+print(json.dumps(recs, sort_keys=True))
+SITEPY
+)" || die "could not build the record"
+        run_as_engine --set local_records "$merged" >/dev/null || die "the engine refused the change (see above)"
+        say "published $name"
+        printf '  dns       %s -> %s  (every device using this box for DNS finds it)\n' \
+            "$name" "${ip:-this box}"
+        if [ -n "$port" ]; then
+            printf '  proxy     http://%s -> %s:%s   after: %ssudo adquit proxy install%s\n' \
+                "$name" "${host:-127.0.0.1}" "$port" "$B" "$N"
+        fi
+        printf '  tile      it is on the start page now: %s\n' "$(portal_url || printf 'run: sudo adquit portal url')"
+        printf '  note      names you publish are answered before the block engine runs, so a site\n'
+        printf '          you host on the LAN can never be swallowed by a 5M-rule list\n'
+        ;;
+      rm|remove|del)
+        local name="${1:-}"
+        [ -n "$name" ] || die "usage: adquit site rm <name.lan>"
+        local cur merged
+        cur="$(run_as_engine --get local_records | sed 's/^[^=]*= //')"
+        merged="$("$PY" - "$cur" "$name" <<'RMPY'
+import json, sys
+try:
+    recs = json.loads(sys.argv[1] or "{}")
+except ValueError:
+    recs = {}
+if not isinstance(recs, dict):
+    recs = {}
+recs.pop(sys.argv[2], None)
+print(json.dumps(recs, sort_keys=True))
+RMPY
+)" || die "could not build the record"
+        run_as_engine --set local_records "$merged" >/dev/null || die "the engine refused the change"
+        say "site $name removed - its vhost disappears on the next 'adquit proxy install'"
+        ;;
+      list|"")
+        proxy_load
+        printf '%sLAN sites this fortress publishes%s\n' "$B" "$N"
+        local s n p h w x
+        for s in "${PSITES[@]}"; do
+            IFS='|' read -r n p h w x <<<"$s"
+            printf '  %-28s' "$n"
+            if [ -n "$p" ] && [ "$x" = 1 ]; then
+                printf 'proxy -> http://%s:%s%s\n' "$h" "$p" "$([ "$w" = 1 ] && printf ' (websockets)')"
+            else
+                printf 'dns only%s\n' "$([ "$x" = 0 ] && printf ', proxy off')"
+            fi
+        done
+        [ "${#PSITES[@]}" -gt 0 ] || printf '  %s(none yet)%s  add one:  sudo adquit site add media.lan --port 8096\n' "$Y" "$N"
+        printf '\n  proxy state   sudo adquit proxy status\n'
+        printf '  LAN zones     names under a zone go to your router: sudo adquit lan-zone add .lan %s\n' "${ADQUIT_LAN_DNS:-<router-ip>}"
+        ;;
+      *) die "usage: adquit site add|rm|list ..." ;;
+    esac
+}
+
+cmd_portal() {
+    local verb="${1:-status}"; shift || true
+    local cfg on pp ip n url
+    cfg="$(portal_cfg)"; on="${cfg%% *}"; pp="${cfg##* }"
+    ip="$(lan_ip | head -n1)"; n="$(portal_count)"
+    url="http://${ip:-127.0.0.1}:$pp/"
+    case "$verb" in
+      on|off)
+        [ -f "$APP" ] || die "not installed yet - run: adquit install"
+        local want=true; [ "$verb" = "off" ] && want=false
+        run_as_engine --set portal_enabled "$want" >/dev/null || die "the engine refused the change"
+        say "start page $verb"
+        if [ "$verb" = "on" ]; then
+            printf '  %s%s%s  (%s tile%s - one per published site)\n' "$B" "$url" "$N" "$n" "$([ "$n" = 1 ] || printf s)"
+            printf '  other devices need it open:  sudo adquit portal open\n'
+        else
+            printf '  the listener is released on the next restart\n'
+        fi
+        return 0 ;;
+      title)
+        [ -n "${1:-}" ] || die "usage: adquit portal title \"Home on the NAS\""
+        [ -f "$APP" ] || die "not installed yet - run: adquit install"
+        run_as_engine --set portal_title "$1" >/dev/null || die "the engine refused the change"
+        say "start page titled: $1"
+        return 0 ;;
+      add)
+        cmd_site add "$@"
+        return 0 ;;
+      url)
+        [ "$on" = "1" ] || die "the start page is off - sudo adquit portal on"
+        printf '%s\n' "$url"
+        return 0 ;;
+      open)
+        cmd_lan open "$pp"
+        return 0 ;;
+      status|"")
+        printf '%sLAN start page%s\n' "$B" "$N"
+        if [ "$on" = "1" ]; then
+            printf '  url        %s  (any device on this network)\n' "$url"
+            printf '  names      home.lan, portal.lan, start.lan  (the fortress answers these)\n'
+            printf '  tiles      %s published site%s\n' "$n" "$([ "$n" = 1 ] || printf s)"
+            printf '  add one    sudo adquit site add media.lan --port 8096\n'
+            printf '  one port   sudo adquit proxy install --port %s   then http://home.lan/\n' "80"
+        else
+            printf '  %soff%s - sudo adquit portal on\n' "$Y" "$N"
+        fi
+        return 0 ;;
+      *) die "usage: adquit portal [status|on|off|title <text>|add <name> --port <n>|url|open]" ;;
+    esac
+}
+
+cmd_lan_zone() {
+    local verb="${1:-list}" suffix="${2:-}" server="${3:-}"
+    [ -f "$APP" ] || die "not installed yet - run: adquit install"
+    local cur merged
+    case "$verb" in
+      add)
+        [ -n "$suffix" ] || die "usage: adquit lan-zone add .lan 192.168.1.1"
+        case "$suffix" in .*) ;; *) suffix=".$suffix" ;; esac
+        case "$suffix" in
+            *[!a-zA-Z0-9.-]*) die "zone must be a plain DNS suffix (got '$suffix')" ;;
+        esac
+        [ -n "$server" ] || server="$(gateway_ip)"
+        case "${server%%:*}" in
+            *.*.*.*|*:*:*) ;;                                          # ipv4 (maybe :port) or ipv6
+            *) die "a LAN zone needs an address, not a name ('$server'): this box answers DNS, so resolving its own upstream would ask DNS how to reach DNS" ;;
+        esac
+        [ -n "$server" ] || die "no router given and none found on the default route - pass it explicitly: adquit lan-zone add .lan <gateway-ip>"
+        warn_off_subnet "${server%%:*}" "the $suffix resolver" \
+            "sudo adquit lan-zone add $suffix $(gateway_ip)"
+        ;;
+      rm|remove)
+        [ -n "$suffix" ] || die "usage: adquit lan-zone rm .lan"
+        case "$suffix" in .*) ;; *) suffix=".$suffix" ;; esac
+        server=""
+        ;;
+      list|"")
+        local gw; gw="$(gateway_ip)"
+        [ -n "$gw" ] && printf '  gateway on this box: %s  (lan-zone add .lan with no address uses it)\n' "$gw"
+        "$PY" - "$STATE_DIR/config.json" <<'LISTPY' || true
+import json, sys
+try:
+    zones = (json.load(open(sys.argv[1])).get("lan_zones") or {})
+except Exception:
+    zones = {}
+if not zones:
+    print("  (no LAN zones - names under .lan/.local are answered NXDOMAIN by design)")
+for k in sorted(zones):
+    print("  %-14s -> %s" % (k, zones[k]))
+LISTPY
+        return 0 ;;
+      *) die "usage: adquit lan-zone add|rm|list [.lan] [router-ip]" ;;
+    esac
+    cur="$(run_as_engine --get lan_zones | sed 's/^[^=]*= //')"
+    merged="$("$PY" - "$cur" "$verb" "$suffix" "$server" <<'ZONEPY'
+import json, sys
+cur, verb, suffix, server = sys.argv[1:5]
+try:
+    zones = json.loads(cur or "{}")
+except ValueError:
+    zones = {}
+if not isinstance(zones, dict):
+    zones = {}
+if verb == "rm":
+    zones.pop(suffix, None)
+    zones.pop(suffix.lstrip("."), None)
+else:
+    zones[suffix.lstrip(".")] = server
+print(json.dumps(zones, sort_keys=True))
+ZONEPY
+)" || die "could not build the zone map"
+    run_as_engine --set lan_zones "$merged" >/dev/null || die "the engine refused the change"
+    if [ "$verb" = "add" ]; then
+        say "LAN zone $suffix now resolves through $server"
+        printf '  printer, nas and any other name your router knows answers on every device;\n'
+        printf '  nothing about those names is ever sent to a public resolver\n'
+    else
+        say "LAN zone $suffix removed"
+    fi
+}
+
+cmd_lan() {
+    local p; p="$(web_port)"
+    local ports="$p" one extra
+    if [ "${1:-}" = "open" ]; then
+        # `adquit lan open` opens the dashboard port; extra arguments open more, which is what a
+        # site published behind `proxy install --port 80` needs. Numbers only, so a typo can never
+        # reach the firewall as `--delete` or as a service name - and validate before printing,
+        # so a bad argument fails in one line instead of after a wall of diagnostics.
+        for extra in "${@:2}"; do
+            case "$extra" in
+                ''|*[!0-9]*) die "not a port number: $extra (usage: adquit lan open [port ...])" ;;
+            esac
+            if [ "$extra" -lt 1 ] || [ "$extra" -gt 65535 ]; then
+                die "port out of range: $extra"
+            fi
+            [ "$extra" = "$p" ] || ports="$ports $extra"
+        done
+        if [ "$#" -le 1 ]; then
+            # nothing extra asked for: the start page is the other half of "reachable"
+            local pcap; pcap="$(portal_cfg)"
+            [ "${pcap%% *}" = "1" ] && [ "${pcap##* }" != "$p" ] && ports="$ports ${pcap##* }"
+        fi
+    fi
+    printf '%sReachability of the fortress dashboard%s\n' "$B" "$N"
+    printf '  listening   : '
+    if have ss; then
+        ss -tulpn 2>/dev/null | grep -q ":$p " && printf 'tcp/%s on 0.0.0.0 (all interfaces)\n' "$p" \
+            || printf '%snothing on tcp/%s - the service is not up%s\n' "$R" "$p" "$N"
+    else
+        printf 'unknown (no ss)\n'
+    fi
+    printf '  URLs:\n'; lan_urls | sed 's/^/    /'
+    printf '  firewall    : '
+    if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw status 2>/dev/null | grep -q "$p"; then printf '%sopen%s\n' "$C" "$N"
+        else printf '%sblocked by ufw%s\n' "$R" "$N"; fi
+    elif have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+        if firewall-cmd --query-port="$p/tcp" >/dev/null 2>&1; then printf '%sopen%s\n' "$C" "$N"
+        else printf '%sblocked by firewalld%s\n' "$R" "$N"; fi
+    else
+        printf 'no active firewall\n'
+    fi
+    if [ "${1:-}" = "open" ]; then
+        if ! have ufw && ! have firewall-cmd; then
+            # nothing to do is not a failure: the box simply does not filter LAN traffic
+            warn "no ufw/firewalld found - nothing to open (a cloud box needs its security group)"
+            return 0
+        fi
+        for one in $ports; do
+            if have ufw; then
+                $SUDO ufw allow "$one/tcp" comment 'adquit LAN service' \
+                    && say "firewall: tcp/$one open to this network"
+            elif have firewall-cmd; then
+                $SUDO firewall-cmd --permanent --add-port="$one/tcp" >/dev/null \
+                    && $SUDO firewall-cmd --reload >/dev/null \
+                    && say "firewall: tcp/$one open to this network"
+            fi
+        done
+        return 0
+    fi
+    printf '%s  if a device on your Wi-Fi cannot reach it:%s\n' "$D" "$N"
+    printf '    1) sudo adquit lan open [port]   (opens the host firewall; add 80/443 for a proxy)\n'
+    printf '    2) cloud host? also allow tcp/%s in the provider security group\n' "$p"
+    printf '    3) on a different network, skip exposure entirely with a tunnel:\n'
+    printf '         ssh -N -L 8080:127.0.0.1:%s user@this-box   ->  http://localhost:8080\n' "$p"
+    printf '    4) never port-forward this dashboard to the internet; it is LAN-only by design\n'
+    return 0
+}
+cmd_test()   { run_as_engine --test "$@"; }
+cmd_doctor() { run_as_engine --doctor "$@"; }
+cmd_verify() { run_as_engine --verify-lists "$@"; }
+cmd_rules()  { run_as_engine --rules "$@"; }
+cmd_top()    { run_as_engine --top "$@"; }
+cmd_mode()   { run_as_engine --mode "$@"; if running; then cmd_restart; fi; }
+cmd_block()  { run_as_engine --block "$@"; }
+cmd_allow()  { run_as_engine --allow "$@"; }
+cmd_unblock(){ run_as_engine --unblock "$@"; }
+_sha256() { # the same three-way fallback file_id uses, for a string instead of a file
+    if have sha256sum; then printf '%s' "$1" | sha256sum | cut -d' ' -f1
+    elif have shasum; then printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+    else printf ''; fi
+}
+
+passwd_show() { # the login for this box's dashboard, for the person who owns the box, asked for by
+                # name. `adquit status` and the start banner deliberately print only the username and
+                # this command: a password in ordinary output ends up in screenshots, journald and
+                # help-desk pastes, and a LAN box gets shared around like that. Values come from the
+                # engine rather than from config.json, because a box that has never saved has
+                # defaults in memory and nothing on disk to grep.
+    local user hash want
+    _ask_cfg() { run_as_engine --get "$1" 2>/dev/null | sed -n 's/^[^=]*= *//p' | head -n1 | tr -d '"'; }
+
+    user="$(_ask_cfg admin_username)"
+    [ -n "$user" ] || user="admin"
+    hash="$(_ask_cfg password_hash)"
+    say "dashboard login for this fortress"
+    printf '  username   %s\n' "$user"
+    printf '  open       http://127.0.0.1:%s  (from any device on this network: http://%s:%s)\n' \
+        "$(web_port)" "$(lan_ip)" "$(web_port)"
+    want="$(_sha256 admin123)"
+    if [ -z "$hash" ]; then   # a bare 'not recoverable' here would be a lie; the engine never answered
+        printf '  password   unknown - the engine gave no answer (is it installed and readable as root?)\n'
+        printf '  try        sudo adquit get password_hash   |   sudo adquit passwd "new-password"\n'
+        return 0
+    fi
+    if [ -n "$want" ] && [ "$hash" = "$want" ]; then
+        printf '  password   %sadmin123%s - the shipped default; change it: sudo adquit passwd\n' "$Y" "$N"
+        return 0
+    fi
+    if [ -r "$INITIAL_PW_FILE" ]; then
+        local pw; pw="$(head -n1 "$INITIAL_PW_FILE" 2>/dev/null)"
+        if [ -n "$pw" ] && [ "$(_sha256 "$pw")" = "$hash" ]; then
+            printf '  password   %s%s%s - what the installer generated; forgotten once you set your own\n' \
+                "$B" "$pw" "$N"
+            return 0
+        fi
+    fi
+    printf '  password   not recoverable - the config keeps only its SHA-256\n'
+    printf '  set a new one   sudo adquit passwd   %s(prompts, hidden; type your own)%s\n' "$D" "$N"
+    # deliberately no quoted example after this: an example in the line someone copies becomes their
+    # password (`passwd "at-least-8-characters"` is a real thing users have run, and the engine now
+    # refuses it). The prompt is the only shape we print, and `adquit doctor` flags the rest.
+    return 0
+}
+
+cmd_passwd() {
+    case "${1:-}" in
+        --show|show) passwd_show; return $? ;;
+    esac
+    run_as_engine --passwd "$@"
+}
+cmd_set()    { run_as_engine --set "$@"; }
+cmd_get()    { run_as_engine --get "$@"; }
+cmd_feed()   {
+    local url="$1" name="${2:-}"
+    [ -n "$url" ] || die "usage: adquit blocklist add <url> [name]"
+    "$PY" - "$STATE_DIR/config.json" "$url" "$name" <<'PYX'
+import json, sys, hashlib, pathlib
+cfg_path, url, name = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.load(open(cfg_path))
+lid = "custom_" + hashlib.sha256(url.encode()).hexdigest()[:8]
+feeds = dict(cfg.get("custom_lists") or {})
+feeds[lid] = {"name": name or url.split("/")[2:][-1][:40], "url": url, "cat": "ads", "vec": "banner"}
+cfg["custom_lists"] = feeds
+if lid not in cfg.get("enabled_lists", []):
+    cfg["enabled_lists"] = list(cfg.get("enabled_lists", [])) + [lid]
+pathlib.Path(cfg_path).write_text(json.dumps(cfg, indent=2))
+print("[+] added feed", lid)
+PYX
+    run_as_engine --update-lists
+}
+
+# ---------------------------------------------------------------------------
+#  Point this machine (or the network) at the fortress
+# ---------------------------------------------------------------------------
+cmd_protect() {
+    is_root || { [ -n "$SUDO" ] && exec $SUDO bash "$0" protect "$@" || die "needs root"; }
+    local action="${1:-on}" port="${ADQUIT_DNS_PORT:-53}"
+    if have resolvctl || have systemctl && [ -d /run/systemd/system ]; then :; fi
+    case "$action" in
+        on)
+            if have nmcli && nmcli -t -f NAME c show --active 2>/dev/null | head -n1 | grep -q .; then
+                local con; con="$(nmcli -t -f NAME c show --active | head -n1)"
+                say "NetworkManager connection '$con' -> DNS 127.0.0.1"
+                nmcli connection modify "$con" ipv4.dns "127.0.0.1" ipv4.ignore-auto-dns yes
+                nmcli connection up "$con" >/dev/null 2>&1 || true
+            elif have resolvectl; then
+                local link; link="$(resolvectl status 2>/dev/null | awk '/Link/{print $2; exit}')"
+                say "systemd-resolved link ${link:-all} -> DNS 127.0.0.1:$port"
+                resolvectl dns "${link:-}" "$port" 2>/dev/null || resolvectl dns global 127.0.0.1
+                resolvectl domain "${link:-}" "~." 2>/dev/null || true
+            else
+                printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf.adquit
+                cp -f /etc/resolv.conf "/etc/resolv.conf.adquit.bak" 2>/dev/null || true
+                printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+                say "wrote /etc/resolv.conf (backup: /etc/resolv.conf.adquit.bak)"
+            fi
+            ;;
+        off)
+            if have resolvectl; then resolvectl revert all 2>/dev/null || true; fi
+            if have nmcli; then
+                local con; con="$(nmcli -t -f NAME c show --active 2>/dev/null | head -n1)"
+                [ -n "$con" ] && nmcli connection modify "$con" ipv4.dns "" ipv4.ignore-auto-dns no \
+                    && nmcli connection up "$con" >/dev/null 2>&1 || true
+            fi
+            [ -f /etc/resolv.conf.adquit.bak ] && cp -f /etc/resolv.conf.adquit.bak /etc/resolv.conf \
+                && say "restored /etc/resolv.conf"
+            ;;
+        *) die "usage: adquit protect on|off" ;;
+    esac
+}
+
+cmd_uninstall() {
+    is_root || { [ -n "$SUDO" ] && exec $SUDO bash "$0" uninstall || die "needs root"; }
+    if using_systemd; then
+        systemctl stop "$SERVICE" 2>/dev/null || true
+        systemctl disable "$SERVICE" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$SERVICE.service" /etc/logrotate.d/adquit
+        systemctl daemon-reload
+    fi
+    running && kill "$(cat "$PIDFILE")" 2>/dev/null
+    local keep=""
+    [ "${1:-}" = "--keep-data" ] && keep=1
+    if [ -z "$keep" ]; then rm -rf "$HOME_DIR"; else rm -f "$APP" "$HOME_DIR/bin/adquit"; fi
+    rm -f /usr/local/bin/adquit
+    warn "uninstalled. If you pointed your router at this box, restore its DNS."
+}
+
+usage() {
+    cat <<USAGE
+${B}adquit${N} - NetBlock Fortress v$VERSION_TAG ("$D Omni-Shield $N")
+One command for a network-wide ad + tracker shield: every micro-ad pixel,
+SDK handshake and macro banner/ad-video request on your LAN dies at the DNS layer.
+
+${B}START / STOP${N}
+  adquit                    start the fortress (auto-installs on first run)
+  adquit start | stop | restart | status | logs | watch
+  adquit run                run in the foreground (no service, no systemd)
+
+${B}PROTECTION${N}
+  adquit mode <name>        off | balanced | strict | family | nuclear
+  adquit block <domain>...  add to your own blacklist (wildcards ok)
+  adquit allow <domain>...  never block a domain again
+  adquit unblock <domain>   remove a custom block rule
+  adquit blocklist add <url> [name]     import any hosts/adblock feed
+
+${B}MAINTENANCE${N}
+  adquit install [--mode strict] [--user]   (re)install / upgrade in place
+  adquit update [--force]   pull the latest fortress + refresh feeds
+                            ("already up to date" if unchanged; a real downgrade needs
+                             --force, because sudo wipes exported variables)
+  adquit gravity            re-download every enabled blocklist
+  adquit test [domain]      prove blocking works (engine + live resolver)
+  adquit doctor             config, port, feed and dependency diagnostics
+  adquit verify-lists       check every feed URL is reachable
+  adquit stats | top [n] | rules <domain>...
+  adquit site add media.lan --port 8096   publish a self-hosted site on the LAN
+  adquit proxy install        one port for every site: nginx/Caddy/Apache vhosts
+  adquit lan-zone add .lan <router-ip>    let the router answer printer.lan, nas.lan
+  adquit portal             the start page for everything you published (home.lan)
+  adquit set <key> <value>  change any config key, live (adquit get shows them all)
+  adquit passwd [new]       change the dashboard password (adquit passwd --show: the login)
+  adquit protect on|off     point THIS machine's DNS at the fortress
+  adquit uninstall [--keep-data]
+
+${B}AFTER INSTALLING${N}
+  set your router's DNS to this machine's IP and every device is covered,
+  or run 'sudo adquit protect' to protect just this machine.
+
+  one-line install on a fresh box:
+    curl -fsSL ${RAW_BASE%/*}/install.sh | sudo bash
+USAGE
+}
+
+cmd_run() {
+    [ -f "$APP" ] || { say "installing first"; cmd_install --already-elevated --no-lists; }
+    export ADQUIT_HOME="${ADQUIT_HOME:-$HOME_DIR}"
+    say "foreground run - Ctrl-C to stop (dashboard http://127.0.0.1:${ADQUIT_WEB_PORT:-8080})"
+    exec "$PY" "$APP" --serve
+}
+
+
+# A normal user driving a root-owned install: elevate once, centrally, for every verb
+# that writes state or controls the service. Reads stay unprivileged.
+case "${1:-}" in
+    start|stop|restart|run|install|update|upgrade|gravity|pull|update-lists|mode|block|\
+    allow|unblock|blocklist|feed|passwd|password|protect|uninstall|remove|export|lan|reach|site|lan-zone|proxy|portal|set|get|--set|--get)
+        elevate_for "${1:-}" ;;
+esac
+
+case "${1:-}" in
+    ""|start)      cmd_start ;;
+    stop)          cmd_stop ;;
+    restart)       cmd_restart ;;
+    status)        cmd_status ;;
+    logs)          shift; cmd_logs "$@" ;;
+    watch)         cmd_watch ;;
+    run)           cmd_run ;;
+    install)       shift; cmd_install "$@" ;;
+    update|upgrade) shift; cmd_update "$@" ;;
+    gravity|pull|update-lists) shift; cmd_gravity "$@" ;;
+    mode)          shift; cmd_mode "$@" ;;
+    block)         shift; cmd_block "$@" ;;
+    allow|unblock-domain) shift; cmd_allow "$@" ;;
+    unblock)       shift; cmd_unblock "$@" ;;
+    blocklist|feed) shift; case "${1:-add}" in add) shift; cmd_feed "$@";; *) cmd_feed "${1:-}";; esac ;;
+    test|self-test) shift; cmd_test "$@" ;;
+    doctor)        shift; cmd_doctor "$@" ;;
+    verify|verify-lists) shift; cmd_verify "$@" ;;
+    export)        shift; cmd_export "${1:-ublock}" "${@:2}" ;;
+    intel|whois)   shift; cmd_intel "$@" ;;
+    lan|reach)     shift; cmd_lan "$@" ;;
+    site|sites)    shift; cmd_site "$@" ;;
+    lan-zone|zone) shift; cmd_lan_zone "$@" ;;
+    portal|home|startpage) shift; cmd_portal "$@" ;;
+    set|--set)   shift; cmd_set "$@" ;;
+    get|--get)   shift; cmd_get "$@" ;;
+    proxy)         shift; cmd_proxy "$@" ;;
+    stats)         cmd_stats ;;
+    json)          run_as_engine --json ;;
+    top)           shift; cmd_top "$@" ;;
+    rules)         shift; cmd_rules "$@" ;;
+    passwd|password) shift; cmd_passwd "$@" ;;
+    protect)       shift; cmd_protect "$@" ;;
+    uninstall|remove) shift; cmd_uninstall "$@" ;;
+    version|-v|--version) printf 'adquit %s (NetBlock Fortress %s)\n' "$VERSION_TAG" "$VERSION_TAG" ;;
+    help|-h|--help) usage ;;
+    *) printf '%sunknown command: %s%s\n\n' "$R" "${1:-}" "$N" >&2; usage; exit 2 ;;
+esac
