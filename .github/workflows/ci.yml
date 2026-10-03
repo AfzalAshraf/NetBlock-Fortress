@@ -55,7 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: bash -n
-        run: for f in install.sh uninstall.sh bin/adquit tests/test_cli.sh; do bash -n $f; done
+        run: for f in install.sh uninstall.sh bin/adquit tests/*.sh; do bash -n "$f"; done
       - name: shellcheck
         uses: ludeeus/action-shellcheck@master
         with:

@@ -26,10 +26,15 @@ test:
 	@ADQUIT_NO_PIP=1 $(PY) tests/run_tests.py
 	@bash tests/test_cli.sh
 
+# The shell list is a glob on purpose: the hand-written one kept missing files
+# the day a second script landed in tests/, and a script nobody syntax-checks
+# is a script nobody knows is broken.
+SH = install.sh uninstall.sh bin/adquit $(wildcard tests/*.sh)
+
 lint:
 	@$(PY) -m py_compile app.py && echo "  python ok"
-	@for f in install.sh uninstall.sh bin/adquit tests/test_cli.sh; do bash -n $$f && echo "  shell ok: $$f"; done
-	@command -v shellcheck >/dev/null 2>&1 && shellcheck -S warning install.sh uninstall.sh bin/adquit || echo "  (shellcheck not installed - skipped)"
+	@for f in $(SH); do bash -n $$f && echo "  shell ok: $$f"; done
+	@command -v shellcheck >/dev/null 2>&1 && shellcheck -S warning $(SH) || echo "  (shellcheck not installed - skipped)"
 
 run:
 	@ADQUIT_HOME=$(HOME)/.adquit ADQUIT_NO_PIP=1 ADQUIT_DNS_PORT=5353 ADQUIT_WEB_PORT=8080 $(PY) app.py --serve
