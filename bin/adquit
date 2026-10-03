@@ -1798,8 +1798,10 @@ passwd_show() { # the login for this box's dashboard, for the person who owns th
         fi
     fi
     printf '  password   not recoverable - the config keeps only its SHA-256\n'
-    printf '  set a new one   sudo adquit passwd                (prompts, hidden)\n'
-    printf '                  sudo adquit passwd "at-least-8-characters"\n'
+    printf '  set a new one   sudo adquit passwd   %s(prompts, hidden; type your own)%s\n' "$D" "$N"
+    # deliberately no quoted example after this: an example in the line someone copies becomes their
+    # password (`passwd "at-least-8-characters"` is a real thing users have run, and the engine now
+    # refuses it). The prompt is the only shape we print, and `adquit doctor` flags the rest.
     return 0
 }
 

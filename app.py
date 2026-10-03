@@ -4927,9 +4927,12 @@ def cmd_doctor():
     bad = [l for l, st in LIST_STATUS.items() if st.get("state") == "error" and st.get("enabled")]
     checks.append(("feed errors", not bad, "%s failing: %s" % (len(bad), ", ".join(bad[:5])) if bad else "none"))
     checks.append(("writable data dir", os.access(DATA_DIR, os.W_OK), str(DATA_DIR)))
-    default_pw = CFG.get("password_hash") == hashlib.sha256(b"admin123").hexdigest()
-    checks.append(("default password changed", not default_pw,
-                   "CHANGE IT: adquit passwd <new>" if default_pw else "ok"))
+    # the shipped default AND any example this project has printed are the same failure: a
+    # password an attacker can find in our own README. One check, because the fix is one command.
+    placeholder = CFG.get("password_hash") in set(
+        hashlib.sha256(p.encode()).hexdigest() for p in PLACEHOLDER_PASSWORDS)
+    checks.append(("password is not a known default", not placeholder,
+                   "CHANGE IT: adquit passwd <new>" if placeholder else "ok"))
     web_free = True
     w = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     w.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -4956,6 +4959,36 @@ def cmd_doctor():
         print("  %s %-28s %s%s%s" % (tick(ok), label, DIM, detail, RESET))
     print("\n  %s%d issue(s)%s\n" % (YEL if problems else GREEN, problems, RESET))
     return 1 if problems else 0
+
+
+# Strings this project has *printed* as examples of what to type. Anyone who follows the
+# instructions verbatim ends up with a dashboard password that is public knowledge, and one
+# (`change-me-please`) is what `install.sh` falls back to if its generator cannot run - so these
+# are refused, not warned about: pasting a placeholder is obeying us, not choosing badly.
+PLACEHOLDER_PASSWORDS = ("at-least-8-characters", "change-me-please", "your-password-here",
+                         "changeme", "admin123")
+
+
+def _pw_is_placeholder(pw):
+    return (pw or "").strip().lower() in PLACEHOLDER_PASSWORDS
+
+
+def _live_suffix():
+    """One line of truth appended to every 'updated' message that only means 'saved' on its own."""
+    return " (the live service reloaded it)" if _reload_live_config() \
+        else " - saved; no live service to notify, so it applies on the next start"
+
+
+def _reload_live_config():
+    """Ask a running fortress to re-read data/config.json - the cheap `?config=1` form of
+    /api/reload, which clears the decision cache without recompiling millions of rules.
+
+    True when a live service picked the change up. Every CLI verb that changes the login has to do
+    this: the process holding the *login* compares against the CFG it read at start, so saving to
+    disk and printing "[+] password updated" while that copy stays stale reads to the operator as
+    "my password was not changed" - and the old password still works, which is worse.
+    """
+    return bool(_api_get("/api/reload", {"config": "1"}).get("ok"))
 
 
 def _notify_service():
@@ -5183,11 +5216,15 @@ def cli(argv):
         if len(rest) < 2:
             print("[!] usage: --set-auth <username> <password>")
             return 1
+        if _pw_is_placeholder(rest[1]):
+            print("[!] that is an example from the docs, not a password - type your own")
+            print('    usage: --set-auth <username> "<something only you know>"')
+            return 1
         CFG["admin_username"] = rest[0].strip()
         CFG["password_hash"] = hashlib.sha256(rest[1].encode()).hexdigest()
         save_config()
         _forget_initial_password()
-        print("[+] dashboard login is now %s" % rest[0])
+        print("[+] dashboard login is now %s%s" % (rest[0], _live_suffix()))
         return 0
     if cmd in ("--passwd",):
         pw = rest[0] if rest else None
@@ -5197,10 +5234,14 @@ def cli(argv):
         if len(pw) < 8:
             print("[!] password must be at least 8 characters")
             return 1
+        if _pw_is_placeholder(pw):
+            print("[!] that is an example from the docs, not a password - type your own")
+            print('    usage: adquit passwd "<something only you know>"')
+            return 1
         CFG["password_hash"] = hashlib.sha256(pw.encode()).hexdigest()
         save_config()
         _forget_initial_password()
-        print("[+] password updated")
+        print("[+] password updated%s" % _live_suffix())
         return 0
     if cmd in ("--set",):
         if len(rest) < 2:
@@ -5234,7 +5275,7 @@ def cli(argv):
             rebuild_master_blocklist()
             flush_caches()
             _notify_service()
-        elif _api_get("/api/reload", {"config": "1"}).get("ok"):
+        elif _reload_live_config():
             print("[+] %s = %s (live service updated)" % (key, val))
             return 0
         print("[+] %s = %s" % (key, val))

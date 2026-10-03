@@ -151,7 +151,8 @@ adquit portal             the start page of everything you published
 adquit lan-zone add .lan 192.168.1.1    printer.lan / nas.lan: ask the router, never a
                             public resolver (adquit lan-zone list | rm SUFFIX)
 adquit proxy install          nginx/Caddy/Apache vhosts: every published site on one port
-adquit passwd [new]         rotate the dashboard password
+adquit passwd [new]         rotate the dashboard password (reloads the running dashboard and
+                            says whether it answered; docs-placeholder passwords are refused)
 adquit passwd --show        the login for this box: username, link, and the password while
                             it is still the one in use (a password you set yourself is stored as a
                             SHA-256 and cannot be read back - only rotated)
@@ -397,7 +398,7 @@ blocker and the web server are the same box on purpose.
 * **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
   rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
   compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
-  MIT licence, 92-test offline suite (engine, API, UI, exports, dependency gate,
+  MIT licence, 96-test offline suite (engine, API, UI, exports, dependency gate,
   source hygiene).
 * **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
   `adquit stats` answers even when the web layer is down.
@@ -447,7 +448,7 @@ blocker and the web server are the same box on purpose.
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline suite (92 engine/API/UI/gate/boot/hygiene tests) + CLI contract
+make test      # offline suite (96 engine/API/UI/gate/boot/hygiene tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 

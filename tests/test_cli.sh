@@ -377,6 +377,16 @@ check "the saved-password filename is one literal in app.py, install.sh and the 
     grep -qF '\$STATE/.dashboard-initial-password' '$REPO/install.sh' &&
     grep -qF 'INITIAL_PW_FILE=\"\$STATE_DIR/.dashboard-initial-password\"' '$REPO/bin/adquit'
 "
+# an example string after a command becomes the password; the engine refuses them now, and the CLI
+# must stop handing anybody one to copy
+check "adquit never prints an example password for someone to paste" bash -c "
+    '$BIN' passwd --show 2>&1 | grep -q 'sudo adquit passwd' &&
+    ! '$BIN' passwd --show 2>&1 | grep -qE 'passwd \"[^\"]+\"'
+"
+check "adquit passwd says whether the running box picked it up" bash -c "
+    '$BIN' passwd a-choice-of-mine 2>&1 | grep -qE 'live service reloaded it|applies on the next start' &&
+    '$BIN' passwd at-least-8-characters 2>&1 | grep -q 'not a password'
+"
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
 "$BIN" stop >/dev/null 2>&1

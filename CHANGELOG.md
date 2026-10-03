@@ -2,6 +2,25 @@
 
 ## v19.3 — a start page for the LAN you just made reachable
 
+- **`adquit passwd` and `adquit --set-auth` reload the dashboard that is actually running.** Both
+  saved the new hash to `config.json`, printed `[+] password updated`, and left the live process
+  comparing logins against the `CFG` it read at start - so the password you just typed did not work,
+  the old one still did, and the box looked like it was ignoring you. Both now use the cheap
+  `?config=1` form of `/api/reload` (a re-read plus a decision-cache clear, not a recompile of four
+  million rules) and say which situation they are in: `(the live service reloaded it)` or `saved; no
+  live service to notify, so it applies on the next start`. `[+] password updated` alone is not a
+  claim anyone can act on.
+- **Passwords that are really instructions are refused.** `install.sh` prints
+  `passwd "at-least-8-characters"` as a shape, and people copy shapes: the box ends up with a
+  dashboard password published in our own docs. The engine rejects every such string
+  (`at-least-8-characters`, `change-me-please` - which is also `install.sh`'s fallback when its
+  generator cannot run - `your-password-here`, `changeme`, `admin123`), `passwd --show` no longer
+  prints a quoted example at all, and `adquit doctor` flags one already in use instead of only
+  catching the shipped default.
+- A hygiene test now guards the *class*: every `cli()` gate that writes config must also reach the
+  live service or restart it. Against the pre-fix source it names `--passwd` and `--set-auth`, and it
+  asserts those two are among the gates it parsed, so a drift in the parser cannot quietly un-guard
+  the bug.
 - **`adquit passwd --show`** answers "what is my dashboard login?" from the box itself: the
   username, the URL as both loopback and LAN address, and the password - but only where the box
   actually still knows it. That is the shipped default (with a warning to change it) or the one the

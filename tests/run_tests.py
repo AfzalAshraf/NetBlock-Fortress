@@ -377,6 +377,64 @@ class TestModesAndConfig(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_login_verbs_reach_the_running_service(self):
+        """Saving a new login to disk is only half the job: the running process compares every
+        login against the CFG it read at start. Without the reload these two verbs printed
+        "[+] password updated" while the *old* password still worked and the new one did not -
+        indistinguishable from "my password was not changed". Both must reload, and say which
+        of the two situations they are in.
+        """
+        import contextlib
+        import io
+        real = nb._reload_live_config
+        old = (nb.CFG["password_hash"], nb.CFG["admin_username"])
+        try:
+            seen = []
+            nb._reload_live_config = lambda: (seen.append("reload"), True)[1]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(nb.cli(["--passwd", "a-brand-new-secret"]), 0)
+                self.assertEqual(nb.cli(["--set-auth", "operator", "another-secret"]), 0)
+            self.assertEqual(len(seen), 2, "a login verb saved without telling the running box")
+            self.assertEqual(buf.getvalue().count("live service reloaded it"), 2, buf.getvalue())
+
+            # and when nothing is listening, it must not claim otherwise
+            seen = []
+            nb._reload_live_config = lambda: (seen.append("reload"), False)[1]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(nb.cli(["--passwd", "yet-another-secret"]), 0)
+            self.assertEqual(len(seen), 1)
+            self.assertIn("applies on the next start", buf.getvalue(), buf.getvalue())
+        finally:
+            nb._reload_live_config = real
+            nb.CFG["password_hash"], nb.CFG["admin_username"] = old
+            nb.save_config()
+
+    def test_placeholder_passwords_are_refused(self):
+        """The examples this project prints become real passwords, typed by people following the
+        instructions - so they are refused, and `adquit doctor` flags them where they are already in
+        use. `install.sh` even falls back to one of them when its generator cannot run."""
+        old = nb.CFG["password_hash"]
+        try:
+            for pw in nb.PLACEHOLDER_PASSWORDS:
+                self.assertGreaterEqual(len(pw), 8, "%s is not even long enough to reach the check" % pw)
+                self.assertEqual(nb.cli(["--passwd", pw]), 1, "%s should not be accepted" % pw)
+                self.assertEqual(nb.CFG["password_hash"], old, "%s was written anyway" % pw)
+            self.assertEqual(nb.cli(["--set-auth", "admin", "change-me-please"]), 1)
+            self.assertEqual(nb.CFG["admin_username"], old and nb.CFG["admin_username"])
+            self.assertEqual(nb.cli(["--passwd", "a-choice-of-mine"]), 0)
+            self.assertNotEqual(nb.CFG["password_hash"], old)
+        finally:
+            nb.CFG["password_hash"] = old
+            nb.save_config()
+
+    def test_doctor_flags_placeholders_not_just_the_default(self):
+        import inspect
+        src = inspect.getsource(nb.cmd_doctor)
+        self.assertIn("PLACEHOLDER_PASSWORDS", src,
+                      "the shipped default is checked but the documented examples are not")
+
     def test_api_payload_shape(self):
         payload = nb.stats_payload()
         for key in ("version", "queries", "blocked", "rules", "macro_rules", "micro_rules",
@@ -1382,6 +1440,44 @@ class TestHygiene(unittest.TestCase):
             unread,
             "config keys nothing reads (remove them, or wire them up): %s" % ", ".join(unread))
 
+
+
+    def test_every_config_writing_cli_verb_reaches_the_service(self):
+        """A verb that saves and does not notify is the password bug in waiting.
+
+        `--passwd` wrote config.json, said "[+] password updated", and the running dashboard kept
+        comparing logins against the hash it read at start - so the operator's new password did not
+        work, the old one still did, and nothing on screen was technically a lie. `--block` never
+        had that problem because it calls `_notify_service()`. Rather than trust the next verb to
+        remember, every gate in `cli()` that touches CFG or save_config() must also reach the
+        service (or restart it) before it returns.
+        """
+        src = (REPO / "app.py").read_text(errors="replace")
+        cli = src[src.index("def cli(argv):"):]
+        gates = re.split(r"\n    if cmd in \((.*?)\):", cli)
+        checked = []
+        for i in range(1, len(gates), 2):
+            verb = gates[i].strip(' "\'' ).strip(",").strip('"').strip("'")
+            body = gates[i + 1].split("\n    if cmd in (")[0]
+            if verb in ("--serve", "--daemon"):
+                continue
+            writes = ("save_config()" in body or "atomic_write(" in body
+                      or re.search(r"CFG\[[^\]]+\] *[^=]*=", body))
+            if not writes:
+                continue
+            checked.append(verb)
+            reaches = ("_notify_service" in body or "_reload_live_config" in body
+                       or "_live_suffix" in body or "/api/reload" in body)
+            self.assertTrue(
+                reaches,
+                "%s changes config but never tells the running service; add _notify_service() "
+                "(rules) or _live_suffix() (config only, no recompilation)" % verb)
+        # a floor is not enough: if the parse drifted and these two stopped being seen, the guard
+        # would pass while the login bug walked back in
+        self.assertTrue(all(v in checked for v in ("--passwd", "--set-auth")),
+                        "the login verbs are not among the gates this checked: %s" % checked)
+        self.assertGreaterEqual(len(checked), 3,
+                                "only %s gates parsed - the test stopped seeing the CLI" % checked)
 
 
 if __name__ == "__main__":
