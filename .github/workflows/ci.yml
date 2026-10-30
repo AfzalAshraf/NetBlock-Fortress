@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  engine:
+    name: Engine + dashboard tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+      - name: Syntax
+        run: python -m py_compile app.py
+      - name: Test suite (offline, 66 assertions)
+        run: python tests/run_tests.py
+      - name: CLI contract
+        run: bash tests/test_cli.sh
+
+  installer:
+    name: One-command install smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install as root from the checkout (no lists)
+        run: |
+          sudo -E bash -c 'ADQUIT_SKIP_LISTS=1 ADQUIT_MODE=strict bash install.sh'
+      - name: adquit end-to-end
+        run: |
+          adquit version
+          adquit status || true
+          adquit test --no-live
+          adquit block ads.example.com
+          adquit rules ads.example.com | grep -q BLOCK
+          adquit unblock ads.example.com
+          adquit mode family
+          adquit mode strict
+          adquit stats
+      - name: Uninstall cleanly
+        run: sudo bash uninstall.sh
+
+  shell:
+    name: Shell hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: for f in install.sh uninstall.sh bin/adquit tests/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning

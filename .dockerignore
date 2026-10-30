@@ -1,0 +1,7 @@
+.git
+.github
+data
+venv
+__pycache__
+*.pyc
+tests/fixtures/*.bak

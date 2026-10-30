@@ -1,0 +1,3 @@
+plain-ad-domain.com
+deep.sub.pixels.example
+analytics.vendor-xyz.net

@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build bundle
+        run: |
+          set -e
+          VER="${GITHUB_REF_NAME:-latest}"
+          mkdir -p dist
+          tar --exclude=.git --exclude=dist -czf "dist/netblock-fortress-$VER.tar.gz" .
+          cp install.sh "dist/install-$VER.sh"
+          echo "installer one-liner for this release:"
+          echo "  curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$VER/install.sh | sudo bash"
+      - name: GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/install-*.sh
+      - name: Docker image on GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+          IMAGE=ghcr.io/${{ github.repository_owner }}/netblock-fortress
+          docker build -t $IMAGE:latest -t $IMAGE:${GITHUB_REF_NAME:-latest} .
+          docker push $IMAGE:latest
+          docker push $IMAGE:${GITHUB_REF_NAME:-latest}

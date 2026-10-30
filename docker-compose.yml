@@ -1,0 +1,25 @@
+# docker compose up -d      -> fortress on :53 (DNS) and :8080 (dashboard)
+# Full docs: README.md "Docker"
+services:
+  adquit:
+    build: .
+    image: netblock-fortress:19
+    container_name: adquit
+    restart: unless-stopped
+    network_mode: host          # required: answers DNS on the LAN
+    environment:
+      ADQUIT_MODE: ${ADQUIT_MODE:-strict}
+      ADQUIT_UPSTREAM: ${ADQUIT_UPSTREAM:-1.1.1.1}
+      ADQUIT_WEB_PORT: "${ADQUIT_WEB_PORT:-8080}"
+      ADQUIT_DNS_PORT: "${ADQUIT_DNS_PORT:-53}"
+      ADQUIT_PASSWORD: "${ADQUIT_PASSWORD:-}"
+    volumes:
+      - adquit-data:/opt/adquit/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  adquit-data:

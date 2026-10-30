@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.bak
+.DS_Store
+data/
+venv/
+.opt/
+*.tmp
+gravity.cache
+gravity.idx
+gravity.small
+native/*.so
+native/*.o

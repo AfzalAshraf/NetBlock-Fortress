@@ -1,0 +1,8 @@
+# comment line
+127.0.0.1   localhost
+0.0.0.0 localhost
+0.0.0.0 ads.example-ads.com # inline comment
+127.0.0.1 track.one-more-tracker.com tracker-second.example.net
+::1 ip6-localhost
+0.0.0.0 malformed..domain
+192.168.1.1 notadomain
