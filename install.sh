@@ -153,6 +153,36 @@ if [ "$lowest" != "$MIN_APP_VERSION" ]; then
     fail "refusing to install app.py v$APP_VER from $REPO/$REF - this installer (v$INSTALLER_VERSION) needs >= v$MIN_APP_VERSION. That branch is behind: merge it into $REF, or re-run with ADQUIT_REF=<branch>"
 fi
 note "app.py v$APP_VER from $REPO/$REF"
+
+# The optional C data plane. Why it exists, in one line: 4.2M rules held as python dicts cost a box
+# ~1.5 GB of memory that it cannot give back, and the same tables as a mapped index cost whatever the
+# page cache can spare. It is genuinely optional - a box with no compiler runs the python tables, and
+# `adquit doctor` says which of the two is live, because a silent fallback is how an optimisation
+# becomes a rumour.
+CC_BIN="${CC:-$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)}"
+GB_SRC="$HOME_DIR/native/adquit_gravity.c"
+GB_OUT="$HOME_DIR/lib/libadquit_gravity.so"
+GB_FLAGS="-O2 -fPIC -shared -Wall -Wextra -pthread"
+if [ -n "$SRC" ] && [ -f "$SRC/native/adquit_gravity.c" ]; then
+    install -D -m 0644 "$SRC/native/adquit_gravity.c" "$GB_SRC" 2>/dev/null || true
+fi
+if [ ! -f "$GB_SRC" ] && command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 30 "$RAW/native/adquit_gravity.c" -o "$GB_SRC" 2>/dev/null || rm -f "$GB_SRC"
+fi
+if [ -n "$CC_BIN" ] && [ -f "$GB_SRC" ]; then
+    mkdir -p "$HOME_DIR/lib" 2>/dev/null || true
+    if "$CC_BIN" $GB_FLAGS -march=native -o "$GB_OUT" "$GB_SRC" >/dev/null 2>&1; then
+        note "data plane: native index, built for this cpu"
+    elif GB_WARN="$("$CC_BIN" $GB_FLAGS -o "$GB_OUT" "$GB_SRC" 2>&1)"; then
+        [ -n "$GB_WARN" ] && warn "compiler: $GB_WARN"
+        note "data plane: native index (portable build here)"
+    else
+        rm -f "$GB_OUT"
+        note "data plane: python tables (the index did not build on this box)"
+    fi
+else
+    note "data plane: python tables (no C compiler - install gcc to map the blocklist instead)"
+fi
 # remember the channel, so `adquit update` stays on the ref this box came from
 printf '%s\n' "$REF" > "$HOME_DIR/.channel" 2>/dev/null || true
 

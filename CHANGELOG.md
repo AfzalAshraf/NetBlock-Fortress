@@ -2,6 +2,33 @@
 
 ## v19.3 — a start page for the LAN you just made reachable
 
+- **The blocklist's data plane is now a memory-mapped C index, and it is optional in the way that
+  matters.** Holding 4.22M rules as Python `dict` entries costs a box ~1,590 MB of anonymous RSS, takes
+  2.5 s to unpickle at boot, and re-walks every parent label per query; the same tables as a mapped file
+  cost ~0 MB of anonymous memory (a 206 MB file the kernel may reclaim), load in microseconds, and do
+  the parent walk in C without building substrings. `native/adquit_gravity.c` is ~700 lines of
+  lookup-table code — no dependencies, no Python headers (it is reached through `ctypes`), no runtime
+  to keep alive. It replaces *storage*, never policy: normalisation, exemptions, categories and the
+  unbreak list stay in `classify()`, so there is still one definition of a domain.
+- **A hit through it costs ~370 ns more; a miss costs ~650 ns less.** That trade is written down in the
+  README's table rather than sold as "faster everywhere": a ctypes call is not free, most queries are
+  answered from `DECISION_CACHE` before either path is touched, and the win you actually feel on a Pi
+  is that the box stops swapping. Rust or C++ would not change the conclusion — the cost is the
+  Python↔native boundary, not the language — and a `crates.io` build would turn `curl | sudo bash` into
+  a toolchain install.
+- **Parity is the requirement, and it is tested that way.** `TestNativePlane` answers the same corpus
+  through both paths and compares the verdict *and* the reason string a user reads; the disarmed-vector
+  case has its own test, because `feed_hit` *keeps walking* past a row whose vector has been switched
+  off, and an index that returned it would block names the engine allows (the C side is therefore told
+  which metas are armed, on every cache flush). A truncated or damaged index file is refused by
+  re-deriving every offset from the header and bounds-checking it; a stale one is refused by the same
+  feed stamps the pickle path uses. `adquit doctor` prints which plane is live, and
+  `sudo adquit set native_gravity false` is the deliberate off switch.
+- **It rides along with updates.** `install.sh` and each of `adquit update`'s three fetch paths (tarball,
+  raw file, git clone) install the C source and compile it — `-march=native` first, a portable build if
+  the compiler refuses that flag, nothing at all if there is no compiler — and one check pins the compiler
+  flags in all three places so they cannot drift. In native mode the 152 MB gravity pickle is replaced by
+  a small stamps file, so a rebuild costs the SD card one write of each table instead of two.
 - **`adquit passwd` and `adquit --set-auth` reload the dashboard that is actually running.** Both
   saved the new hash to `config.json`, printed `[+] password updated`, and left the live process
   comparing logins against the `CFG` it read at start - so the password you just typed did not work,

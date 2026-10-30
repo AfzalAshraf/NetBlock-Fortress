@@ -9,6 +9,7 @@ micro/macro engine blocks what it must and never touches what it must not.
 """
 
 import ast
+import datetime
 import importlib.util
 import json
 import os
@@ -673,19 +674,32 @@ class TestDomainIntel(unittest.TestCase):
     """`adquit intel` with RDAP stubbed, so the success path is covered even where the
     network is not (the CI-only TypeError this test now catches was invisible offline)."""
 
+    @staticmethod
+    def _rdap(days_ago):
+        """A payload whose registration date is *relative to today*.
+
+        The engine calls a domain freshly-baked for 30 days and switches wording after that, and a
+        hard-coded date crossed the line about a month after this test was written - which made a
+        green commit look broken to whoever ran it next. Age is the input here, so it cannot rot.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc)
+        reg = (now - datetime.timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        exp = (now + datetime.timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {
+            "events": [{"eventAction": "registration", "eventDate": reg},
+                       {"eventAction": "expiration", "eventDate": exp}],
+            "entities": [{"roles": ["registrar"],
+                          "vcardArray": ["vcard", [["fn", {}, "text", "Sneaky Registrar LLC"]]]}],
+            "status": ["client transfer prohibited"],
+            "nameservers": [{"ldhName": "ns1.scam-ads.net"}, {"ldhName": "ns2.scam-ads.net"}],
+        }
+
     class Resp:
         status_code = 200
+        payload = None
 
-        @staticmethod
-        def json():
-            return {
-                "events": [{"eventAction": "registration", "eventDate": "2026-09-25T00:00:00Z"},
-                           {"eventAction": "expiration", "eventDate": "2027-09-25T00:00:00Z"}],
-                "entities": [{"roles": ["registrar"],
-                              "vcardArray": ["vcard", [["fn", {}, "text", "Sneaky Registrar LLC"]]]}],
-                "status": ["client transfer prohibited"],
-                "nameservers": [{"ldhName": "ns1.scam-ads.net"}, {"ldhName": "ns2.scam-ads.net"}],
-            }
+        def json(self):
+            return self.payload
 
     def setUp(self):
         self._real_get = nb.requests.get
@@ -694,14 +708,27 @@ class TestDomainIntel(unittest.TestCase):
         nb.requests.get = self._real_get
 
     def test_rdap_facts_are_parsed_and_cached(self):
-        nb.requests.get = lambda *a, **k: self.Resp()
+        class Fresh(self.Resp):
+            payload = self._rdap(3)
+
+        nb.requests.get = lambda *a, **k: Fresh()
         rep = nb.intel_report("brand-new-scam.biz")
         self.assertEqual("brand-new-scam.biz", rep["zone"])
         self.assertEqual("Sneaky Registrar LLC", rep["rdap"]["registrar"])
         self.assertIn("client transfer prohibited", rep["rdap"]["status"])
         self.assertEqual(["ns1.scam-ads.net", "ns2.scam-ads.net"], rep["rdap"]["nameservers"])
         self.assertIsNotNone(rep["rdap"].get("age_days"))
-        self.assertTrue(any("freshly" in h or "days old" in h for h in rep["hints"]), rep["hints"])
+        self.assertTrue(any("freshly" in h for h in rep["hints"]), rep["hints"])
+        self.assertLess(rep["rdap"]["age_days"], 31)
+        # and the other side of the same threshold, so the wording switch is pinned rather than
+        # something a future reader trips over
+        class Mature(self.Resp):
+            payload = self._rdap(400)
+
+        nb.requests.get = lambda *a, **k: Mature()
+        old = nb.intel_report("an-old-domain.biz")
+        self.assertTrue(any("domain age 400 days" in h for h in old["hints"]), old["hints"])
+        nb.requests.get = lambda *a, **k: Fresh()
         # a brand-new scam domain is on no list yet - that is the whole point of intel:
         self.assertEqual("allow", rep["action"])
         self.assertTrue(any("adquit block brand-new-scam.biz" in h for h in rep["hints"]), rep["hints"])
@@ -732,6 +759,12 @@ class TestBootFastPath(unittest.TestCase):
     TABLES = ("BLOCKED", "WILDCARDS", "UNBREAK", "GRAVITY_CUSTOM", "CUSTOM_WHITELIST_SET")
 
     def setUp(self):
+        # this class is about the *pickle* fast path, so it pins the data plane to Python: with the
+        # native index installed, BLOCKED is a view over a file and assertions like "the cache holds
+        # exactly these two rows" describe a different mechanism (TestNativePlane covers that one)
+        self._native = nb.CFG.get("native_gravity", True)
+        nb.CFG["native_gravity"] = False
+        self._plane, nb.NATIVE = nb.NATIVE, None
         self.saved = {n: getattr(nb, n) for n in self.TABLES}
         self.saved_counts = (dict(nb.VECTOR_COUNTS), dict(nb.CAT_COUNTS))
         for p in (nb.GRAVITY_CACHE, nb.META_DIR / "gravity.custom"):
@@ -746,6 +779,8 @@ class TestBootFastPath(unittest.TestCase):
         nb.CAT_COUNTS.update({"ads": 1, "trackers": 1})
 
     def tearDown(self):
+        nb.CFG["native_gravity"] = self._native
+        nb.NATIVE = self._plane
         for n, v in self.saved.items():
             setattr(nb, n, v)
         nb.VECTOR_COUNTS.clear(); nb.CAT_COUNTS.clear()
@@ -1478,6 +1513,161 @@ class TestHygiene(unittest.TestCase):
                         "the login verbs are not among the gates this checked: %s" % checked)
         self.assertGreaterEqual(len(checked), 3,
                                 "only %s gates parsed - the test stopped seeing the CLI" % checked)
+
+
+class TestNativePlane(unittest.TestCase):
+    """The C index must be *indistinguishable* from the dicts, or it is not an optimisation, it is a
+    different product. Every test here runs the same question twice: once with the tables in Python,
+    once with the mapped index, and compares answers down to the reason string a user reads.
+    """
+
+    TABLES = ("BLOCKED", "WILDCARDS", "UNBREAK")
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+        cls.lib = HOME / "lib" / "libadquit_gravity.so"      # BASE_DIR/lib is where the engine looks
+        src = REPO / "native" / "adquit_gravity.c"
+        if not src.exists():
+            raise unittest.SkipTest("native/adquit_gravity.c is gone")
+        cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
+        if cc is None:
+            raise unittest.SkipTest("no C compiler on this box - the Python path is what runs there")
+        cls.lib.parent.mkdir(parents=True, exist_ok=True)
+        res = subprocess.run([cc, "-O2", "-fPIC", "-shared", "-Wall", "-Wextra", "-pthread",
+                              "-o", str(cls.lib), str(src)], capture_output=True, text=True,
+                             timeout=300)
+        if res.returncode != 0 or res.stderr.strip():
+            raise AssertionError("the index must compile clean:\n%s" % (res.stdout + res.stderr))
+        os.environ["ADQUIT_GRAVITY_LIB"] = str(cls.lib)
+        nb._NATIVE_LIB = False                                 # re-look, this time find it
+        if nb._gravity_lib() is None:
+            raise unittest.SkipTest("library built but not loadable here")
+
+    @classmethod
+    def tearDownClass(cls):
+        nb._NATIVE_LIB = False
+        os.environ.pop("ADQUIT_GRAVITY_LIB", None)
+
+    def setUp(self):
+        self.saved = {n: getattr(nb, n) for n in self.TABLES}
+        self.saved_plane, self.saved_cfg = nb.NATIVE, nb.CFG.get("native_gravity", True)
+        self.saved_custom = set(nb.CUSTOM_BLOCKED)
+        nb.CFG["native_gravity"] = True
+        nb.NATIVE = None
+        # a small hand-built corpus, plus the real one the fixtures give us
+        self.blocked = {"doubleclick.net": ("ads", "banner", "h_pro"),
+                        "tracker.zone": ("trackers", "pixel", "h_pro"),
+                        "notdoubleclick.net": ("ads", "banner", "h_pro"),
+                        "deep.ads.example": ("ads", "native", "fx_wildcard")}
+        self.wild = {"adnetwork.test": ("ads", "banner", "fx_wildcard"),
+                     "tracker.zone": ("trackers", "pixel", "h_pro")}
+        nb.BLOCKED = dict(self.blocked)
+        nb.WILDCARDS = dict(self.wild)
+        nb.UNBREAK = set()
+        nb.CUSTOM_BLOCKED = set()
+        nb.flush_caches()
+
+    def tearDown(self):
+        for n, v in self.saved.items():
+            setattr(nb, n, v)
+        nb.CFG["native_gravity"] = self.saved_cfg
+        if nb.NATIVE is not None:
+            nb.NATIVE.close()
+        nb.NATIVE = self.saved_plane
+        nb.CUSTOM_BLOCKED = self.saved_custom
+        for path in (nb.GRAVITY_INDEX, nb.GRAVITY_SMALL):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        nb.flush_caches()
+
+    def _go_native(self):
+        plane = nb.NativeGravity.install(dict(self.blocked), dict(self.wild))
+        self.assertIsNotNone(plane, "the index should build from a normal table")
+        nb.BLOCKED = nb._IndexView(plane, False)
+        nb.WILDCARDS = nb._IndexView(plane, True)
+        nb.flush_caches()
+        return plane
+
+    CORPUS = ["doubleclick.net", "x.doubleclick.net", "a.b.c.doubleclick.net", "notdoubleclick.net",
+              "doubleclick.net.evil.com", "tracker.zone", "sub.tracker.zone", "adnetwork.test",
+              "deep.adnetwork.test", "a.b.deep.adnetwork.test", "deep.ads.example", "ads.example",
+              "DOUBLECLICK.NET", "unrelated.example.com", "zone", "co.uk", "x.co.uk", ""]
+
+    def test_verdicts_are_identical_through_the_index(self):
+        want = {}
+        for d in self.CORPUS:
+            nb.flush_caches()
+            want[d] = nb.classify(d)
+        self._go_native()
+        for d in self.CORPUS:
+            nb.flush_caches()
+            got = nb.classify(d)
+            self.assertEqual(want[d]["action"], got["action"], d)
+            self.assertEqual(want[d]["reason"], got["reason"], "%s: reason text differs" % d)
+            self.assertEqual(want[d].get("source", ""), got.get("source", ""), d)
+
+    def test_disarmed_vector_is_skipped_not_blocked(self):
+        """`feed_hit` walks *past* a row whose vector is off. An index that returned it anyway would
+        block names the engine allows - the one difference that would be invisible until a user's
+        legitimate site stopped resolving."""
+        nb.CFG["macro_ads"] = False
+        want = {}
+        for d in self.CORPUS:
+            nb.flush_caches()
+            want[d] = nb.classify(d)
+        self._go_native()
+        nb.CFG["macro_ads"] = False
+        nb.flush_caches()                      # this is what pushes the active table into the index
+        for d in self.CORPUS:
+            nb.flush_caches()
+            self.assertEqual(want[d]["action"], nb.classify(d)["action"], d)
+        nb.CFG["macro_ads"] = True
+        nb.flush_caches()
+        self.assertEqual("block", nb.classify("doubleclick.net")["action"])
+
+    def test_view_reads_like_a_dict_and_follows_writes(self):
+        plane = self._go_native()
+        self.assertEqual(len(self.blocked), len(nb.BLOCKED))
+        self.assertEqual(self.blocked["doubleclick.net"], nb.BLOCKED["doubleclick.net"])
+        self.assertIn("tracker.zone", nb.WILDCARDS)
+        self.assertNotIn("nope.example", nb.BLOCKED)
+        self.assertEqual({}, {k: v for k, v in nb.BLOCKED.items() if False})
+        self.assertEqual(set(self.blocked), {d for d, _m in nb.BLOCKED.items()})
+        nb.BLOCKED["added.later.net"] = ("custom", "banner", "custom")
+        self.assertEqual(("custom", "banner", "custom"), nb.BLOCKED["added.later.net"])
+        self.assertEqual(len(self.blocked) + 1, len(nb.BLOCKED))
+        self.assertIn("added.later.net", set(nb.BLOCKED))
+        del nb.BLOCKED["added.later.net"]
+        self.assertNotIn("added.later.net", nb.BLOCKED)
+        self.assertEqual(len(self.blocked), len(nb.BLOCKED))
+        nb.BLOCKED["doubleclick.net"] = ("ads", "banner", "custom")
+        self.assertEqual("custom", nb.BLOCKED["doubleclick.net"][2])
+        plane.close() if False else None
+
+    def test_stale_index_is_refused_not_trusted(self):
+        """The stamps are the difference between an optimisation and a blocklist that quietly stopped
+        covering the feeds the operator enabled."""
+        self._go_native()
+        feed = nb.LIST_DIR / "h_pro.txt"
+        feed.write_text("0.0.0.0 stale.example\n")
+        os.utime(feed, None)
+        nb.NATIVE.close()
+        nb.NATIVE = None
+        self.assertFalse(nb.NativeGravity.restore(),
+                         "an index that no longer matches the feeds must be refused")
+
+    def test_a_damaged_index_is_rejected(self):
+        self._go_native()
+        raw = nb.GRAVITY_INDEX.read_bytes()
+        nb.GRAVITY_INDEX.write_bytes(raw[: len(raw) // 2])     # a truncated write, as disk faults go
+        nb.NATIVE.close()
+        nb.NATIVE = None
+        self.assertIsNone(nb.NativeGravity.open(), "a short file must not map as an index")
+        nb.GRAVITY_INDEX.write_bytes(b"ADQJ" + b"\0" * 200)
+        self.assertIsNone(nb.NativeGravity.open(), "a header that lies about its size must not map")
 
 
 if __name__ == "__main__":

@@ -387,6 +387,15 @@ check "adquit passwd says whether the running box picked it up" bash -c "
     '$BIN' passwd a-choice-of-mine 2>&1 | grep -qE 'live service reloaded it|applies on the next start' &&
     '$BIN' passwd at-least-8-characters 2>&1 | grep -q 'not a password'
 "
+# install.sh, `adquit update` and `make native` each compile the same C file; if their flags drift, one
+# of the three ships a differently-optimised index and nobody notices until a box is oddly slow.
+check "the data plane builds the same way in all three places" bash -c "
+    grep -qF -- '-O2 -fPIC -shared -Wall -Wextra -pthread' '$REPO/install.sh' &&
+    grep -qF -- '-O2 -fPIC -shared -Wall -Wextra -pthread' '$REPO/bin/adquit' &&
+    grep -qF -- '-O2 -fPIC -shared -Wall -Wextra -pthread' '$REPO/Makefile' &&
+    grep -c 'fetch_native_src' '$REPO/bin/adquit' | grep -qx 4 &&
+    grep -q native_gravity '$REPO/app.py'
+"
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
 "$BIN" stop >/dev/null 2>&1

@@ -76,6 +76,9 @@ fi
 if [ "$KEEP" = "1" ]; then
     say "removing binaries, keeping $HOME_DIR/data"
     rm -f "$HOME_DIR/app.py" "$HOME_DIR/bin/adquit"
+    # and the compiled data plane: a .so left behind is a binary from the *old* source that the next
+    # install would happily reuse instead of compiling the new one
+    rm -rf "${HOME_DIR:?}/lib" "${HOME_DIR:?}/native"
 else
     say "removing $HOME_DIR"
     rm -rf "$HOME_DIR"

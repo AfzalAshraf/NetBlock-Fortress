@@ -36,7 +36,7 @@ Single Python file, three PyPI dependencies, no database, no Docker required.
 | 📢 **Macro-ad blocking** | Display banners, pre/mid-roll video endpoints, pop-unders, interstitials, native “sponsored” units, smart-TV ads, push-notification ads, shopping/affiliate units |
 | 🧠 **Pattern + wildcard engine** | `*.adnetwork.com` zones, ad-infrastructure host labels (`ads.`, `prebid.`, `banner.`…) and 100+ ad-tech keywords — catches brand-new hosts that no list knows yet |
 | 🕳️ **Zero-pixel creative sinkhole** | Optional: sinkhole the ad host to the fortress and answer with an empty GIF/JS/CSS so ad slots collapse instead of hanging on a spinner |
-| ⚡ **Fast by design** | TTL decision cache + upstream response cache, bounded DNS thread pool, UDP **and** TCP DNS, pickled gravity cache (instant restart), conditional-GET feed pulls |
+| ⚡ **Fast by design** | the 4M-rule blocklist lives in a **memory-mapped C index** instead of Python dicts, TTL decision cache + upstream response cache, bounded DNS thread pool, UDP **and** TCP DNS, pickled gravity cache (instant restart), conditional-GET feed pulls |
 | 📊 **Dashboard** | Brave-Shield style analytics, 24 h sparkline, top blocked hosts, per-client inspection, security events, live query log |
 | 🧪 **Coverage matrix** | A page that shows exactly which ad vectors are armed, how many rules back each one, and lets you flip macro/micro/CTV/push/exchange/email coverage with one click |
 | 🔬 **Domain lab** | Type any hostname and watch the 8-layer decision trace: whitelist → feed → wildcard → unbreak → in-video → keyword pattern → label pattern → heuristics |
@@ -398,7 +398,7 @@ blocker and the web server are the same box on purpose.
 * **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
   rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
   compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
-  MIT licence, 96-test offline suite (engine, API, UI, exports, dependency gate,
+  MIT licence, 101-test offline suite (engine, API, UI, exports, dependency gate,
   source hygiene).
 * **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
   `adquit stats` answers even when the web layer is down.
@@ -418,7 +418,8 @@ blocker and the web server are the same box on purpose.
 | `ModuleNotFoundError: No module named 'flask'` (or `dnslib`, `requests`) | You ran `python3 app.py` with a bare interpreter. `adquit doctor` says exactly this and how to fix it; the installer builds a private venv so you never hand-install anything. |
 | `refusing to install app.py v18.0 …` / `no version stamp` | The installer noticed the ref is behind itself and stopped rather than half-installing. Pass `ADQUIT_REF=<branch>` or merge. |
 | `service did not become healthy`, or `state down` while `journalctl` shows the unit running | Almost always a **warm-up**, not a crash: loading a 5M-rule gravity cache takes tens of seconds on a small box, and the health probe used to give up at 15s and stop the service mid-boot. v19.1 sizes the wait from the cache and reports `warming up`. Raise it with `ADQUIT_START_WAIT=<seconds>` (e.g. `sudo env ADQUIT_START_WAIT=300 adquit restart`). |
-| Restart takes as long as a first install | It shouldn't any more: a boot with a valid gravity cache used to rebuild every feed from disk before binding the port. `adquit logs` now says `gravity cache restored ... ready in Ns` instead of `building gravity from 99 enabled feeds`. |
+| Restart takes as long as a first install | It shouldn't any more: a boot with a valid gravity cache used to rebuild every feed from disk before binding the port. `adquit logs` now says `gravity cache restored ... ready in Ns` instead of `building gravity from 99 enabled feeds`. With the native index built (`make native`, or an install/update on a box with a compiler) it says `gravity restored from the native index ... no rows held in python` and the load is a mmap, not an unpickle. |
+| `adquit doctor` says `the index on disk was refused` | The stamps that guard it did not match the feeds (a refresh died mid-write, or the files were edited by hand). It is a rebuild away: `sudo adquit gravity`. |
 | `already up to date - engine vX is byte-identical` | Not an error: your channel has no newer commit. Blocklists are updated separately with `adquit gravity`. |
 | `refusing to downgrade vA -> vB` | The channel genuinely holds an **older** engine than you run (v19.1+ compares content, not just the stamp, so same-version commits update normally). Point `ADQUIT_REF` at the right branch, or `sudo adquit update --force` to allow it. `ADQUIT_FORCE=1` alone does nothing through `sudo` - the environment is reset. |
 | `adquit update` refuses, and the refusal makes no sense | If the CLI on your box predates v19.1 it has no escape hatch of its own: the guard that is misfiring is the one you are running. Re-install in place instead - it refreshes `app.py` **and** the CLI and leaves `data/` (config, custom blocks, allows, lists) alone: `curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/<your-ref>/install.sh \| sudo env ADQUIT_REF=<your-ref> bash` |
@@ -427,6 +428,32 @@ blocker and the web server are the same box on purpose.
 | feeds look dead | `adquit verify-lists` reports which of the 131 sources your box can reach; a dead feed is an error badge, never a breakage. |
 
 ## Notes, limits and honesty
+
+**The data plane is C, and it is optional.** Four million rules held as `dict` entries cost a box
+about **1.5 GB of RAM** that it can never give back, and boot spends seconds unpickling them. The same
+tables as a file mapped read-only cost whatever the page cache can spare — the kernel can reclaim those
+pages under pressure, and it can never reclaim a dict. Measured on this repo's own corpus, on the box
+that builds it:
+
+| | Python dicts | mapped native index |
+|---|---|---|
+| memory for 4.22M rules | ~1,590 MB resident | ~0 MB anonymous (206 MB file, page cache) |
+| load at boot | 2.5 s (unpickle) | ~0.000 s (mmap) |
+| a query nothing blocks | 1,507 ns | 850 ns |
+| a query an exact rule blocks | 248 ns | 618 ns |
+
+Read the last row honestly: a native call is not free, so a *hit* costs about 370 ns more, and a
+*miss* — the commonest answer a resolver gives, since most of the internet is not an ad — costs about
+650 ns less, because the parent walk happens in C without building a substring per label. At LAN query
+rates neither number is visible (and most queries never reach the tables at all, `classify()` answers
+from the decision cache); the memory and the boot time are what you feel, especially on a Pi.
+
+`install.sh` and `adquit update` build `native/adquit_gravity.c` with the system compiler when there is
+one, `-march=native` first and a portable build if that flag is refused. No compiler, a refused build,
+or a stale index all mean the same thing: **the Python path, unchanged** — `adquit doctor` prints which
+plane is live rather than letting a performance feature quietly become a rumour, and
+`sudo adquit set native_gravity false` turns it off deliberately.
+
 
 * This is **DNS-level** blocking. It kills ad traffic at the resolver — including mobile apps,
   smart TVs and consoles — but it cannot re-style a page, so an empty ad box may still be
@@ -448,7 +475,7 @@ blocker and the web server are the same box on purpose.
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline suite (96 engine/API/UI/gate/boot/hygiene tests) + CLI contract
+make test      # offline suite (101 engine/API/UI/gate/boot/hygiene tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 

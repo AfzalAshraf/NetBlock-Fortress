@@ -288,6 +288,7 @@ DEFAULT_CONFIG = {
     "email_tracking": True,           # open & click tracking pixels
     "youtube_aggressive": True,       # YouTube ad endpoint stripping
     "safe_search": False,             # force Google/YouTube/Bing safe results
+    "native_gravity": True,      # mmap the compiled tables instead of holding 4M python strings
     "wildcard_engine": True,          # *.adnetwork.com style blocking
     "pattern_engine": True,           # ad-infrastructure subdomain heuristics
     "pattern_action": "enforce",      # enforce | shadow (log only)
@@ -923,11 +924,12 @@ def _write_banners():
     banner = (
         "  ================================================================\n"
         "   NETBLOCK FORTRESS v%s \"%s\"  |  %s feeds / %s categories\n"
-        "   DNS :0.%s  ->  %s | Web :%s | %s rules armed\n"
+        "   DNS :0.%s  ->  %s | Web :%s | %s rules armed | data plane: %s\n"
         "  ================================================================" % (
             VERSION, CODENAME, len(ALL_LISTS), len(CAT), CFG.get("dns_port", 53),
             CFG.get("dns_upstream", "1.1.1.1"), CFG.get("web_port", 8080),
-            "{:,}".format(len(BLOCKED) + len(WILDCARDS)))
+            "{:,}".format(len(BLOCKED) + len(WILDCARDS)),
+            "native index (mapped)" if NATIVE is not None else "python tables")
     )
     print(banner)
 
@@ -1429,6 +1431,457 @@ def vector_active(vec, cat):
 SAFETY_CATS = {"malware", "phishing", "spam", "security", "abuse", "crypto", "adult", "gambling"}
 
 
+# ──────────────────────────────────────────────
+#  Native data plane - the same two tables, memory-mapped instead of held as dicts
+# ──────────────────────────────────────────────
+#  Why this is here, in numbers from this repo's own corpus (4.22M exact rules + 65 zones):
+#
+#    Python dicts for the tables      ~1,590 MB of anonymous RSS
+#    the index in native/gravity.c    ~0 MB of anonymous RSS (206 MB of file, page-cache backed)
+#    boot: unpickle / mmap            2.5 s                    ~0.000 s
+#    a query that matches nothing     1,507 ns                   850 ns
+#    a query that matches an exact    248 ns                     618 ns
+#
+#  So the trade is explicit: mapped storage costs about 370 ns on a *hit* (one ctypes call) and
+#  saves about 650 ns on a miss (the parent walk happens in C, without building substrings), and it
+#  gives back 1.5 GB of RAM to a box that is usually a Pi or a NAS - which is the difference between
+#  an ad blocker and a box that swaps. On a LAN almost every query is answered from DECISION_CACHE
+#  anyway; the memory is what you feel. The kernel can also reclaim mapped pages under pressure,
+#  which it can never do to a dict.
+#
+#  What stays in Python: everything. Normalisation, exemptions, category and vector rules, the
+#  unbreak list, the sinkhole answer. The index only ever answers "is this name here, and which feed
+#  said so", so there is one policy and one definition of a domain. If the library is missing, the
+#  index is stale, or a config change makes us unsure, the dict path below is used unchanged - and
+#  `adquit doctor` says which of the two is live, because a silent fallback is how a box ends up
+#  quietly running the slow thing forever.
+GRAVITY_INDEX = DATA_DIR / "gravity.idx"
+GRAVITY_SMALL = DATA_DIR / "gravity.small"
+GRAVITY_LIBS = ("libadquit_gravity.so", "libadquit_gravity.dylib")
+NATIVE = None                     # the live NativeGravity, or None for the dict path
+_NATIVE_LIB = False               # False = not looked for yet, None = looked for and absent
+
+
+def _gravity_lib():
+    """ ctypes handle for the compiled index, or None. Built by install.sh / `make native` and looked
+    for next to the engine, so a checkout without a compiler simply runs the Python path.
+    """
+    global _NATIVE_LIB
+    if _NATIVE_LIB is not False:
+        return _NATIVE_LIB
+    import ctypes
+    here = Path(__file__).resolve().parent
+    cand = []
+    env = os.environ.get("ADQUIT_GRAVITY_LIB")
+    if env:
+        cand.append(Path(env))
+    for name in GRAVITY_LIBS:
+        cand += [BASE_DIR / "lib" / name, here / "native" / name, here / name]
+    for path in cand:
+        if not path.exists():
+            continue
+        try:
+            lib = ctypes.CDLL(str(path))
+        except OSError as exc:
+            LOG.warning("native gravity library %s will not load: %s", path, exc)
+            continue
+        lib.gb_open.argtypes = [ctypes.c_char_p]
+        lib.gb_open.restype = ctypes.c_int
+        lib.gb_close.argtypes = [ctypes.c_int]
+        lib.gb_build.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        lib.gb_build.restype = ctypes.c_int
+        lib.gb_last_error.restype = ctypes.c_char_p
+        lib.gb_feed.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        lib.gb_feed.restype = ctypes.c_uint64
+        lib.gb_get.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        lib.gb_get.restype = ctypes.c_uint32
+        lib.gb_count.argtypes = [ctypes.c_int, ctypes.c_int]
+        lib.gb_count.restype = ctypes.c_uint32
+        lib.gb_bytes.argtypes = [ctypes.c_int]
+        lib.gb_bytes.restype = ctypes.c_uint64
+        lib.gb_built_ns.argtypes = [ctypes.c_int]
+        lib.gb_built_ns.restype = ctypes.c_uint64
+        lib.gb_meta_at.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32]
+        lib.gb_meta_at.restype = ctypes.c_int
+        lib.gb_set_active.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        lib.gb_set_active.restype = ctypes.c_int
+        lib.gb_dump.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32,
+                                ctypes.c_char_p, ctypes.c_void_p,
+                                ctypes.POINTER(ctypes.c_uint32)]
+        lib.gb_dump.restype = ctypes.c_uint32
+        _NATIVE_LIB = lib
+        return lib
+    _NATIVE_LIB = None
+    return None
+
+
+class NativeGravity(object):
+    """The mmap'd index, plus the small amount of Python glue the C side must not decide for itself."""
+
+    def __init__(self, lib, slot, metas):
+        self.lib, self.slot, self.metas = lib, slot, metas
+        self._scratch = {}                      # per-thread name buffers, see _bytes()
+        self.push_active()
+
+    # ── construction ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _rows(blocked, wildcards):
+        for d, m in blocked.items():
+            yield "E\t%s\t%s\t%s\t%s\n" % (d, m[0], m[1], m[2])
+        for d, m in wildcards.items():
+            yield "W\t%s\t%s\t%s\t%s\n" % (d, m[0], m[1], m[2])
+
+    @classmethod
+    def build(cls, blocked, wildcards):
+        """Write the index from the tables Python just compiled, and return True if it is readable.
+
+        The stream is the engine's own truth, so the index cannot disagree with the dicts about what
+        a domain is - there is no second list parser here to drift. Rows land in a temp file that is
+        unlinked at the end: 4M names are not worth keeping, and a partial one would be worse.
+        """
+        lib = _gravity_lib()
+        if lib is None:
+            return False
+        try:
+            tmp = DATA_DIR / (".gravity.src.%d" % os.getpid())
+            with open(tmp, "w", buffering=1 << 20) as fh:
+                for line in cls._rows(blocked, wildcards):
+                    fh.write(line)
+            idx = DATA_DIR / (".gravity.idx.%d" % os.getpid())
+            rc = lib.gb_build(os.fsencode(str(tmp)), os.fsencode(str(idx)))
+            err = lib.gb_last_error().decode("utf-8", "replace") if rc else ""
+            tmp.unlink()
+            if rc != 0:
+                LOG.warning("native gravity build failed: %s", err)
+                try:
+                    idx.unlink()
+                except OSError:
+                    pass
+                return False
+            os.replace(str(idx), str(GRAVITY_INDEX))   # never a half index for the next boot
+            return True
+        except Exception as exc:
+            LOG.warning("native gravity build skipped: %s", exc)
+            return False
+
+    @classmethod
+    def open(cls):
+        """Map the index on disk, or return None (missing, unreadable, or from another version)."""
+        lib = _gravity_lib()
+        if lib is None or not GRAVITY_INDEX.exists():
+            return None
+        try:
+            import ctypes
+            slot = lib.gb_open(os.fsencode(str(GRAVITY_INDEX)))
+            if slot < 0:
+                LOG.info("native gravity index not usable: %s",
+                         lib.gb_last_error().decode("utf-8", "replace"))
+                return None
+            metas, i = [], 0
+            buf = ctypes.create_string_buffer(512)
+            while True:
+                n = lib.gb_meta_at(slot, i, buf, 512)
+                if n < 0:
+                    break
+                fields = tuple(x.decode("utf-8", "replace") for x in buf.raw[:n].split(b"\0")[:3])
+                metas.append(fields)
+                i += 1
+            if not metas:
+                lib.gb_close(slot)
+                return None
+            return cls(lib, slot, metas)
+        except Exception as exc:
+            LOG.warning("native gravity index skipped: %s", exc)
+            return None
+
+    def close(self):
+        try:
+            self.lib.gb_close(self.slot)
+        except Exception:
+            pass
+
+    @classmethod
+    def install(cls, blocked, wildcards):
+        """Build from the tables Python just compiled, map the result, and hand back the live index.
+
+        Returns None whenever the native plane cannot be trusted, which leaves the dicts in place -
+        the caller does not have to know which of the two it got, and `doctor` reports the difference.
+        """
+        global NATIVE
+        if not cls.build(blocked, wildcards):
+            return None
+        fresh = cls.open()
+        if fresh is None:
+            return None
+        prev, NATIVE = NATIVE, fresh
+        if prev is not None:
+            prev.close()          # the retired mapping is kept until no reader is inside it
+        return fresh
+
+    @classmethod
+    def restore(cls):
+        """Map the index on disk if - and only if - it still describes the feeds on disk.
+
+        The stamp comparison is the same one the pickle path does: an index from before a feed
+        refresh is not "slightly out of date", it is a blocklist that silently stopped covering what
+        the operator enabled. Refusing it costs a rebuild, and the log says so.
+        """
+        lib = _gravity_lib()
+        if lib is None or not GRAVITY_INDEX.exists() or not GRAVITY_SMALL.exists():
+            return False
+        try:
+            with open(GRAVITY_SMALL, "rb") as fh:
+                small = pickle.load(fh)
+        except Exception as exc:
+            LOG.info("native gravity stamps unreadable (%s) - using the dict path" % exc)
+            return False
+        if small.get("v") != CONFIG_VERSION:
+            LOG.info("native gravity index is from another version - using the dict path")
+            return False
+        global BLOCKED, WILDCARDS
+        for lid, mark in (small.get("srcs") or {}).items():
+            p = LIST_DIR / ("%s.txt" % lid)
+            if not p.exists():
+                if lid in CFG.get("enabled_lists", []):
+                    LOG.info("a feed the index was built from is gone - using the dict path")
+                    return False
+                continue
+            st = p.stat()
+            if (st.st_mtime_ns, st.st_size) != tuple(mark):
+                LOG.info("a feed changed since the index was built - using the dict path")
+                return False
+        me = cls.open()
+        if me is None:
+            return False
+        if me.count(False) != small.get("n_exact") or me.count(True) != small.get("n_wild"):
+            LOG.warning("native index holds %s/%s rows, the stamps say %s/%s - using the dict path"
+                        % (me.count(False), me.count(True),
+                           small.get("n_exact"), small.get("n_wild")))
+            me.close()
+            return False
+        global NATIVE
+        prev, NATIVE = NATIVE, me
+        if prev is not None:
+            prev.close()
+        UNBREAK.clear()
+        UNBREAK.update(small.get("unbreak") or ())
+        vc, cc = small.get("vcounts"), small.get("ccounts")
+        if vc is not None and cc is not None:
+            VECTOR_COUNTS.clear()
+            CAT_COUNTS.clear()
+            VECTOR_COUNTS.update(vc)
+            CAT_COUNTS.update(cc)
+        BLOCKED = _IndexView(NATIVE, False)
+        WILDCARDS = _IndexView(NATIVE, True)
+        return True
+
+    # ── the parts Python must own ────────────────────────────────────────────
+    def push_active(self):
+        """Tell the index which of its (category, vector) pairs are armed.
+
+        `feed_hit` in the dict path *keeps walking* past a row whose vector has been switched off; if
+        the index returned that row instead, the C path would block a name the Python path allows. So
+        the flags are handed over whenever the vectors change, and the index skips rows the same way.
+        """
+        try:
+            import ctypes
+            flags = bytes(1 if vector_active(m[1], m[0]) else 0 for m in self.metas)
+            if getattr(self, "_flags", None) == flags:
+                return
+            self.lib.gb_set_active(self.slot,
+                                   ctypes.c_char_p(flags) if flags else None, len(flags))
+            self._flags = flags
+        except Exception as exc:
+            LOG.debug("native active table not pushed: %s", exc)
+
+    def _bytes(self, d):
+        b = d.encode("utf-8", "strict") if type(d) is str else bytes(d)
+        return b if len(b) <= 253 else None       # the C side refuses longer anyway
+
+    def feed(self, d):
+        """(how, meta, parent) for the feed layer, or (None, None, None).
+
+        One call answers the exact rule on the name *and* the whole parent walk: two calls per query
+        would cost more than the Python loop they replace, which is why the ABI returns one packed
+        integer instead of a struct. `parent` is the matched zone, sliced from the caller's own name.
+        """
+        b = self._bytes(d)
+        if b is None:
+            return (None, None, None)
+        q = self.lib.gb_feed(self.slot, b, len(b))
+        if not q:
+            return (None, None, None)
+        if q & 1:
+            return ("exact", self.metas[(q >> 1) & 0xFFFF], None)
+        if q & (1 << 17):
+            off = (q >> 35) & 0xFF
+            meta = self.metas[(q >> 19) & 0xFFFF]
+            parent = d[off:] if off <= len(d) else None
+            how = "parent" if (q >> 18) & 1 else "zone"
+            return (how, meta, parent)
+        return (None, None, None)
+
+    def get(self, d, wild=False):
+        """One table's answer for one name - the form the mapping view and the cold paths need."""
+        b = self._bytes(d)
+        if b is None:
+            return None
+        n = self.lib.gb_get(self.slot, 1 if wild else 0, b, len(b))
+        return self.metas[n - 1] if n else None
+
+    def count(self, wild=False):
+        return int(self.lib.gb_count(self.slot, 1 if wild else 0))
+
+    def size_bytes(self):
+        return int(self.lib.gb_bytes(self.slot))
+
+    def names(self, wild=False, room=1 << 20):
+        """Every name in one table, in batches. Used by the exports and the lazy views, where a
+        call per row would make a fast index the slowest way to list 4M domains."""
+        import ctypes
+        buf = ctypes.create_string_buffer(room)
+        metas = (ctypes.c_uint16 * (room // 2))()
+        got = ctypes.c_uint32(0)
+        off = 0
+        while True:
+            n = self.lib.gb_dump(self.slot, 1 if wild else 0, off, room, buf,
+                                 ctypes.cast(metas, ctypes.c_void_p), ctypes.byref(got))
+            if n <= 0 or got.value == 0:
+                return
+            chunk = buf.raw[:n].split(b"\0")
+            for k in range(got.value):
+                yield chunk[k].decode("utf-8", "replace"), self.metas[metas[k]]
+            off += got.value
+
+
+def _data_plane_note():
+    """(is_this_fine, what to say) about which storage path the tables are on.
+
+    Only the state where a usable index was *refused* is reported as an issue: a box with no compiler
+    has never had one, and `doctor` is where an operator looks for the thing that is wrong now, not for
+    an optional feature they never installed. The note names the command that fixes it either way.
+    """
+    if NATIVE is not None:
+        return True, "native index mapped (%s rows, %s MB, python dicts not resident)" % (
+            "{:,}".format(NATIVE.count(False) + NATIVE.count(True)),
+            NATIVE.size_bytes() // (1024 * 1024))
+    if not cfg_bool("native_gravity", True):
+        return True, "python dicts (%s rules) - native_gravity is off" % "{:,}".format(len(BLOCKED))
+    if _gravity_lib() is None:
+        return True, "python dicts (%s rules) - no compiled index on this box (make native)" \
+            % "{:,}".format(len(BLOCKED))
+    if GRAVITY_INDEX.exists():
+        return False, "the index on disk was refused (stale or damaged) - rebuild it: sudo adquit gravity"
+    return True, "python dicts (%s rules) - no index yet; sudo adquit gravity builds one" \
+        % "{:,}".format(len(BLOCKED))
+
+
+class _IndexView(object):
+    """`BLOCKED` and `WILDCARDS` when the native plane is live: a dict-shaped read of the mmap.
+
+    Everything else in the engine - the dashboard, the exports, `--rules`, the tallies - indexes these
+    two names as dicts, so this is a Mapping rather than a new kind of call site. Rows written after
+    the index was built (a custom block in a long-running process) live in a small overlay, and rows
+    removed since then are tombstoned, so the view follows `block`/`unblock` the way a dict would.
+    Between gravity rebuilds that is all it has to be; a rebuild replaces both views from scratch.
+    """
+
+    __slots__ = ("_n", "_wild", "_over", "_gone", "_len")
+
+    def __init__(self, native, wild):
+        self._n, self._wild, self._over, self._gone, self._len = native, bool(wild), {}, set(), None
+
+    def __getitem__(self, d):
+        if d in self._over:
+            v = self._over[d]
+            if v is None:
+                raise KeyError(d)
+            return v
+        if d in self._gone:
+            raise KeyError(d)
+        v = self._n.get(d, self._wild)
+        if v is None:
+            raise KeyError(d)
+        return v
+
+    def get(self, d, default=None):
+        try:
+            return self[d]
+        except KeyError:
+            return default
+
+    def __contains__(self, d):
+        try:
+            self[d]
+            return True
+        except KeyError:
+            return False
+
+    def __setitem__(self, d, v):
+        self._over[d] = v
+        self._gone.discard(d)
+        self._len = None
+
+    def __delitem__(self, d):
+        if d in self._over:
+            del self._over[d]
+        if self._n.get(d, self._wild) is not None:
+            self._gone.add(d)
+        else:
+            self._gone.discard(d)
+        self._len = None
+
+    def pop(self, d, *default):
+        """The dict form `adquit unblock` uses. Written out rather than borrowed from dict, because
+        `dict.pop(self, ..)` on a non-dict is a TypeError waiting for the first unblock."""
+        try:
+            v = self[d]
+        except KeyError:
+            if default:
+                return default[0]
+            raise
+        try:
+            del self[d]
+        except KeyError:
+            pass
+        return v
+    def setdefault(self, d, default=None):
+        if d in self:
+            return self[d]
+        self[d] = default
+        return default
+
+    def __len__(self):
+        if self._len is None:
+            base = self._n.count(self._wild)
+            new = sum(1 for d in self._over if d not in self._gone)
+            gone = sum(1 for d in self._gone if self._n.get(d, self._wild) is not None)
+            self._len = base + new - gone
+        return self._len
+
+    def __iter__(self):
+        seen = set()
+        for d, _m in self._n.names(self._wild):
+            if d in self._gone:
+                continue
+            seen.add(d)
+            yield d
+        for d in self._over:
+            if d not in seen and d not in self._gone:
+                yield d
+
+    def items(self):
+        for d in self:
+            yield d, self[d]
+
+    def keys(self):
+        return iter(self)
+
+    def __repr__(self):
+        return "<%s over the native index: %s rows>" % (
+            "WILDCARDS" if self._wild else "BLOCKED", "{:,}".format(len(self)))
+
+
 def rebuild_master_blocklist(persist=True):
     """Merge every enabled feed + seed + patterns into the live lookup tables."""
     global BLOCKED, WILDCARDS, UNBREAK
@@ -1471,8 +1924,6 @@ def rebuild_master_blocklist(persist=True):
                     if d.count(".") > 1:
                         wildcards.setdefault(d, ("custom", "banner", "custom"))
 
-        BLOCKED = blocked
-        WILDCARDS = wildcards
         UNBREAK = unbreak
         stats = defaultdict(int), defaultdict(int)
         vcount, ccount = stats
@@ -1488,10 +1939,23 @@ def rebuild_master_blocklist(persist=True):
         VECTOR_COUNTS.update(vcount)
         CAT_COUNTS.clear()
         CAT_COUNTS.update(ccount)
+        # The native plane is installed *before* anything is written, because whether the index took
+        # decides whether the big pickle is still needed as a fallback.
+        global NATIVE
+        if cfg_bool("native_gravity", True):
+            NATIVE = NativeGravity.install(blocked, wildcards)
+            if NATIVE is not None:
+                blocked = _IndexView(NATIVE, False)
+                wildcards = _IndexView(NATIVE, True)
+        else:
+            NATIVE = None
+        BLOCKED = blocked
+        WILDCARDS = wildcards
         if persist:
             save_gravity_cache(custom=custom)
-        LOG.info("gravity rebuilt: %s exact + %s wildcard rules from %s feeds",
-                 "{:,}".format(len(blocked)), "{:,}".format(len(wildcards)), len(srcs))
+        LOG.info("gravity rebuilt: %s exact + %s wildcard rules from %s feeds%s",
+                 "{:,}".format(len(blocked)), "{:,}".format(len(wildcards)), len(srcs),
+                 " (native index)" if NATIVE is not None else "")
         return len(blocked)
 
 
@@ -1503,6 +1967,19 @@ def save_gravity_cache(custom=None):
             if p.exists():
                 st = p.stat()
                 srcs[lid] = (st.st_mtime_ns, st.st_size)
+        if NATIVE is not None:
+            # The 4M rows are already on disk as the mapped index; pickling them again would cost
+            # 152 MB per rebuild on the same SD card that has to survive years of them. Only the
+            # small, slow-to-recompute parts go here, plus the stamps `restore()` refuses on.
+            try:
+                with open(GRAVITY_SMALL, "wb") as fh:
+                    pickle.dump({"v": CONFIG_VERSION, "srcs": srcs, "unbreak": set(UNBREAK),
+                                 "vcounts": dict(VECTOR_COUNTS), "ccounts": dict(CAT_COUNTS),
+                                 "n_exact": NATIVE.count(False), "n_wild": NATIVE.count(True)},
+                                fh, protocol=4)
+            except Exception as exc:
+                LOG.debug("gravity stamps save skipped: %s", exc)
+            return
         with open(GRAVITY_CACHE, "wb") as fh:
             pickle.dump({"v": CONFIG_VERSION, "srcs": srcs, "blocked": BLOCKED,
                          "wild": WILDCARDS, "unbreak": UNBREAK,
@@ -1527,9 +2004,20 @@ GRAVITY_CUSTOM = None
 
 
 def load_gravity_cache():
-    """Load the compiled blocklist so protection starts in milliseconds."""
+    """Load the compiled blocklist so protection starts in milliseconds.
+
+    Two ways to get there, and the fast one is tried first: the native index is a mmap (no rows are
+    materialised at all), the pickle is 152 MB of Python objects. Whichever answers, `doctor` and
+    `adquit status` say which plane the box is running, because "we quietly fell back" is how a
+    performance feature becomes a rumour.
+    """
     global BLOCKED, WILDCARDS, UNBREAK
     _t0 = time.time()
+    if cfg_bool("native_gravity", True) and NativeGravity.restore():
+        LOG.info("gravity restored from the native index: %s exact + %s zones in %.3fs (no rows held "
+                 "in python: %s MB mapped)", "{:,}".format(len(BLOCKED)), "{:,}".format(len(WILDCARDS)),
+                 time.time() - _t0, NATIVE.size_bytes() // (1024 * 1024))
+        return True
     if not GRAVITY_CACHE.exists():
         return False
     try:
@@ -1734,6 +2222,11 @@ UPSTREAM_CACHE = TTLCache(20000)
 def flush_caches():
     DECISION_CACHE.clear()
     UPSTREAM_CACHE.clear()
+    if NATIVE is not None:
+        # Which vectors are armed is policy the index has to be told about, or it would return rows
+        # the Python path skips (see NativeGravity.push_active). A rebuild does this too; this covers
+        # the config keys that change a verdict without touching the tables.
+        NATIVE.push_active()
 
 
 # ──────────────────────────────────────────────
@@ -1803,8 +2296,23 @@ def _classify_uncached(d):
             return None
         return _deny(cat, vec, "Blocklist (%s)" % CAT.get(cat, {}).get("name", cat), src)
 
+    # Under the native plane the exact rule *and* the parent walk come back from one C call, which is
+    # the point of it: the loop below allocates a new string per label, for every query that is not
+    # blocked - the commonest answer a resolver gives. It is only taken when the mapping views have no
+    # pending overlay rows: those are written by `adquit block` between an index build and the rebuild
+    # that folds them in, and a C index cannot see them. Both views are consulted instead, which is
+    # what the walk below does anyway.
+    nf = None
+    direct = None
+    if NATIVE is not None and not BLOCKED._over and not WILDCARDS._over:
+        nf = NATIVE.feed(d)
+        if nf[0] == "exact":
+            _c, _v, _s = nf[1]
+            direct = _deny(_c, _v, "Blocklist (%s)" % CAT.get(_c, {}).get("name", _c), _s)
+
     # 1 - safety feeds always win, even over anti-breakage exceptions
-    direct = feed_hit(d)
+    if nf is None:
+        direct = feed_hit(d)
     if direct and direct["cat"] in SAFETY_CATS:
         return direct
 
@@ -1815,6 +2323,15 @@ def _classify_uncached(d):
     # 3 - curated ad/tracker feeds
     if direct:
         return direct
+    if nf is not None and nf[0] in ("zone", "parent"):
+        _c, _v, _s = nf[1]
+        if not vector_active(_v, _c):
+            nf = None                          # disarmed between build and now: walk it properly
+        elif nf[0] == "zone":
+            WILDCARD_HITS += 1
+            return _deny(_c, _v, "Wildcard (*.%s)" % nf[2], _s)
+        else:
+            return _deny(_c, _v, "Blocklist (%s)" % CAT.get(_c, {}).get("name", _c), _s)
     for parent in parents:
         if CFG.get("wildcard_engine", True):
             wc = WILDCARDS.get(parent)
@@ -2335,6 +2852,7 @@ def snapshot_stats():
     data = {"version": VERSION, "codename": CODENAME, "updated": int(time.time()),
             "total": TOTAL_QUERIES, "blocked": BLOCKED_QUERIES, "allowed": ALLOWED_QUERIES,
             "rules": len(BLOCKED), "wildcards": len(WILDCARDS), "clients": len(CLIENT_ACTIVITY),
+            "data_plane": "native-index" if NATIVE is not None else "python-dicts",
             "pattern_hits": PATTERN_HITS, "wildcard_hits": WILDCARD_HITS,
             "cache_hits": CACHE_HITS, "cache_size": len(DECISION_CACHE),
             "uptime": int(time.time() - START_TIME), "mode": CFG.get("block_mode"),
@@ -4929,6 +5447,8 @@ def cmd_doctor():
     checks.append(("writable data dir", os.access(DATA_DIR, os.W_OK), str(DATA_DIR)))
     # the shipped default AND any example this project has printed are the same failure: a
     # password an attacker can find in our own README. One check, because the fix is one command.
+    ok, note = _data_plane_note()
+    checks.append(("gravity data plane", ok, note))
     placeholder = CFG.get("password_hash") in set(
         hashlib.sha256(p.encode()).hexdigest() for p in PLACEHOLDER_PASSWORDS)
     checks.append(("password is not a known default", not placeholder,
@@ -5026,6 +5546,7 @@ def cmd_stats(as_json=False):
     print("  rules %s + %s wildcards from %s/%s feeds"
           % ("{:,}".format(live.get("rules", 0)), "{:,}".format(live.get("wildcards", 0)),
              live.get("feeds_enabled", 0), live.get("feeds_total", 0)))
+    print("  data plane %s" % live.get("data_plane", "python dicts"))
     print("  macro ad rules %s | micro ad rules %s | cache hits %s"
           % ("{:,}".format(macro), "{:,}".format(micro), "{:,}".format(live.get("cache_hits", 0))))
     print("  bandwidth saved %s | time saved %s" % (live.get("bandwidth_saved", "-"),

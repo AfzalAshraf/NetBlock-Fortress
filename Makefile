@@ -8,7 +8,7 @@
 PY ?= python3
 HERE := $(shell pwd)
 
-.PHONY: help test lint run install user-install uninstall update gravity clean docker docker-run release verify-lists
+.PHONY: help test native lint run install user-install uninstall update gravity clean docker docker-run release verify-lists
 
 help:
 	@printf "NetBlock Fortress v19 targets:\n"
@@ -22,7 +22,16 @@ help:
 	@printf "  make docker        build the container image\n"
 	@printf "  make clean         remove caches and local run state\n"
 
-test:
+# The C data plane is optional in the product but not in the tests: with a compiler the suite drives
+# the mapped index, without one it drives the python tables, and both paths have to pass. Building it
+# here (rather than only in the test that needs it) means `make test` covers the same thing CI covers.
+native:
+	@if command -v $${CC:-cc} >/dev/null 2>&1; then \
+	    $${CC:-cc} -O2 -fPIC -shared -Wall -Wextra -pthread -o native/libadquit_gravity.so \
+	        native/adquit_gravity.c && echo "  native data plane built"; \
+	else echo "  (no C compiler - the suite will exercise the python tables)"; fi
+
+test: native
 	@ADQUIT_NO_PIP=1 $(PY) tests/run_tests.py
 	@bash tests/test_cli.sh
 
@@ -33,6 +42,8 @@ SH = install.sh uninstall.sh bin/adquit $(wildcard tests/*.sh)
 
 lint:
 	@$(PY) -m py_compile app.py && echo "  python ok"
+	@if command -v $${CC:-cc} >/dev/null 2>&1; then \
+	    $${CC:-cc} -fsyntax-only -Wall -Wextra -pthread native/adquit_gravity.c && echo "  c ok"; fi
 	@for f in $(SH); do bash -n $$f && echo "  shell ok: $$f"; done
 	@command -v shellcheck >/dev/null 2>&1 && shellcheck -S warning $(SH) || echo "  (shellcheck not installed - skipped)"
 

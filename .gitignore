@@ -7,3 +7,7 @@ venv/
 .opt/
 *.tmp
 gravity.cache
+gravity.idx
+gravity.small
+native/*.so
+native/*.o

@@ -226,6 +226,7 @@ fetch_repo() { # download app.py + adquit into HOME_DIR
             if [ -f "$root/app.py" ]; then
                 atomic_install "$root/app.py" "$dest/app.py" 0755 || true
                 [ -f "$root/bin/adquit" ] && install -D -m 0755 "$root/bin/adquit" "$dest/bin/adquit"
+                fetch_native_src "$root" "$dest"
                 rm -rf "$tmp"; return 0
             fi
         fi
@@ -233,6 +234,7 @@ fetch_repo() { # download app.py + adquit into HOME_DIR
     if have curl && curl -fsSL --max-time 60 "$RAW_BASE/app.py" -o "$dest/app.py" 2>/dev/null; then
         curl -fsSL --max-time 30 "$RAW_BASE/bin/adquit" -o "$dest/bin/adquit" 2>/dev/null || true
         chmod 0755 "$dest/bin/adquit" 2>/dev/null || true
+        fetch_native_src "" "$dest"
         return 0
     fi
     have git || { rm -rf "$tmp"; die "need curl or git to download the fortress"; }
@@ -240,7 +242,53 @@ fetch_repo() { # download app.py + adquit into HOME_DIR
         || { rm -rf "$tmp"; die "git clone of $REPO failed"; }
     atomic_install "$tmp/clone/app.py" "$dest/app.py" 0755
     [ -f "$tmp/clone/bin/adquit" ] && install -D -m 0755 "$tmp/clone/bin/adquit" "$dest/bin/adquit"
+    fetch_native_src "$tmp/clone" "$dest"
     rm -rf "$tmp"
+}
+
+fetch_native_src() { # the C source for the optional data plane, best-effort: without it the engine
+                     # holds the blocklist as python tables, which is slower and costs ~1.5 GB on a
+                     # 4M-rule box. A failure here must never fail the update.
+    local root="${1:-}" dest="$HOME_DIR/native"
+    if [ -n "$root" ] && [ -f "$root/native/adquit_gravity.c" ]; then
+        mkdir -p "$dest" 2>/dev/null || true
+        install -m 0644 "$root/native/adquit_gravity.c" "$dest/adquit_gravity.c" && return 0
+    fi
+    [ -f "$dest/adquit_gravity.c" ] && return 0
+    have curl || return 0
+    mkdir -p "$dest" 2>/dev/null || return 0
+    curl -fsSL --max-time 30 "$RAW_BASE/native/adquit_gravity.c" -o "$dest/adquit_gravity.c" \
+        2>/dev/null || rm -f "$dest/adquit_gravity.c"
+    return 0
+}
+
+build_data_plane() { # compile the mapped index if this box can build it. -march=native first, because
+                     # the point of a native lookup path is the cpu it runs on; a plain build after,
+                     # because a compiler that does not know that flag is not a reason to lose the
+                     # index - and a build that fails leaves the python tables in place, on purpose.
+    local src="$HOME_DIR/native/adquit_gravity.c" out="$HOME_DIR/lib/libadquit_gravity.so"
+    local ccbin flags w rc
+    [ -f "$src" ] || return 0
+    ccbin="${CC:-$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)}"
+    if [ -z "$ccbin" ]; then
+        note "data plane: python tables (no C compiler here - install gcc to map the blocklist)"
+        return 0
+    fi
+    flags="-O2 -fPIC -shared -Wall -Wextra -pthread"
+    mkdir -p "$(dirname "$out")" 2>/dev/null || return 0
+    if "$ccbin" $flags -march=native -o "$out" "$src" >/dev/null 2>&1; then
+        say "data plane: native index, built for this cpu"
+        return 0
+    fi
+    w="$("$ccbin" $flags -o "$out" "$src" 2>&1)"; rc=$?
+    if [ "$rc" = 0 ]; then
+        [ -n "$w" ] && warn "the compiler said: $w"
+        say "data plane: native index (portable build - this compiler refused -march=native)"
+    else
+        rm -f "$out"
+        note "data plane: python tables (the index did not build on this box)"
+    fi
+    return 0
 }
 
 ensure_deps() {
@@ -397,6 +445,7 @@ cmd_install() {
     else
         fetch_repo "$HOME_DIR"
     fi
+    build_data_plane
     if [ ! -d "$HOME_DIR/venv" ] && have python3; then
         say "creating a private virtualenv"
         python3 -m venv "$HOME_DIR/venv" >/dev/null 2>&1 || true
@@ -810,6 +859,7 @@ cmd_update() {
     fi
     if [ ! -f "$origin" ]; then origin="$APP.pre-update"; cp -f "$APP" "$origin" 2>/dev/null || true; fi
     fetch_repo "$HOME_DIR"
+    build_data_plane
 
     # The judgement below lives in the CLI you already have - which is a trap: a
     # stale or buggy guard can refuse the very update that would fix it, and no
