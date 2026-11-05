@@ -396,6 +396,41 @@ check "the data plane builds the same way in all three places" bash -c "
     grep -c 'fetch_native_src' '$REPO/bin/adquit' | grep -qx 4 &&
     grep -q native_gravity '$REPO/app.py'
 "
+# The kernel layer has to be driveable from the CLI without root, without nftables and without a
+# single packet rule being installed - that is the whole "safe to enable by default" claim, tested.
+check "adquit net reports without root or a kernel" bash -c "
+    '$BIN' net status 2>&1 | grep -q 'Kernel layer' &&
+    '$BIN' net status 2>&1 | grep -qE 'needs-root|no nft|net_enforce is off|not installed|nothing installed'
+"
+check "adquit net dry-run writes the script and installs nothing" bash -c "
+    '$BIN' net dry-run 2>&1 | grep -q 'table inet adquit' &&
+    '$BIN' net dry-run 2>&1 | grep -q 'ct state established,related accept' &&
+    ! '$BIN' net dry-run 2>&1 | grep -q 'hook input' &&
+    grep -q 'daddr {' '$ADQUIT_HOME/data/net/adquit.nft' &&
+    test ! -e '$ADQUIT_HOME/data/net/nft.state'
+"
+check "adquit net refuses an invented subcommand and explains an address" bash -c "
+    '$BIN' net explain 8.8.8.8 2>&1 | grep -qE 'allow|block' &&
+    '$BIN' net wat >/dev/null 2>&1; test \$? -ne 0
+"
+check "adquit harden status works unprivileged" bash -c "
+    '$BIN' harden status 2>&1 | grep -q 'Kernel hardening' &&
+    '$BIN' harden status 2>&1 | grep -q rp_filter
+"
+# one implementation of the sysctl list, and both directions of the kernel state covered
+check "the installers do not keep a second copy of the hardening" bash -c "
+    grep -q 'bin/adquit.*harden on' '$REPO/install.sh' &&
+    ! grep -q 'net.ipv4.conf.all.rp_filter' '$REPO/install.sh' &&
+    grep -q 'sysctl.d/99-adquit.conf' '$REPO/uninstall.sh' &&
+    grep -q 'nft delete table inet adquit' '$REPO/uninstall.sh' &&
+    grep -q 'run/adquit-net-watch' '$REPO/uninstall.sh'
+"
+check "the IP feeds are registered and EDROP stays opt-in" bash -c "
+    grep -q saa_adonly '$REPO/app.py' &&
+    grep -q spamhaus_edrop '$REPO/app.py' &&
+    grep -q parse_surge_bytes '$REPO/app.py' &&
+    ! grep -A2 'spamhaus_edrop' '$REPO/app.py' | grep -q ', 1)'
+"
 check "adquit doctor reports"               bash -c "$BIN doctor | grep -q 'issue' "
 check "adquit json is valid json"           bash -c "$BIN json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
 "$BIN" stop >/dev/null 2>&1
