@@ -311,7 +311,17 @@ kind of reason: it buys nothing here and it breaks wheels that mmap executable m
 
 **Dashboard** — `http://<box-ip>:8080`, login `admin` / the password printed at install
 (`adquit passwd --show` while that one is still current, `adquit passwd` to set a new one). Pages: Dashboard · Security Center · Blocklists · **Ad Coverage
-Matrix** · **Domain Lab** · Protection Modes · Live Query Logs · Custom Rules · Settings.
+Matrix** · **Domain Lab** · Protection Modes · Live Query Logs · Custom Rules · Settings. A box with no
+clients on it yet opens on a card that says so and prints the address to point at — the instructions
+live next to the state that makes them true, rather than in a page nobody opens.
+
+**Which devices are behind it** — *Security Center → Client Inspection*: every address that has asked
+this resolver a question since it started, with its totals, block ratio, last sighting and the five names
+it asked about most. That is what a DNS filter can honestly know: a query carries no hostname and no
+device identity, so a device that has not queried yet is not in the list, one pointed at another resolver
+is invisible to *every* DNS filter, and a laptop that roams off the Wi-Fi keeps its old row until it ages
+out. Nothing here scans the LAN — `adquit lan` prints the addresses this box answers on, and
+`adquit site list` / `adquit lan-zone` the names it resolves for it.
 
 **Protect your network** — set your router’s DNS (IPv4) to the fortress IP. Every device —
 phones, TVs, consoles, laptops — is covered with zero per-device setup, including apps where
@@ -492,7 +502,7 @@ blocker and the web server are the same box on purpose.
 * **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
   rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
   compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
-  MIT licence, 128-test offline suite (engine, API, UI, exports, dependency gate,
+  MIT licence, 131-test offline suite (engine, API, UI, exports, dependency gate,
   source hygiene).
 * **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
   `adquit stats` answers even when the web layer is down.
@@ -570,7 +580,7 @@ plane is live rather than letting a performance feature quietly become a rumour,
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline suite (128 engine/API/UI/gate/boot/hygiene/kernel tests) + CLI contract
+make test      # offline suite (131 engine/API/UI/gate/boot/hygiene/kernel tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 

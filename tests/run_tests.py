@@ -492,6 +492,72 @@ class TestWebSurface(unittest.TestCase):
             res = self.client.get(path)
             self.assertEqual(res.status_code, 200, "%s -> %s" % (path, res.status_code))
 
+    def test_no_placeholder_escapes_the_template(self):
+        """A Jinja variable written with one pair of braces renders as its own name.
+
+        `DNS Active (:{ dns_port })` sat in the sidebar like that for a release: harmless-looking,
+        permanently unfilled, and a lie on top - the green dot next to it never moved whether the
+        resolver had bound its port or not. Both halves are pinned here, because a template that
+        quietly prints its own source is a bug no API test can see.
+        """
+        self.login()
+        leaked = re.compile(r"(?<!\{)\{ ?[a-z_][a-z0-9_]* ?\}(?!\})")
+        for path in ("/", "/security", "/coverage", "/blocklists", "/modes", "/logs",
+                     "/custom", "/settings", "/lab"):
+            body = self.client.get(path).data.decode("utf-8", "replace")
+            hit = leaked.search(body)
+            self.assertIsNone(hit, "%s printed a raw placeholder: %r" % (path, hit and hit.group(0)))
+            self.assertNotIn("{{", body, "%s has an unrendered Jinja expression" % path)
+            self.assertNotIn("{%", body, "%s has an unrendered Jinja tag" % path)
+
+    def test_the_shell_reports_the_resolver_as_it_is(self):
+        """`DNS Active` while the port is held by something else is worse than no indicator."""
+        self.login()
+        self.assertNotIn("DNS NOT answering", self.client.get("/").data.decode())
+        saved = nb.CFG.get("dns_bind_error")
+        nb.CFG["dns_bind_error"] = "Address already in use"
+        try:
+            body = self.client.get("/").data.decode()
+            self.assertIn("DNS NOT answering", body)
+            self.assertIn("The resolver is not listening", body)
+            self.assertIn("Address already in use", body)
+            self.assertIn("adquit doctor", body, "it has to say what to do, not just that it is bad")
+        finally:
+            if saved is None:
+                nb.CFG.pop("dns_bind_error", None)
+            else:
+                nb.CFG["dns_bind_error"] = saved
+        self.assertNotIn("DNS NOT answering", self.client.get("/").data.decode())
+
+    def test_an_idle_box_says_how_to_make_it_not_idle(self):
+        """Zero clients is the state a fresh install is actually in, and the page used to be silent
+        about it - the numbers all read 0 and nothing told the operator the first thing to do."""
+        self.login()
+        saved = dict(nb.CLIENT_ACTIVITY)
+        nb.CLIENT_ACTIVITY.clear()
+        try:
+            body = self.client.get("/").data.decode()
+            self.assertIn("Nothing is asking this box yet", body)
+            self.assertIn("adquit lan", body)
+            # an address is only worth printing if a neighbour could reach it
+            nb.CFG["sinkhole_ip"] = "10.20.30.40"
+            body = self.client.get("/").data.decode()
+            self.assertIn("10.20.30.40:%s" % nb.CFG.get("dns_port", 53), body,
+                          "the address and port to point a device at have to be on the page")
+            nb.CFG["sinkhole_ip"] = "169.254.7.7"
+            body = self.client.get("/").data.decode()
+            self.assertNotIn("169.254.7.7", body,
+                             "a link-local address must not be offered as something to type into a router")
+            self.assertIn("adquit lan", body)
+            nb.CFG.pop("sinkhole_ip", None)
+            nb.CLIENT_ACTIVITY["10.0.0.9"] = {"total": 4, "blocked": 1, "last_seen": 0.0,
+                                             "threats": 0, "ads": 1, "names": {}}
+            self.assertNotIn("Nothing is asking this box yet", self.client.get("/").data.decode(),
+                             "the hint is a first-run card, not a permanent banner")
+        finally:
+            nb.CLIENT_ACTIVITY.clear()
+            nb.CLIENT_ACTIVITY.update(saved)
+
     def test_unauth_api_rejected(self):
         res = nb.app.test_client().get("/api/stats")
         self.assertIn(res.status_code, (401, 302))

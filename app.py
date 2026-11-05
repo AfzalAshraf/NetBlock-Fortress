@@ -4388,6 +4388,11 @@ def dns_udp_worker():
         CFG["dns_bind_error"] = str(exc)
         save_config()
         return
+    if CFG.pop("dns_bind_error", None) is not None:
+        # It lives in config.json so `doctor` can explain a dead service after a restart - which also
+        # means a bind that failed once would keep the dashboard promising "DNS Active" forever, on a
+        # box that is now answering queries fine. A successful bind clears the claim in both directions.
+        save_config()
     _udp_sock = sock
     DNS_POOL = ThreadPoolExecutor(max_workers=max(4, int(CFG.get("dns_workers", 32))))
     LOG.info("DNS ready on 0.0.0.0:%s (udp+tcp, %s workers)", port,
@@ -4877,6 +4882,8 @@ def render_page(tpl, nav, page_title="Dashboard", msg="", msg_type="ok", **kw):
     ctx = dict(a=nav, page_title=page_title, title=page_title, msg=msg, msg_type=msg_type,
                blocked_count=BLOCKED_QUERIES, rules_total=len(BLOCKED) + len(WILDCARDS),
                dns_port=CFG.get("dns_port", 53), web_port=CFG.get("web_port", 8080),
+               dns_ok=not CFG.get("dns_bind_error"),
+               dns_hint=str(CFG.get("dns_bind_error") or "").strip(),
                version=VERSION, codename=CODENAME, mode=CFG.get("block_mode", "strict"),
                mode_name=(MODES.get(CFG.get("block_mode", "strict"), MODES["strict"]))["name"],
                feeds=len(CFG.get("enabled_lists", [])), cat_count=len(CAT),
@@ -5100,7 +5107,7 @@ input:checked+.sl2:before{transform:translateX(18px)}
 <a class="ni {% if a=='sett' %}active{% endif %}" href="/settings"><i class="fa-solid fa-gear"></i> Settings</a>
 </div>
 <div class="sf">
-<div style="font-size:11px;color:var(--mut)"><i class="fa-solid fa-circle" style="color:var(--grn);font-size:8px"></i> DNS Active (:{ dns_port })</div>
+<div style="font-size:11px;color:var(--mut)"><i class="fa-solid fa-circle" style="color:var({{ '--grn' if dns_ok else '--red' }});font-size:8px"></i> {% if dns_ok %}DNS answering UDP :{{ dns_port }}{% else %}DNS NOT answering :{{ dns_port }}{% endif %}</div>
 <a class="lo" href="/logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
 </div></div>
 <div class="main">
@@ -5133,6 +5140,23 @@ PAGE_DASH = """
 <div class="sl">Time Saved</div><div class="sv" style="color:var(--sec)">{{ time_saved }}</div>
 <div class="ss">~1.5s / blocked tracker</div></div>
 </div>
+{% if not dns_ok or client_count == 0 %}<div class="card"{% if not dns_ok %} style="border-color:rgba(239,68,68,.45)"{% endif %}>
+<div class="ch"><div class="ct"><i class="fa-solid fa-{{ 'triangle-exclamation' if not dns_ok else 'route' }}" style="color:var({{ '--red' if not dns_ok else '--yel' }})"></i> {% if not dns_ok %}The resolver is not listening{% else %}Nothing is asking this box yet{% endif %}</div></div>
+<div style="font-size:13px;line-height:1.75;color:var(--mut)">
+{% if not dns_ok %}
+UDP/{{ dns_port }} is taken, so no device can be blocked from here until that changes.{% if dns_hint %} The bind said: <code>{{ dns_hint }}</code>.{% endif %}
+<code>sudo adquit doctor</code> names whatever owns the port (systemd-resolved is the usual one, and
+<code>sudo adquit protect</code> hands it over); <code>adquit set dns_port 5353</code> moves the fortress
+instead - but then no client will find it unless you tell them where it lives.
+{% else %}
+Blocking starts when a device sends its DNS here, and none has yet. Point your router's DNS at
+{% if box_ip %}<code>{{ box_ip }}:{{ dns_port }}</code> to cover the house, or set it on one device
+first and watch <code>/logs</code> fill up.{% else %}this box&rsquo;s LAN address &mdash;
+<code>adquit lan</code> prints it, because the address a box sends traffic out on is not always one a
+neighbour can reach &mdash; then watch <code>/logs</code> fill up.{% endif %}
+<code>sudo adquit protect</code> does it for this machine alone.
+{% endif %}
+</div></div>{% endif %}
 <div style="display:grid;grid-template-columns:2fr 1fr;gap:20px;margin-bottom:20px">
 <div class="card" style="margin-bottom:0"><div class="ch">
 <div class="ct"><i class="fa-solid fa-shield-virus" style="color:var(--pri)"></i> Threat Category Distribution</div></div>
@@ -5204,6 +5228,11 @@ PAGE_SEC = """
 <div class="ct"><i class="fa-solid fa-network-wired"></i> Client Inspection</div></div>
 <table class="tbl"><thead><tr>
 <th>IP</th><th>Total</th><th>Threats</th><th>Block Ratio</th><th>Last Seen</th></tr></thead><tbody>
+<div style="padding:0 16px 10px;font-size:12px;color:var(--mut)">A client is an address that has asked
+this resolver a question since it started &mdash; a DNS query carries no hostname, so a device that has not
+queried yet is simply not here, and one that asks another resolver is invisible to every DNS filter.
+<code>adquit lan</code> prints this box&rsquo;s addresses; <code>adquit site list</code> and
+<code>adquit lan-zone</code> show the names it answers for.</div>
 {% for ip, d in clients.items() %}<tr>
 <td><code>{{ ip }}</code></td><td>{{ "{:,}".format(d.total) }}</td>
 <td>{% if d.threats > 0 %}<span class="bdg" style="background:rgba(239,68,68,.2);color:var(--red)">{{ d.threats }}</span>
@@ -5713,7 +5742,17 @@ def page_dashboard():
                       "pct": int(b * 100.0 / peak) if peak else 0,
                       "rest": int((q - b) * 100.0 / peak) if peak else 0})
     hits_total = max(1, TOTAL_QUERIES)
+    # "point your router at this" is only worth saying with an address a device can reach: the
+    # outbound-socket trick answers 169.254.x on a box with no default route, and a link-local
+    # address in a router's DNS field is a support ticket, not a configuration.
+    box_ip = ""
+    try:
+        _a = ipaddress.ip_address(fortress_ip())
+        box_ip = "" if (_a.is_loopback or _a.is_link_local or _a.is_unspecified) else str(_a)
+    except ValueError:
+        pass
     return render_page(PAGE_DASH, "dash", "Network Overview",
+        box_ip=box_ip,
         total_queries=TOTAL_QUERIES, blocked_queries=BLOCKED_QUERIES, block_rate=br,
         bandwidth_saved=human_bytes(bw), time_saved=human_duration(ts),
         client_count=len(CLIENT_ACTIVITY), rule_count=total_rules,
