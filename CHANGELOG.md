@@ -1,5 +1,50 @@
 # Changelog
 
+## v19.4 — the feeds a name filter could only count now block something
+
+- **IP feeds stopped being decoration.** Spamhaus DROP, Emerging Threats compromised hosts,
+  blocklist.de and the `IP-CIDR` half of a Surge/Shadowrocket rule set are lists of *addresses*, and
+  `norm_domain()` was right to refuse `192.0.2.0/24` - which meant every one of those feeds was
+  downloaded, parsed, counted on the dashboard and then produced exactly zero protection. On the real
+  SAA rule set the old parser found **0 rules in 53,100 lines**; the new one finds 52,911 names,
+  4,253 zones and 125 IP ranges in 0.24 s, and the ranges now go somewhere that can use them.
+- **One nftables table, three guards, and a rollback.** `data/net/nets.txt` is compiled on the same
+  pass as gravity; `inet adquit` is programmed in a single atomic transaction on `forward` +
+  `output` (never `input`), with `ct state established,related accept` and ICMP first so no list
+  update ever cuts a live flow or path-MTU discovery. A prefix floor refuses anything broader than
+  /12 v4 or /32 v6, a never-block set refuses reserved space *and this box* - its own addresses, its
+  gateway, its upstream, whatever `resolv.conf` names - and after the install the table has to report
+  the generation it was handed and the box has to still reach its upstream, or the table is deleted
+  again. A `systemd-run` timer holds that delete-order while a sync is in flight, so a machine that
+  dies mid-sync does not come back half-filtered.
+- **`adquit net` and `adquit harden`.** `net status|sync|dry-run|off|explain|allow|deny|sources`, and
+  `harden on|off|status` for the kernel defaults (strict `rp_filter`, SYN cookies, martian logging,
+  no redirects), which keeps the values it found so `off` restores those rather than guessing.
+  `install.sh` applies them - decline with `ADQUIT_NO_HARDEN=1` - and `uninstall.sh` removes the table
+  and the sysctls, because kernel state is not a file in `$HOME_DIR` and does not go away by itself.
+- **Exceptions are rules, not deletions.** `adquit net allow 1.2.3.4` becomes an `accept` set in front
+  of the drops, which is the only way to express "that one address is mine" against a feed claiming
+  the whole /14; it also changes the generation, so an exception can never be reported as "unchanged"
+  and silently not installed. A `deny` the guards refuse says so and exits non-zero: a rule you believe
+  you have and do not is worse than a refusal.
+- **What it is not, said out loud.** No TLS interception, no CA on your devices, no `URL-Regex`
+  path blocking (a gateway sees SNI and nothing else, so those rules are read and deliberately
+  dropped); no `ip_forward`, NAT or default route, so this is not a transparent gateway and cannot
+  become the reason the house has no internet; no `input` hook, so no third-party list stands between
+  you and your own SSH session; and no claim about QUIC, where the name is still blocked and the
+  address only helps if the client had it cached. `adquit set net_enforce false` returns the box to
+  names-only.
+- **`Shadowrocket-ADBlock-Rules-Forever` as a feed** (`saa_adonly`, on by default; `spamhaus_edrop`
+  is registered and *off*, because it includes some small ISPs). A rule set is a third shape worth
+  eating: suffix zones, single domains and ranges in one file - and only `Reject` rules are read,
+  because `Direct`/`Proxy` are a phone's routing policy, not a claim that a name is safe to let
+  through every other filter.
+- **Verified against the tools, not just the tests.** The suite hands the generated script to
+  nftables' own parser - after proving that parser rejects a script that really is broken - and the
+  127 offline tests cover the guards, the merged interval table, the sync ordering (install once, no-op
+  the second time, roll back on a failed probe, delete nothing when nft refuses), and that the resolver's
+  per-query path gained no new lookup at all.
+
 ## v19.3 — a start page for the LAN you just made reachable
 
 - **The blocklist's data plane is now a memory-mapped C index, and it is optional in the way that

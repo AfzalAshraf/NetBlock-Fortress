@@ -73,6 +73,28 @@ if command -v nmcli >/dev/null 2>&1; then
     fi
 fi
 
+# Kernel state is not a file in $HOME_DIR, so it has to be undone here explicitly: an uninstalled
+# fortress that still drops packets, or still re-applies rp_filter on every boot, is worse than no
+# fortress - it is a mystery the next admin has to solve. Both are touched only when they are ours,
+# and the sysctls go back to what `adquit harden on` recorded first.
+if [ "$(id -u)" = 0 ] && command -v nft >/dev/null 2>&1; then
+    if nft list table inet adquit >/dev/null 2>&1; then
+        say "removing the nftables kernel layer"
+        nft delete table inet adquit 2>/dev/null || true
+    fi
+fi
+rm -f /run/adquit-net-watch 2>/dev/null || true
+if [ "$(id -u)" = 0 ] && [ -f /etc/sysctl.d/99-adquit.conf ]; then
+    say "restoring the kernel sysctls this install set"
+    if [ -f "$HOME_DIR/data/meta/sysctl.prev" ]; then
+        while IFS= read -r line; do
+            case "$line" in ''|'#'*) continue ;; esac
+            sysctl -w "$line" >/dev/null 2>&1 || true
+        done < "$HOME_DIR/data/meta/sysctl.prev"
+    fi
+    rm -f /etc/sysctl.d/99-adquit.conf
+fi
+
 if [ "$KEEP" = "1" ]; then
     say "removing binaries, keeping $HOME_DIR/data"
     rm -f "$HOME_DIR/app.py" "$HOME_DIR/bin/adquit"

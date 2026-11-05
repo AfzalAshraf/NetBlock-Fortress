@@ -29,6 +29,7 @@ import socket
 import pickle
 import hashlib
 import logging
+import bisect
 import threading
 import ipaddress
 import subprocess
@@ -37,7 +38,7 @@ from pathlib import Path
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "19.3"
+VERSION = "19.4"
 CODENAME = "Omni-Shield"
 CONFIG_VERSION = 19
 USER_AGENT = (
@@ -289,6 +290,12 @@ DEFAULT_CONFIG = {
     "youtube_aggressive": True,       # YouTube ad endpoint stripping
     "safe_search": False,             # force Google/YouTube/Bing safe results
     "native_gravity": True,      # mmap the compiled tables instead of holding 4M python strings
+    # --- the kernel layer: the IP ranges a DNS answer cannot express ---
+    "net_enforce": True,         # compile IP feeds into one nftables table (needs root + nft)
+    "net_log_drops": True,       # rate-limited nft log, so a drop is auditable in journald
+    "net_watchdog_s": 45,        # hold a delete-order for nft until a reachability probe agrees
+    "net_min_prefix4": 12,       # refuse a feed that tries to blackhole a /8 of the internet
+    "net_min_prefix6": 32,
     "wildcard_engine": True,          # *.adnetwork.com style blocking
     "pattern_engine": True,           # ad-infrastructure subdomain heuristics
     "pattern_action": "enforce",      # enforce | shadow (log only)
@@ -586,6 +593,19 @@ _L("emerging", "Emerging Threats Compromised", "malware", "malvertising", "https
 _L("blocklist_de", "Blocklist.de Phishing", "phishing", "malvertising", "https://lists.blocklist.de/lists/phishing.txt", 1)
 _L("blocklist_de_all", "Blocklist.de All Attacks", "spam", "shortlink", "https://lists.blocklist.de/lists/all.txt", 1)
 _L("spamhaus_drop", "Spamhaus DROP Netblocks", "spam", "shortlink", "https://www.spamhaus.org/drop/drop.txt", 1)
+# DROP is a list of CIDRs: every one of them was parsed, counted on the dashboard and then thrown
+# away by `norm_domain`, because a name filter has no idea what to do with a /24. The kernel layer is
+# what finally spends them. EDROP adds the smaller abuse-assigned blocks on top - real protection,
+# and it can include the odd small ISP, so it is a toggle an operator reaches for deliberately rather
+# than a default handed out to everybody.
+_L("spamhaus_edrop", "Spamhaus EDROP (aggressive)", "spam", "shortlink",
+   "https://www.spamhaus.org/drop/edrop.txt")
+# SAA is a Surge/Shadowrocket rule set, i.e. the third shape worth having: 52,941 rejected domains
+# *and* 128 IP ranges aimed at the Chinese ad inventory the Western lists barely glance at, built
+# from 40+ upstream sources. Fetched as published; only its Reject rules are read, because the rest
+# of a client rule set is routing policy for a phone.
+_L("saa_adonly", "SAA Shadowrocket AdBlock (domains + IP ranges)", "ads", "banner",
+   "https://johnshall.github.io/Shadowrocket-ADBlock-Rules-Forever/sr_ad_only.conf", 1)
 _L("nocoin", "NoCoin Cryptomining", "crypto", "malvertising", "https://raw.githubusercontent.com/hoshsadiq/adblock-nocoin-list/master/hosts.txt", 1)
 _L("coinblocker", "CoinBlocker Pools & Miners", "crypto", "malvertising", "https://zerodot1.gitlab.io/CoinBlockerLists/hosts", 1)
 _L("coinbrowser", "CoinBlocker Browser Miners", "crypto", "malvertising", "https://zerodot1.gitlab.io/CoinBlockerLists/hosts_browser", 1)
@@ -929,7 +949,7 @@ def _write_banners():
             VERSION, CODENAME, len(ALL_LISTS), len(CAT), CFG.get("dns_port", 53),
             CFG.get("dns_upstream", "1.1.1.1"), CFG.get("web_port", 8080),
             "{:,}".format(len(BLOCKED) + len(WILDCARDS)),
-            "native index (mapped)" if NATIVE is not None else "python tables")
+            "native index (mapped)" if plane_is_index() else "python tables")
     )
     print(banner)
 
@@ -1108,31 +1128,57 @@ def parse_source_bytes(raw):
     return exact, wild, unb
 
 
-def list_file(path):
+def parse_feed_bytes(raw):
+    """Parse one feed's bytes into (exact, wildcard, unbreak, nets), whatever shape it arrives in.
+
+    The format is detected from the content rather than from a field in the registry: a feed added by
+    hand with `adquit feed add --url ...` has no registry entry to carry a label, and the two families
+    are unambiguous anyway - a Surge/Shadowrocket rule set is a sectioned .conf, hosts/adblock/plain
+    lists are not.
+
+    `nets` is the half a name filter cannot express. It travels with the domains so that one read of a
+    file feeds both layers, and so a feed that mixes shapes (SAA does, Spamhaus effectively does)
+    loses neither half.
+    """
+    if is_surge_bytes(raw):
+        return parse_surge_bytes(raw)
+    exact, wild, unb = parse_source_bytes(raw)
+    return exact, wild, unb, parse_nets_bytes(raw)
+
+
+def parse_feed(path):
     """Cached parse of one downloaded feed (re-parses only when the file changes)."""
     try:
         st = path.stat()
     except Exception:
-        return frozenset(), frozenset(), frozenset()
+        return frozenset(), frozenset(), frozenset(), frozenset()
     meta = META_DIR / (path.stem + ".parse.meta")
     mark = "%s:%s" % (st.st_mtime_ns, st.st_size)
-    cache_path = META_DIR / (path.stem + ".parse.pkl")
+    # `.parse2` and not the old `.parse`: the payload grew a fourth set, and a cache from before that
+    # is a miss to be recovered from, not a bug to be handled.
+    cache_path = META_DIR / (path.stem + ".parse2.pkl")
     try:
         if cache_path.exists() and meta.exists() and meta.read_text() == mark:
             with open(cache_path, "rb") as fh:
-                e, w, u = pickle.load(fh)
-            return e, w, u
+                exact, wild, unb, nets = pickle.load(fh)
+            return exact, wild, unb, nets
     except Exception:
         pass
     raw = path.read_bytes()
-    e, w, u = parse_source_bytes(raw)
+    exact, wild, unb, nets = parse_feed_bytes(raw)
     try:
         meta.write_text(mark)
         with open(cache_path, "wb") as fh:
-            pickle.dump((frozenset(e), frozenset(w), frozenset(u)), fh, protocol=4)
+            pickle.dump((frozenset(exact), frozenset(wild), frozenset(unb), frozenset(nets)),
+                        fh, protocol=4)
     except Exception:
         pass
-    return frozenset(e), frozenset(w), frozenset(u)
+    return frozenset(exact), frozenset(wild), frozenset(unb), frozenset(nets)
+
+
+def net_file(path):
+    """The IP ranges one feed asserts, as CIDR text."""
+    return parse_feed(path)[3]
 
 
 # ──────────────────────────────────────────────
@@ -1882,11 +1928,1090 @@ class _IndexView(object):
             "WILDCARDS" if self._wild else "BLOCKED", "{:,}".format(len(self)))
 
 
+def plane_is_index():
+    """Whether name lookups are reading the mapped index rather than the dicts.
+
+    `NATIVE is not None` is *not* that question, and conflating them is a bug waiting to happen: a
+    throwaway rebuild (`persist=False`) leaves the previous mapping alive while the live tables are
+    plain dicts. Anything that reads or writes the plane has to ask about the tables, and the hot path
+    in `_classify_uncached` is the one that would silently consult a stale index.
+    """
+    return NATIVE is not None and isinstance(BLOCKED, _IndexView)
+
+
+# ──────────────────────────────────────────────
+#  Surge / Shadowrocket rule sets, and the IP ranges a sinkhole cannot express
+#
+#  Two formats, one reason to care. A hosts file answers a single question ("this name is an ad").
+#  A rule set answers three: a suffix zone (`DOMAIN-SUFFIX`), a keyword, and an address range
+#  (`IP-CIDR`) - and the third is the half a DNS-only fortress has to throw away. Feeds written as
+#  CIDRs (Spamhaus DROP, ET compromised, SAA's IP rules) were already being downloaded, counted on
+#  the dashboard, and blocking nothing, because `norm_domain("192.0.2.0/24")` is None and quite right
+#  to be. So both halves get a home: names go into gravity, ranges go into the packet filter.
+# ──────────────────────────────────────────────
+NET_DIR = DATA_DIR / "net"
+NET_FILE = NET_DIR / "nets.txt"
+NET_NFT_SCRIPT = NET_DIR / "adquit.nft"
+NET_LIVE_FILE = NET_DIR / "live.json"
+NET_CUSTOM = DATA_DIR / "custom_nets_blocked.txt"
+NET_ALLOW = DATA_DIR / "custom_nets_allowed.txt"
+NET_WATCH_FILE = Path("/run/adquit-net-watch")
+NFT_TABLE = "adquit"
+
+SURGE_RULE_TYPES = ("DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "URL-Regex", "IP-CIDR",
+                    "IP-CIDR2", "SRC-IP-CIDR", "GEOIP", "RULE-SET")
+
+# Ranges the kernel layer refuses no matter which feed claims them: reserved, private, anycast,
+# transition and documentation space (RFC 6890). Over-broad blocking is the one failure mode here
+# that takes a whole site offline, so this list is a floor under the feeds, not a suggestion to them.
+NET_NEVER = (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.31.196.0/24", "192.88.99.0/24",
+    "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4",
+    "240.0.0.0/4",
+    "::/128", "::1/128", "64:ff9b::/96", "100::/64", "2001::/32", "2001:db8::/32",
+    "2002::/16", "fe80::/10", "fc00::/7", "ff00::/8",
+)
+
+NET_META = {"generation": "", "n_nets": 0, "n_refused": 0, "n_allowed": 0, "n_srcs": 0,
+            "srcs": {}, "refused": {}, "compiled": ""}
+NET_VIEW = {"key": None, "tables": {4: [], 6: []}, "src_of": {}}
+NET_LOCK = threading.RLock()
+
+try:
+    NET_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+
+def is_surge_bytes(raw):
+    """True when these bytes are a Surge/Shadowrocket rule set rather than a hosts file.
+
+    Sniffed from the content instead of trusting a registry label, so a feed added with
+    `adquit feed add --url ...` gets the same parser as a registered one. A `[rule]` header alone is
+    not enough - adblock headers are not sections of this kind - so a rule-shaped line has to appear
+    as well before we switch parsers.
+    """
+    head = raw[:65536].decode("utf-8", "ignore").lower()
+    if "[rule]" not in head:
+        return False
+    for line in head.splitlines():
+        for rtype in SURGE_RULE_TYPES:
+            if line.startswith(rtype.lower() + ","):
+                return True
+    return False
+
+
+def _ip_token(tok):
+    """One raw token -> canonical CIDR text, or None when it is not an address or a network.
+
+    The dotted-quad pre-filter in front of `ipaddress` is not laziness: this runs over every token of
+    every feed, millions of times, and one exception per domain would cost more than the rest of the
+    parse combined. `strict=False` is load-bearing too - SAA ships `117.139.18.141/22`, a host
+    address inside a /22 - and folding it onto the network is what the list means, not what it
+    happens to be spelled as.
+    """
+    tok = (tok or "").strip().strip("[](){}").strip(".,;\"'")
+    if not tok or tok[0] in "#/":
+        return None
+    head = tok.split("/")[0]
+    if ":" not in head and not IP_LIKE.match(head):
+        return None
+    if "/" not in tok:
+        tok += "/128" if ":" in tok else "/32"
+    try:
+        return str(ipaddress.ip_network(tok, strict=False))
+    except Exception:
+        return None
+
+
+_OWN = {"t": 0.0, "list": [], "watched": ""}
+
+
+def _own_addresses():
+    """The addresses a rule in this table could plausibly shoot us in the foot with.
+
+    Not a substitute for the operator's judgement - the short list of "if you drop these, the
+    fortress stops being reachable or stops reaching anything": our own interface addresses, the
+    default route's gateway, the configured upstream, and whatever /etc/resolv.conf still names.
+    Every part is optional, so a box with no `ip` command or no default route just gets a shorter
+    list. Cached for five minutes: it shells out, and a rebuild must not pay for that per range.
+    """
+    now = time.time()
+    watched = "%s|%s" % (CFG.get("dns_upstream"), CFG.get("sinkhole_ip"))
+    if now - _OWN["t"] < 300 and _OWN["watched"] == watched:
+        return _OWN["list"]
+    out = set()
+    for text in (str(CFG.get("dns_upstream") or ""), str(CFG.get("sinkhole_ip") or "")):
+        text = text.split("//")[-1].split("/")[0].split(":")[0].strip()
+        if IP_LIKE.match(text):
+            out.add(text + "/32")
+    try:
+        for line in Path("/etc/resolv.conf").read_text(errors="ignore").splitlines():
+            f = line.split()
+            if len(f) >= 2 and f[0] == "nameserver" and f[1] not in ("127.0.0.1", "::1"):
+                out.add(f[1] + ("/128" if ":" in f[1] else "/32"))
+    except Exception:
+        pass
+    try:
+        # /proc/net/route: destination 00000000 is the default route, gateway in little-endian hex
+        for line in Path("/proc/net/route").read_text(errors="ignore").splitlines()[1:]:
+            f = line.split()
+            if len(f) > 3 and f[1] == "00000000" and f[2] not in ("00000000", ""):
+                gw = int(f[2], 16)
+                if gw:
+                    out.add(".".join(str((gw >> (8 * i)) & 0xFF) for i in range(4)) + "/32")
+    except Exception:
+        pass
+    ip_bin = _which("ip")
+    if ip_bin:
+        try:
+            res = subprocess.run([ip_bin, "-o", "addr", "show"], capture_output=True,
+                                 text=True, timeout=5)
+            for line in (res.stdout or "").splitlines():
+                f = line.split()
+                for i, tok in enumerate(f):
+                    if tok in ("inet", "inet6") and i + 1 < len(f) and "/" in f[i + 1]:
+                        out.add(f[i + 1])
+        except Exception:
+            pass
+    _OWN["t"] = now
+    _OWN["watched"] = watched
+    _OWN["list"] = sorted(out)
+    return _OWN["list"]
+
+
+def never_nets():
+    """NET_NEVER plus this host's addresses, as networks."""
+    out = []
+    for text in list(NET_NEVER) + _own_addresses():
+        try:
+            out.append(ipaddress.ip_network(text, strict=False))
+        except Exception:
+            continue
+    return out
+
+
+def net_guard(cidr, never=None):
+    """(ok, reason) for one candidate range: the prefix-length floor, then the never floor."""
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except Exception:
+        return False, "not a network"
+    key = "net_min_prefix6" if net.version == 6 else "net_min_prefix4"
+    try:
+        minlen = int(CFG.get(key, 12 if net.version == 4 else 32) or 0)
+    except Exception:
+        minlen = 0
+    if minlen and net.prefixlen < minlen:
+        return False, "/%s is broader than %s" % (net.prefixlen, key)
+    for guard in (never if never is not None else never_nets()):
+        try:
+            if guard.version != net.version:
+                continue
+            # touching it, containing it, or being contained by it are all the same mistake
+            if net[0] in guard or net[-1] in guard or net.supernet_of(guard):
+                return False, "local or reserved (%s)" % guard
+        except Exception:
+            continue
+    return True, ""
+
+
+def parse_surge_bytes(raw):
+    """A Surge/Shadowrocket rule set -> (exact, wildcard, unbreak, nets).
+
+    Only `Reject` rules are read, and that filter is the whole design decision. The other targets -
+    Direct, Proxy, FINAL, a named policy - are a phone's *routing* instructions ("send this one
+    through the tunnel"), not claims that a name is ad-free; folding them into UNBREAK would let a
+    client config quietly punch holes in a resolver's never-break list. DOMAIN-KEYWORD is skipped for
+    the mirror-image reason: SAA's three keyword rules are amazon/aws/google marked Proxy, and a
+    keyword-to-block path built out of routing metadata is a footgun nobody needs. URL-Regex is
+    skipped knowingly: on a phone it is evaluated after a local MITM, and a gateway sees an encrypted
+    ClientHello and nothing else - accepting those rules would promise path blocking this box cannot
+    deliver.
+    """
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    exact, wild, nets = set(), set(), set()
+    in_rule = False
+    for line in raw.decode("utf-8", "ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            in_rule = line.lower().startswith("[rule")
+            continue
+        if not in_rule or line[0] in "#!;":
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        rtype, value = parts[0].upper(), parts[1]
+        action = parts[-1].upper()
+        if action in ("NO-RESOLVE", "FORCE-CONNECT", "FORCE-QUIT"):
+            action = parts[-2].upper()          # `IP-CIDR,x,Reject,no-resolve`
+        if action != "REJECT":
+            continue
+        if rtype in ("DOMAIN-SUFFIX", "DOMAIN"):
+            dom = norm_domain(value)
+            if not dom:
+                continue
+            exact.add(dom)
+            if rtype == "DOMAIN-SUFFIX" and dom.count(".") > 1:
+                wild.add(dom)                  # a suffix is a zone: the subtree goes with it
+        elif rtype in ("IP-CIDR", "IP-CIDR2"):
+            net = _ip_token(value)
+            if net:
+                nets.add(net)
+        # SRC-IP-CIDR, GEOIP, RULE-SET and the rest fall through: source-matching and rule-set
+        # indirection say nothing about where the traffic is going, which is what we filter on.
+    return frozenset(exact), frozenset(wild), frozenset(), frozenset(nets)
+
+
+def parse_nets_bytes(raw):
+    """IP ranges asserted by an ordinary hosts/plain feed (Spamhaus DROP, ET compromised, blocklist.de).
+
+    The reason this layer exists at all. Three spellings arrive in practice: a bare CIDR, a bare IP
+    (one address, so a /32 or /128), and a hosts-style line where the address follows a stub such as
+    `0.0.0.0`. Spamhaus separates its annotations with `;`, which is cut before the tokens are read.
+    """
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    nets = set()
+    for line in raw.decode("utf-8", "ignore").splitlines():
+        line = line.strip()
+        if not line or line[0] in "#!;[":
+            continue
+        line = line.split(";", 1)[0]
+        line = re.sub(r"\s+#.*$", "", line).strip()
+        if "." not in line and ":" not in line:
+            continue
+        for tok in line.split()[:4]:
+            net = _ip_token(tok)
+            if net:
+                nets.add(net)
+    return frozenset(nets)
+
+
+def _element_text(first, last, version):
+    """The shortest true spelling of an interval: a CIDR when one fits, else `first-last`."""
+    cls = ipaddress.IPv4Address if version == 4 else ipaddress.IPv6Address
+    addr_first, addr_last = cls(first), cls(last)
+    try:
+        span = last - first + 1
+        width = 32 if version == 4 else 128
+        if span & (span - 1) == 0 and 0 < span <= (1 << width):
+            net = ipaddress.ip_network("%s/%s" % (addr_first, width - (span.bit_length() - 1)))
+            if int(net[-1]) == last:
+                return str(net)
+    except Exception:
+        pass
+    return "%s-%s" % (addr_first, addr_last)
+
+
+def merge_ranges(rows):
+    """[(cidr, src)] -> {4: [(first, last, text, src)], 6: [...]}, sorted with overlaps merged.
+
+    Two jobs, both necessary. nftables interval sets refuse to load overlapping elements at all, so a
+    feed listing 1.2.3.0/25 inside another feed's /24 would fail the entire transaction; and a flat
+    sorted table turns a verdict into one bisect instead of a walk over thousands of `ipaddress`
+    objects, which is why the merged form is what matching uses rather than the parsed one.
+    """
+    per = {4: [], 6: []}
+    for cidr, src in rows:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except Exception:
+            continue
+        per[net.version].append([int(net[0]), int(net[-1]), src or ""])
+    out = {}
+    for ver, items in per.items():
+        items.sort(key=lambda r: (r[0], -r[1]))
+        merged = []
+        for first, last, src in items:
+            if merged and first <= merged[-1][1]:
+                if last > merged[-1][1]:
+                    merged[-1][1] = last
+                    if src and src not in merged[-1][2]:
+                        merged[-1][2] = (merged[-1][2] + "+" + src) if merged[-1][2] else src
+                continue
+            merged.append([first, last, src])
+        out[ver] = [(f, l, _element_text(f, l, ver), s) for f, l, s in merged]
+    return {4: out[4], 6: out[6]}
+
+
+def _net_tokens(path):
+    try:
+        for line in path.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if line and line[0] not in "#;":
+                yield line.split(";", 1)[0].strip()
+    except Exception:
+        return
+
+
+def net_read_allow():
+    """Operator exceptions, as networks: `adquit net allow <cidr>`.
+
+    Applied as an `accept` rule in front of the drops rather than by deleting the ranges an
+    exception sits inside - which is the only way that can express "8.20.0.5 is mine" against a feed
+    that claims the whole /14, and it is why an exception takes effect on the next sync without
+    touching a single one of the four million names.
+    """
+    out = []
+    for line in _net_tokens(NET_ALLOW):
+        cidr = _ip_token(line.split()[0])
+        if cidr:
+            try:
+                out.append(ipaddress.ip_network(cidr, strict=False))
+            except Exception:
+                continue
+    return out
+
+
+def net_read_custom():
+    """Operator denies, as CIDR text: `adquit net deny <ip-or-cidr>`."""
+    out = []
+    for line in _net_tokens(NET_CUSTOM):
+        cidr = _ip_token(line.split()[0])
+        if cidr:
+            out.append(cidr)
+    return out
+
+
+def collect_feed_nets():
+    """{cidr: feed} across every enabled feed that asserts ranges. Cheap once the parse cache is warm."""
+    nets = {}
+    try:
+        registry = all_lists()
+    except Exception:
+        return nets
+    for lid in registry:
+        if lid not in CFG.get("enabled_lists", []):
+            continue
+        path = LIST_DIR / ("%s.txt" % lid)
+        if not path.exists():
+            continue
+        try:
+            for cidr in net_file(path):
+                nets.setdefault(cidr, lid)
+        except Exception as exc:
+            LOG.debug("net parse failed for %s: %s", lid, exc)
+    return nets
+
+
+def build_net_tables(feed_nets=None, persist=True):
+    """Fold the feeds + the operator's denies into nets.txt. The allow list is applied on the view.
+
+    That split is what makes `adquit net allow <cidr>` instant: exceptions are applied when the script
+    is written, so opening one hole never waits for four million names to be recompiled - and never
+    gets baked into a file the feeds would have to regenerate. `feed_nets=None` re-reads the feed files
+    (what `adquit net deny` needs); a dict is what a gravity rebuild passes, because it has them in
+    hand already.
+    """
+    if feed_nets is None:
+        feed_nets = collect_feed_nets()
+    rows = list(feed_nets.items()) + [(c, "custom") for c in net_read_custom()]
+    counts, refused, kept = {}, {}, {}
+    never = never_nets()
+    for cidr, src in rows:
+        counts[src] = counts.get(src, 0) + 1
+        ok, why = net_guard(cidr, never)
+        if not ok:
+            refused[why] = refused.get(why, 0) + 1
+            continue
+        if cidr not in kept:
+            kept[cidr] = src
+    body = "".join("%s\t%s\n" % (c, kept[c]) for c in sorted(kept))
+    if persist:
+        header = ("# adquit kernel layer - %s ranges from %s sources, compiled %s\n"
+                  "# Regenerated by a gravity rebuild or `adquit net deny`. Exceptions belong in\n"
+                  "# `adquit net allow <cidr>`: they are applied on the way out, not folded in here.\n"
+                  % ("{:,}".format(len(kept)), len(counts),
+                     datetime.now().strftime("%Y-%m-%d %H:%M")))
+        try:
+            atomic_write(NET_FILE, header + body)
+        except Exception as exc:
+            LOG.debug("nets.txt not written: %s", exc)
+    with NET_LOCK:
+        NET_VIEW["key"] = None
+        NET_META["srcs"] = counts
+        NET_META["n_srcs"] = len(counts)
+        NET_META["refused"] = refused
+        NET_META["n_refused"] = sum(refused.values())
+        NET_META["n_nets"] = len(kept)
+        NET_META["compiled"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    LOG.info("kernel layer: %s IP ranges compiled (%s refused as local, reserved or too broad)",
+             "{:,}".format(len(kept)), "{:,}".format(sum(refused.values())))
+    return NET_META
+
+
+def load_nets():
+    """How many compiled ranges are on disk. The view is built lazily, so boot pays almost nothing."""
+    try:
+        if not NET_FILE.exists():
+            return 0
+        n = sum(1 for line in NET_FILE.read_text(errors="ignore").splitlines()
+                if line.strip() and not line.startswith("#"))
+        with NET_LOCK:
+            NET_VIEW["key"] = None
+        return n
+    except Exception as exc:
+        LOG.debug("nets.txt not read: %s", exc)
+        return 0
+
+
+def net_view(force=False):
+    """(tables, meta): compiled ranges minus the allow list, merged and ready for matching.
+
+    Cached on both files' identity, because it is built at boot, by every sync and by `doctor`, and
+    all three want the same answer without reparsing a couple of thousand CIDRs each time. The
+    generation is a hash of the surviving ranges and nothing else - it is the proof a sync asks the
+    kernel for, so it must not include a timestamp.
+    """
+    try:
+        key = ((NET_FILE.stat().st_mtime_ns, NET_FILE.stat().st_size) if NET_FILE.exists() else (0, 0),
+               (NET_ALLOW.stat().st_mtime_ns, NET_ALLOW.stat().st_size) if NET_ALLOW.exists() else (0, 0),
+               int(CFG.get("net_min_prefix4") or 0), int(CFG.get("net_min_prefix6") or 0),
+               ",".join(_own_addresses()))
+    except Exception:
+        key = None
+    with NET_LOCK:
+        if not force and key is not None and NET_VIEW["key"] == key and NET_VIEW["src_of"]:
+            return NET_VIEW["tables"], NET_META
+    rows, src_of = [], {}
+    for line in _net_tokens(NET_FILE):
+        cidr = _ip_token(line.split("\t")[0])
+        if not cidr:
+            continue
+        src = line.split("\t")[1].strip() if "\t" in line else "file"
+        rows.append((cidr, src))
+        src_of[cidr] = src
+    allow = net_read_allow()
+    never = never_nets()
+    kept = []
+    for cidr, src in rows:
+        ok, _why = net_guard(cidr, never)
+        if not ok:
+            continue
+        kept.append((cidr, src))
+    tables = merge_ranges(kept)
+    exceptions = {4: [], 6: []}
+    for net in allow:
+        exceptions[net.version].append(str(net))
+    # The generation covers the exceptions too: they change what the kernel is told, so an
+    # `adquit net allow` that left the generation alone would be reported as "unchanged" and never
+    # installed - the quietest possible way for an operator's own exception to do nothing.
+    fingerprint = "\n".join(sorted(c for c, _s in kept)) + "|" + "\n".join(
+        sorted(exceptions[4] + exceptions[6]))
+    gen = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:12]
+    with NET_LOCK:
+        NET_VIEW["key"] = key
+        NET_VIEW["tables"] = tables
+        NET_VIEW["src_of"] = src_of
+        NET_META["generation"] = gen
+        NET_META["n_nets"] = len(kept)
+        NET_META["n_allowed"] = len(exceptions[4]) + len(exceptions[6])
+        NET_META["exceptions"] = {4: sorted(exceptions[4]), 6: sorted(exceptions[6])}
+    return tables, NET_META
+
+
+def net_verdict(addr):
+    """What the kernel layer would do with a packet addressed to `addr`."""
+    out = {"address": addr, "action": "allow", "cidr": None, "source": ""}
+    try:
+        ip = ipaddress.ip_address(str(addr).strip())
+    except Exception:
+        out.update({"action": "error", "detail": "not an IP address"})
+        return out
+    tables, meta = net_view()
+    value = int(ip)
+    for text in (meta.get("exceptions") or {}).get(ip.version, []):
+        try:
+            if ip in ipaddress.ip_network(text):
+                out.update({"action": "allow", "cidr": text, "source": "operator exception"})
+                return out
+        except Exception:
+            continue
+    rows = tables[ip.version]
+    if not rows:
+        return out
+    idx = bisect.bisect_right([r[0] for r in rows], value) - 1
+    if 0 <= idx and rows[idx][0] <= value <= rows[idx][1]:
+        cidr = rows[idx][2]
+        out.update({"action": "block", "cidr": cidr,
+                    "source": rows[idx][3] or NET_VIEW["src_of"].get(cidr, "")
+                              or meta.get("srcs", {}).get(cidr, "")})
+    return out
+
+
+def _which(name):
+    """PATH plus the sbin directories root tools live in - a user shell usually has neither."""
+    for d in [x for x in (os.environ.get("PATH") or "").split(os.pathsep) if x] + [
+            "/usr/sbin", "/sbin", "/usr/local/sbin"]:
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def nft_available():
+    return bool(os.environ.get("ADQUIT_NFT_BIN") or _which("nft"))
+
+
+def nft_root():
+    """Root, or a wrapper pointed at deliberately.
+
+    `ADQUIT_NFT_BIN` is both the test hook and the escape hatch for anyone whose nft lives somewhere
+    odd: claiming root privileges is what the guard is for, and an explicit binary is evidence of it.
+    """
+    return os.geteuid() == 0 or bool(os.environ.get("ADQUIT_NFT_BIN"))
+
+
+def nft_run(args, timeout=30):
+    binary = os.environ.get("ADQUIT_NFT_BIN") or _which("nft")
+    if not binary:
+        return 127, "nft not found"
+    try:
+        res = subprocess.run([binary] + list(args), capture_output=True, text=True,
+                             timeout=timeout)
+        return res.returncode, (res.stdout or "") + (res.stderr or "")
+    except Exception as exc:
+        return 1, str(exc)[:200]
+
+
+_NFT_LIST = {"t": 0.0, "text": ""}
+
+
+def nft_live_text(max_age=15.0):
+    """The live table, held briefly: `adquit stats` must not shell out on every refresh."""
+    now = time.time()
+    if now - _NFT_LIST["t"] < max_age:
+        return _NFT_LIST["text"]
+    rc, out = nft_run(["-a", "list", "table", "inet", NFT_TABLE])
+    _NFT_LIST["t"] = now
+    _NFT_LIST["text"] = out if rc == 0 else ""
+    return _NFT_LIST["text"]
+
+
+def nft_live_generation():
+    """The generation the kernel is holding, or None when there is no table at all.
+
+    "" versus None is the difference between "live but from an older build" and "there is nothing to
+    be out of date with", and `net status` says those two very differently.
+    """
+    if not nft_available() or not nft_root():
+        return None
+    text = nft_live_text()
+    if not text:
+        return None
+    m = re.search(r'comment "gen=([0-9a-f]{6,})"', text)
+    return m.group(1) if m else ""
+
+
+def nft_drops():
+    total = 0
+    for m in re.finditer(r"counter packets (\d+)", nft_live_text()):
+        total += int(m.group(1))
+    return total
+
+
+def nft_script(tables=None, meta=None, log=None):
+    """The table as one atomic nftables transaction.
+
+    Kept a pure function of the compiled ranges so a test can read exactly what we are about to ask
+    the kernel to do, without anyone with a root shell having to run it first. The order of the
+    statements is the safety: `table` before `delete table` in the same file means the very first load
+    cannot fail on a table that does not exist yet, and every later load replaces the live one inside
+    a single transaction, so there is no gap for a packet to fall through. Live flows are accepted
+    before anything is consulted; reserved space and this host's own addresses are accepted before the
+    block list; and the drops come last, each with a counter in front of it so `adquit net status` can
+    say what it has been doing.
+
+    A separate table on purpose: it shares nothing with ufw, firewalld or docker's chains, so
+    `adquit net off` cannot take their rules down with it.
+    """
+    if tables is None or meta is None:
+        tables, meta = net_view()
+    if log is None:
+        log = cfg_bool("net_log_drops", True)
+    gen = meta.get("generation") or "-"
+    never = {4: set(), 6: set()}
+    for text in _own_addresses() + list(NET_NEVER):
+        try:
+            net = ipaddress.ip_network(text, strict=False)
+            never[net.version].add(str(net))
+        except Exception:
+            continue
+    out = [
+        "#!/usr/sbin/nft -f",
+        "# NetBlock Fortress kernel layer - generation " + gen + ", " + str(len(tables[4]))
+        + " v4 + " + str(len(tables[6])) + " v6 ranges",
+        "# Written by `adquit net sync`. This table is replaced whole on the next sync, so put",
+        "# exceptions in `adquit net allow <cidr>` instead of editing this file.",
+        "#",
+        "# It hooks forward and output only. Deliberately not input: your own SSH session and every",
+        "# management path to this box must never depend on a third party's blocklist.",
+        "table inet " + NFT_TABLE,
+        "delete table inet " + NFT_TABLE,
+        "table inet " + NFT_TABLE + " {",
+    ]
+    for ver in (4, 6):
+        out.append("\tset net" + str(ver) + " {")
+        out.append("\t\ttype ipv" + str(ver) + "_addr")
+        out.append("\t\tflags interval")
+        out.append('\t\tcomment "gen=' + gen + '"')
+        elems = [r[2] for r in tables[ver]]
+        if not elems:
+            # no `elements` line at all: `elements = { }` is a syntax error to nft, and an empty set
+            # is the common case (IPv6 - most IP feeds are v4 only), so this is the shape that would
+            # otherwise have failed the very first sync on a real box.
+            pass
+        else:
+            groups, chunk, width = [], [], 0
+            for element in elems:
+                chunk.append(element)
+                width += len(element) + 2
+                if width > 88 or len(chunk) >= 32:
+                    groups.append(chunk)
+                    chunk, width = [], 0
+            if chunk:
+                groups.append(chunk)
+            out.append("\t\telements = { " + ", ".join(groups[0])
+                       + ("," if len(groups) > 1 else ""))
+            for i, group in enumerate(groups[1:], start=1):
+                out.append("\t\t           " + ", ".join(group)
+                           + ("," if i < len(groups) - 1 else ""))
+            out.append("\t\t           }")
+        out.append("\t}")
+    for ver in (4, 6):
+        exc = (meta.get("exceptions") or {}).get(ver) or []
+        if exc:
+            out.append("\tset allow%d {" % ver)
+            out.append("\t\ttype ipv%d_addr" % ver)
+            out.append("\t\tflags interval")
+            out.append('\t\tcomment "gen=' + gen + '"')
+            out.append("\t\telements = { " + ", ".join(exc) + " }")
+            out.append("\t}")
+    for hook, chain in (("forward", "protect"), ("output", "local")):
+        out.append("\tchain " + chain + " {")
+        out.append("\t\ttype filter hook " + hook + " priority filter; policy accept;")
+        out.append("\t\t# a list update must never cut a flow that is already running")
+        out.append("\t\tct state established,related accept")
+        out.append("\t\t# nor break path MTU discovery in either direction")
+        out.append("\t\tmeta l4proto { icmp, icmpv6 } accept")
+        for ver in (4, 6):
+            if never[ver]:
+                out.append("\t\t" + ("ip" if ver == 4 else "ip6") + " daddr { "
+                           + ", ".join(sorted(never[ver])) + " } accept")
+        for ver in (4, 6):
+            if (meta.get("exceptions") or {}).get(ver):
+                out.append("\t\t" + ("ip" if ver == 4 else "ip6") + " daddr @allow%d accept" % ver)
+        if log:
+            out.append("\t\t# logged, but rate limited: an unbounded drop log on a busy box is its")
+            out.append("\t\t# own outage, and the counter below is the number that matters anyway")
+            out.append("\t\tip daddr @net4 limit rate 20/minute burst 40 packets "
+                       "log prefix \"adquit-drop: \"")
+            out.append("\t\tip6 daddr @net6 limit rate 20/minute burst 40 packets "
+                       "log prefix \"adquit-drop6: \"")
+        out.append("\t\tip daddr @net4 counter drop")
+        out.append("\t\tip6 daddr @net6 counter drop")
+        out.append("\t}")
+    out.append("}")
+    return "\n".join(out) + "\n"
+
+
+def net_arm_watchdog(gen):
+    """Hold a delete-order for `nft` until the sync has proved itself. True when armed.
+
+    /run/adquit-net-watch is the token. The timer fires an `app.py --net-rollback <gen>` that undoes
+    the install only while that marker still names the generation it was armed for, and a successful
+    sync deletes the marker. So the rollback never has to be cancellable, and a machine that dies
+    mid-sync - precisely when a rollback is wanted - still gets one.
+    """
+    try:
+        secs = int(CFG.get("net_watchdog_s", 45) or 0)
+    except Exception:
+        secs = 0
+    if secs <= 0:
+        return False
+    try:
+        NET_WATCH_FILE.write_text(gen or "0")
+    except Exception:
+        return False
+    runner = _which("systemd-run")
+    if not runner or not nft_root():
+        return False
+    try:
+        subprocess.run([runner, "--quiet", "--on-active=%ds" % secs, "--unit=adquit-net-watch",
+                        "--property=Type=oneshot",
+                        "--property=Description=NetBlock Fortress kernel-layer rollback",
+                        sys.executable or "python3", str(BASE_DIR / "app.py"),
+                        "--net-rollback", gen or "0"],
+                       capture_output=True, text=True, timeout=20)
+        return True
+    except Exception as exc:
+        LOG.debug("watchdog not armed: %s", exc)
+        return False
+
+
+def net_disarm_watchdog():
+    try:
+        NET_WATCH_FILE.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def net_rollback(gen=""):
+    """The watchdog's action. True when it removed a table, False when there was nothing to undo."""
+    try:
+        current = NET_WATCH_FILE.read_text(errors="ignore").strip()
+    except Exception:
+        return False                      # disarmed: the sync finished, which is the normal case
+    if gen and current and current != gen:
+        return False                      # a newer sync owns the state; a stale timer must not act
+    rc, out = nft_run(["delete", "table", "inet", NFT_TABLE])
+    net_disarm_watchdog()
+    _NFT_LIST["t"] = 0.0
+    if rc == 0:
+        LOG.error("kernel layer rolled back (generation %s never proved itself) - names still block, "
+                  "so nothing else changed: %s", current or gen, out.strip()[:120] or "ok")
+        return True
+    return False
+
+
+def reachability_ok(timeout=2.0):
+    """Can this box still reach its upstream with the new rules loaded?
+
+    Deliberately a raw TCP connect and not a lookup: the thing under test is whether a packet filter
+    cut us off, and asking our own resolver would be asking it to repair the very failure being looked
+    for. A box whose only upstream is DoH falls through to the public-resolver probes, which is still
+    the right question to ask.
+    """
+    targets = []
+    up = str(CFG.get("dns_upstream") or "").split("//")[-1].split("/")[0].split(":")[0].strip()
+    if IP_LIKE.match(up):
+        targets.append((up, 53))
+    targets += [("1.1.1.1", 53), ("8.8.8.8", 53)]
+    for host, port in targets:
+        try:
+            sock = socket.create_connection((host, port), timeout=timeout)
+            sock.close()
+            return True, "%s:%s" % (host, port)
+        except Exception:
+            continue
+    return False, "%s:%s" % targets[0]
+
+
+def _net_state_write(state):
+    try:
+        NET_LIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(NET_LIVE_FILE, json.dumps(state, indent=1, sort_keys=True))
+    except Exception:
+        pass
+
+
+def _net_state_read():
+    try:
+        return json.loads(NET_LIVE_FILE.read_text(errors="ignore"))
+    except Exception:
+        return {}
+
+
+def net_sync(reason="", force=False, dry=False):
+    """Program the kernel layer. Returns a dict; never raises into a boot or a rebuild.
+
+    Three outcomes are designed rather than merely handled: already live (a no-op, so every update and
+    every boot may call it), refused by a guard (the counts say so out loud), and installed-but-
+    unhealthy (rolled back, loudly). "Quietly did nothing" is how a safety feature becomes a rumour,
+    so every mode string here is one `adquit net status` prints verbatim.
+    """
+    tables, meta = net_view(force=True)
+    res = {"mode": "", "reason": reason, "n_nets": meta["n_nets"], "generation": meta["generation"],
+           "n_refused": meta["n_refused"], "n_allowed": meta["n_allowed"],
+           "script": str(NET_NFT_SCRIPT)}
+    try:
+        atomic_write(NET_NFT_SCRIPT, nft_script(tables, meta))
+    except Exception as exc:
+        LOG.debug("nft preview not written: %s", exc)
+    if dry:
+        res["mode"] = "preview"
+        return res
+    if not cfg_bool("net_enforce", True):
+        if nft_available() and nft_root() and nft_live_generation() is not None:
+            net_off("net_enforce is off")
+        res["mode"] = "off"
+        res["detail"] = "net_enforce is false (names only)"
+        return res
+    if not meta["n_nets"]:
+        res["mode"] = "empty"
+        res["detail"] = "no compiled ranges - run: adquit gravity"
+        return res
+    if not nft_available():
+        res["mode"] = "no-nft"
+        res["detail"] = "no nft binary here (apt install nftables); the IP feeds stay inert"
+        return res
+    if not nft_root():
+        res["mode"] = "needs-root"
+        res["detail"] = "sudo adquit net sync"
+        return res
+    live = nft_live_generation()
+    if live == meta["generation"] and not force:
+        res.update({"mode": "live", "unchanged": True, "drops": nft_drops()})
+        return res
+    armed = net_arm_watchdog(meta["generation"])
+    rc, out = nft_run(["-f", str(NET_NFT_SCRIPT)])
+    if rc != 0:
+        net_disarm_watchdog()
+        _net_state_write({"generation": "", "mode": "error", "detail": out.strip()[:300],
+                          "reason": reason})
+        res["mode"] = "error"
+        res["detail"] = out.strip()[:300] or "nft rejected the script"
+        LOG.error("kernel layer not installed: %s", res["detail"])
+        return res
+    _NFT_LIST["t"] = 0.0
+    if nft_live_generation() != meta["generation"]:
+        nft_run(["delete", "table", "inet", NFT_TABLE])
+        net_disarm_watchdog()
+        _NFT_LIST["t"] = 0.0
+        res["mode"] = "error"
+        res["detail"] = "the table loaded but does not carry generation " + str(meta["generation"])
+        LOG.error("kernel layer failed verification: %s", res["detail"])
+        return res
+    ok, via = reachability_ok()
+    if not ok:
+        nft_run(["delete", "table", "inet", NFT_TABLE])
+        net_disarm_watchdog()
+        _NFT_LIST["t"] = 0.0
+        res["mode"] = "rolled-back"
+        res["detail"] = ("this box could not reach " + via + " after the install, so the table was "
+                         "removed again")
+        LOG.error("kernel layer rolled back: %s - names are still blocking and nothing else changed. "
+                  "`adquit net status` and `journalctl -u adquit` before re-enabling.", res["detail"])
+        return res
+    net_disarm_watchdog()
+    _net_state_write({"generation": meta["generation"], "mode": "live", "n_nets": meta["n_nets"],
+                      "reason": reason, "watchdog": armed, "via": via,
+                      "synced": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    res.update({"mode": "live", "watchdog": armed, "via": via, "drops": nft_drops()})
+    LOG.info("kernel layer live: %s ranges, generation %s%s", "{:,}".format(meta["n_nets"]),
+             meta["generation"], " (rollback timer armed)" if armed else "")
+    return res
+
+
+def net_off(why="manual"):
+    """Remove the table. Name blocking is untouched - this only undoes what this layer added."""
+    if not nft_available():
+        return {"mode": "no-nft", "detail": "there is no nft binary to talk to"}
+    if not nft_root():
+        return {"mode": "needs-root", "detail": "sudo adquit net off"}
+    net_disarm_watchdog()
+    rc, out = nft_run(["delete", "table", "inet", NFT_TABLE])
+    _NFT_LIST["t"] = 0.0
+    _net_state_write({"mode": "off", "detail": why,
+                      "synced": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    if rc != 0 and "No such file" not in out and "does not exist" not in out:
+        return {"mode": "error", "detail": out.strip()[:200]}
+    LOG.info("kernel layer removed (%s); DNS blocking is untouched", why)
+    return {"mode": "off", "detail": why}
+
+
+def net_status():
+    """Everything `adquit net status` and /api/net print. Read-only, safe to call from anywhere."""
+    tables, meta = net_view()
+    live = nft_live_generation()
+    last = _net_state_read()
+    out = {"enforce": cfg_bool("net_enforce", True), "n_nets": meta["n_nets"],
+           "n_v4": len(tables[4]), "n_v6": len(tables[6]), "n_refused": meta["n_refused"],
+           "n_allowed": meta["n_allowed"], "generation": meta["generation"],
+           "live_generation": live, "in_sync": bool(meta["n_nets"]) and live == meta["generation"],
+           "nft": nft_available(), "root": nft_root(), "script": str(NET_NFT_SCRIPT),
+           "compiled": meta.get("compiled") or "", "last_sync": last.get("synced") or "",
+           "last_mode": last.get("mode") or "", "detail": last.get("detail") or "",
+           "drops": nft_drops() if live is not None else 0,
+           "watchdog": NET_WATCH_FILE.exists(),
+           "refused": dict(list((meta.get("refused") or {}).items())[:8]),
+           "sources": sorted(((v, k) for k, v in (meta.get("srcs") or {}).items()), reverse=True)[:12]}
+    if live is None:
+        # "stale" and "absent" are different sentences to an operator: one means the kernel is
+        # holding an older build, the other means nothing is installed at all - which is exactly
+        # what a rollback leaves behind, and reporting it as stale would imply the table survived.
+        out["mode"] = ("off" if not out["enforce"] else "no-nft" if not nft_available()
+                       else "needs-root" if not nft_root() else
+                       "empty" if not meta["n_nets"] else "absent")
+    else:
+        out["mode"] = "live" if out["in_sync"] else ("stale" if live else "absent")
+    return out
+
+
+def cmd_net(argv=None):
+    """adquit net status|sync|dry-run|off|explain <ip>|allow <cidr>|deny <cidr>|sources"""
+    argv = [a for a in (argv or []) if a]
+    sub = argv[0] if argv and not argv[0].startswith("-") else "status"
+    rest = argv[1:] if argv and argv[0] == sub else argv
+    if sub in ("status", "show"):
+        st = net_status()
+        print("\n" + BOLD + "Kernel layer" + RESET + "  (the IP ranges a DNS answer cannot express)\n")
+        print("  compiled    " + "{:,}".format(st["n_nets"]) + " ranges (" + str(st["n_v4"])
+              + " v4, " + str(st["n_v6"]) + " v6), generation " + (st["generation"] or "-"))
+        if st["n_refused"]:
+            print("  refused     " + str(st["n_refused"]) + " by the guards: "
+                  + ", ".join("%s (%s)" % (v, k) for k, v in list(st["refused"].items())[:4]))
+        if st["n_allowed"]:
+            print("  allowed     " + str(st["n_allowed"])
+                  + " subtracted from data/custom_nets_allowed.txt")
+        if st["mode"] == "live":
+            print("  " + GREEN + "nftables" + RESET + "    table inet " + NFT_TABLE
+                  + " is live, generation " + str(st["live_generation"])
+                  + (" (" + "{:,}".format(st["drops"]) + " packets dropped)" if st["drops"] else ""))
+        elif st["mode"] == "off":
+            print("  " + YEL + "nftables" + RESET + "    net_enforce is off - the compiled ranges "
+                  "are not programmed")
+        elif st["mode"] == "no-nft":
+            print("  " + YEL + "nftables" + RESET + "    no nft binary here (apt install nftables)")
+        elif st["mode"] == "needs-root":
+            print("  " + YEL + "nftables" + RESET + "    compiled, not installed - "
+                  "run: sudo adquit net sync")
+        elif st["mode"] == "absent":
+            print("  " + YEL + "nftables" + RESET + "    nothing installed yet - "
+                  "run: sudo adquit net sync")
+        else:
+            print("  " + RED + "nftables" + RESET + "    " + st["mode"]
+                  + ((" - " + st["detail"]) if st["detail"] else ""))
+        if st["watchdog"]:
+            print("  " + YEL + "rollback" + RESET + "    a timer is armed; if the probe fails, the "
+                  "table comes off")
+        if st["last_sync"]:
+            print("  last sync   " + st["last_sync"] + " (" + st["last_mode"] + ")"
+                  + ((" - " + st["detail"]) if st["detail"] else ""))
+        print("  script      " + st["script"] + "\n")
+        return 0
+    if sub == "sync":
+        res = net_sync(reason="cli", force="--force" in rest, dry="--dry-run" in rest)
+        if res["mode"] == "preview":
+            print("[+] wrote " + str(res["script"]) + " - nothing installed (" + str(res["n_nets"])
+                  + " ranges, generation " + res["generation"] + ")")
+            return 0
+        if res["mode"] == "live":
+            print("[+] kernel layer live: " + "{:,}".format(res["n_nets"]) + " ranges, generation "
+                  + res["generation"] + (" (unchanged)" if res.get("unchanged") else ""))
+            return 0
+        print("[!] kernel layer not programmed: " + res["mode"]
+              + ((" - " + res["detail"]) if res.get("detail") else ""))
+        return 1 if res["mode"] in ("error", "rolled-back") else 0
+    if sub in ("dry-run", "preview"):
+        net_sync(reason="cli", dry=True)
+        try:
+            text = NET_NFT_SCRIPT.read_text(errors="ignore")
+        except Exception:
+            text = ""
+        lines = text.splitlines()
+        print("\n".join(lines[:46]))
+        if len(lines) > 46:
+            print("... " + str(len(lines) - 46) + " more lines - the whole file is in "
+                  + str(NET_NFT_SCRIPT))
+        print("\n" + DIM + "dry-run: nothing was installed. `sudo adquit net sync` does it for real."
+              + RESET)
+        return 0
+    if sub == "off":
+        res = net_off("adquit net off")
+        if res["mode"] == "off":
+            print("[+] kernel layer removed - DNS blocking untouched")
+            return 0
+        print("[!] kernel layer not removed: " + res["mode"]
+              + ((" - " + res["detail"]) if res.get("detail") else ""))
+        return 1
+    if sub == "explain":
+        if not rest:
+            print("[!] usage: adquit net explain <ip-or-cidr>")
+            return 2
+        bad = 0
+        for tok in rest:
+            verdict = net_verdict(tok)
+            if verdict["action"] == "block":
+                print(RED + "block" + RESET + "  " + str(verdict["address"]).ljust(38) + " "
+                      + str(verdict["cidr"]) + " (" + (verdict["source"] or "unknown feed") + ")")
+            elif verdict["action"] == "error":
+                print(YEL + "error" + RESET + "  " + tok.ljust(38) + " " + verdict["detail"])
+                bad += 1
+            else:
+                print(GREEN + "allow" + RESET + "  " + str(verdict["address"]).ljust(38)
+                      + " not inside any compiled range")
+        return 1 if bad and bad == len(rest) else 0
+    if sub in ("allow", "deny"):
+        if not rest:
+            print("[!] usage: adquit net " + sub + " <ip-or-cidr> [more...]")
+            return 2
+        path = NET_ALLOW if sub == "allow" else NET_CUSTOM
+        try:
+            lines = ([l.split("\t")[0].strip() for l in path.read_text(errors="ignore").splitlines()
+                      if l.strip() and not l.startswith("#")] if path.exists() else [])
+        except Exception:
+            lines = []
+        added, bad = [], []
+        for tok in rest:
+            cidr = _ip_token(tok)
+            if not cidr:
+                bad.append(tok)
+                continue
+            if cidr not in lines:
+                lines.append(cidr)
+                added.append(cidr)
+        if added or not bad:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write(path, "".join(l + "\n" for l in lines))
+            except Exception as exc:
+                print("[!] cannot write " + str(path) + ": " + str(exc)[:120])
+                return 1
+        if sub == "deny" and added:
+            build_net_tables(None)      # denies fold in at compile time; the feeds are unchanged
+        print("[+] " + sub + ": " + (", ".join(added) or "nothing new"))
+        if bad:
+            print("[!] not an IP or a CIDR: " + ", ".join(bad))
+            return 2
+        if sub == "deny" and added:
+            # accepted by the parser is not the same as accepted by the guards: a deny that is
+            # refused for sitting in reserved space has to be said out loud, or the operator
+            # believes they blocked something the kernel was never told about.
+            for cidr in added:
+                ok, why = net_guard(cidr)
+                if not ok:
+                    print("[!] refused by the guards: %s (%s) - not installed" % (cidr, why))
+                    return 1
+        res = net_sync(reason="net-" + sub, force=bool(added))
+        print("[i] kernel layer: " + res["mode"] + ((" - " + res["detail"]) if res.get("detail") else ""))
+        _notify_service()
+        return 0
+    if sub == "sources":
+        _tables, meta = net_view()
+        rows = sorted(((v, k) for k, v in (meta.get("srcs") or {}).items()), reverse=True)
+        print("\n" + BOLD + "Compiled IP ranges by source" + RESET
+              + "  (a feed counted here is one a resolver cannot use on its own)\n")
+        for n, lid in rows[:30]:
+            print("  " + str(lid).ljust(26) + " " + "{:,}".format(n))
+        if not rows:
+            print("  " + DIM + "nothing yet - the IP feeds are pulled by `adquit gravity`" + RESET)
+        print("")
+        return 0
+    print("[!] usage: adquit net status|sync|dry-run|off|explain <ip>|allow <cidr>|"
+          "deny <cidr>|sources")
+    return 2
+
+
 def rebuild_master_blocklist(persist=True):
     """Merge every enabled feed + seed + patterns into the live lookup tables."""
     global BLOCKED, WILDCARDS, UNBREAK
     with LIST_LOCK:
         blocked, wildcards, unbreak = {}, {}, set()
+        net_src = {}
         srcs = defaultdict(int)
         registry = all_lists()
 
@@ -1903,7 +3028,7 @@ def rebuild_master_blocklist(persist=True):
             fpath = LIST_DIR / ("%s.txt" % lid)
             if not fpath.exists():
                 continue
-            e, w, u = list_file(fpath)
+            e, w, u, n = parse_feed(fpath)
             cat, vec = info["cat"], info.get("vec", CAT.get(info["cat"], {}).get("vec", "banner"))
             if vector_active(vec, cat):
                 for d in e:
@@ -1913,7 +3038,10 @@ def rebuild_master_blocklist(persist=True):
                     if d not in wildcards:
                         wildcards[d] = (cat, vec, lid)
             unbreak |= u
-            srcs[lid] = len(e) + len(w)
+            for cidr in n:
+                # first feed to claim a range owns it, exactly as the name tables above do
+                net_src.setdefault(cidr, lid)
+            srcs[lid] = len(e) + len(w) + len(n)
 
         # 3. user blacklist
         if CUSTOM_BLOCK.exists():
@@ -1925,6 +3053,9 @@ def rebuild_master_blocklist(persist=True):
                         wildcards.setdefault(d, ("custom", "banner", "custom"))
 
         UNBREAK = unbreak
+        # Names and numbers from one pass over the same files: the ranges have nowhere else to come
+        # from, and a second read of 4.2M lines to find them would be the whole rebuild again.
+        build_net_tables(net_src)
         stats = defaultdict(int), defaultdict(int)
         vcount, ccount = stats
         custom = set()
@@ -1942,20 +3073,27 @@ def rebuild_master_blocklist(persist=True):
         # The native plane is installed *before* anything is written, because whether the index took
         # decides whether the big pickle is still needed as a fallback.
         global NATIVE
-        if cfg_bool("native_gravity", True):
+        if persist and cfg_bool("native_gravity", True):
             NATIVE = NativeGravity.install(blocked, wildcards)
             if NATIVE is not None:
                 blocked = _IndexView(NATIVE, False)
                 wildcards = _IndexView(NATIVE, True)
-        else:
+        elif persist:
             NATIVE = None
+        # `persist=False` is a throwaway: `adquit test` on a box with no cache, and every test
+        # harness that wants an answer without a side effect. `save_gravity_cache` is skipped below for
+        # exactly that reason, so the index on disk has to be skipped too - `NativeGravity.build` ends
+        # in os.replace(), which means a dry rebuild used to *publish* its tables as the live data
+        # plane for the next boot, half-saved (pickle written by a later rebuild or not at all) and
+        # stamped as current. It also closed the mapping this process was still reading through
+        # BLOCKED, which is how "rebuilt 275 rules" ended up answering `allow` for everything.
         BLOCKED = blocked
         WILDCARDS = wildcards
         if persist:
             save_gravity_cache(custom=custom)
         LOG.info("gravity rebuilt: %s exact + %s wildcard rules from %s feeds%s",
                  "{:,}".format(len(blocked)), "{:,}".format(len(wildcards)), len(srcs),
-                 " (native index)" if NATIVE is not None else "")
+                 " (native index)" if plane_is_index() else "")
         return len(blocked)
 
 
@@ -2304,7 +3442,7 @@ def _classify_uncached(d):
     # what the walk below does anyway.
     nf = None
     direct = None
-    if NATIVE is not None and not BLOCKED._over and not WILDCARDS._over:
+    if plane_is_index() and not BLOCKED._over and not WILDCARDS._over:
         nf = NATIVE.feed(d)
         if nf[0] == "exact":
             _c, _v, _s = nf[1]
@@ -2713,7 +3851,10 @@ def fetch_list(lid, session=None):
                 meta.write_text(json.dumps(cache_meta))
             except Exception:
                 pass
-            count = len(parse_source_bytes(raw)[0])
+            # A surge rule set carries its protection three ways (names, zones, ranges), so the
+            # badge counts all of them: a 53k-line feed that read as "0 rules" would look dead.
+            p_exact, p_wild, _p_unb, p_nets = parse_feed_bytes(raw)
+            count = len(p_exact) + len(p_wild) + len(p_nets)
             st.update({"state": "active", "count": count,
                        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"), "error": None})
             save_list_status()
@@ -2852,7 +3993,7 @@ def snapshot_stats():
     data = {"version": VERSION, "codename": CODENAME, "updated": int(time.time()),
             "total": TOTAL_QUERIES, "blocked": BLOCKED_QUERIES, "allowed": ALLOWED_QUERIES,
             "rules": len(BLOCKED), "wildcards": len(WILDCARDS), "clients": len(CLIENT_ACTIVITY),
-            "data_plane": "native-index" if NATIVE is not None else "python-dicts",
+            "data_plane": "native-index" if plane_is_index() else "python-dicts",
             "pattern_hits": PATTERN_HITS, "wildcard_hits": WILDCARD_HITS,
             "cache_hits": CACHE_HITS, "cache_size": len(DECISION_CACHE),
             "uptime": int(time.time() - START_TIME), "mode": CFG.get("block_mode"),
@@ -3247,6 +4388,11 @@ def dns_udp_worker():
         CFG["dns_bind_error"] = str(exc)
         save_config()
         return
+    if CFG.pop("dns_bind_error", None) is not None:
+        # It lives in config.json so `doctor` can explain a dead service after a restart - which also
+        # means a bind that failed once would keep the dashboard promising "DNS Active" forever, on a
+        # box that is now answering queries fine. A successful bind clears the claim in both directions.
+        save_config()
     _udp_sock = sock
     DNS_POOL = ThreadPoolExecutor(max_workers=max(4, int(CFG.get("dns_workers", 32))))
     LOG.info("DNS ready on 0.0.0.0:%s (udp+tcp, %s workers)", port,
@@ -3736,6 +4882,8 @@ def render_page(tpl, nav, page_title="Dashboard", msg="", msg_type="ok", **kw):
     ctx = dict(a=nav, page_title=page_title, title=page_title, msg=msg, msg_type=msg_type,
                blocked_count=BLOCKED_QUERIES, rules_total=len(BLOCKED) + len(WILDCARDS),
                dns_port=CFG.get("dns_port", 53), web_port=CFG.get("web_port", 8080),
+               dns_ok=not CFG.get("dns_bind_error"),
+               dns_hint=str(CFG.get("dns_bind_error") or "").strip(),
                version=VERSION, codename=CODENAME, mode=CFG.get("block_mode", "strict"),
                mode_name=(MODES.get(CFG.get("block_mode", "strict"), MODES["strict"]))["name"],
                feeds=len(CFG.get("enabled_lists", [])), cat_count=len(CAT),
@@ -3804,6 +4952,9 @@ def stats_payload():
         "hourly": {"queries": list(HOURLY), "blocked": list(HOURLY_BLOCKED)},
         "refresh": dict(REFRESH_PROGRESS),
         "security_events": list(SECURITY_EVENTS)[:40],
+        "net_ranges": NET_META.get("n_nets", 0), "net_refused": NET_META.get("n_refused", 0),
+        "net_allowed": NET_META.get("n_allowed", 0),
+        "net_generation": NET_META.get("generation", ""),
     }
 
 
@@ -3956,7 +5107,7 @@ input:checked+.sl2:before{transform:translateX(18px)}
 <a class="ni {% if a=='sett' %}active{% endif %}" href="/settings"><i class="fa-solid fa-gear"></i> Settings</a>
 </div>
 <div class="sf">
-<div style="font-size:11px;color:var(--mut)"><i class="fa-solid fa-circle" style="color:var(--grn);font-size:8px"></i> DNS Active (:{ dns_port })</div>
+<div style="font-size:11px;color:var(--mut)"><i class="fa-solid fa-circle" style="color:var({{ '--grn' if dns_ok else '--red' }});font-size:8px"></i> {% if dns_ok %}DNS answering UDP :{{ dns_port }}{% else %}DNS NOT answering :{{ dns_port }}{% endif %}</div>
 <a class="lo" href="/logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
 </div></div>
 <div class="main">
@@ -3989,6 +5140,23 @@ PAGE_DASH = """
 <div class="sl">Time Saved</div><div class="sv" style="color:var(--sec)">{{ time_saved }}</div>
 <div class="ss">~1.5s / blocked tracker</div></div>
 </div>
+{% if not dns_ok or client_count == 0 %}<div class="card"{% if not dns_ok %} style="border-color:rgba(239,68,68,.45)"{% endif %}>
+<div class="ch"><div class="ct"><i class="fa-solid fa-{{ 'triangle-exclamation' if not dns_ok else 'route' }}" style="color:var({{ '--red' if not dns_ok else '--yel' }})"></i> {% if not dns_ok %}The resolver is not listening{% else %}Nothing is asking this box yet{% endif %}</div></div>
+<div style="font-size:13px;line-height:1.75;color:var(--mut)">
+{% if not dns_ok %}
+UDP/{{ dns_port }} is taken, so no device can be blocked from here until that changes.{% if dns_hint %} The bind said: <code>{{ dns_hint }}</code>.{% endif %}
+<code>sudo adquit doctor</code> names whatever owns the port (systemd-resolved is the usual one, and
+<code>sudo adquit protect</code> hands it over); <code>adquit set dns_port 5353</code> moves the fortress
+instead - but then no client will find it unless you tell them where it lives.
+{% else %}
+Blocking starts when a device sends its DNS here, and none has yet. Point your router's DNS at
+{% if box_ip %}<code>{{ box_ip }}:{{ dns_port }}</code> to cover the house, or set it on one device
+first and watch <code>/logs</code> fill up.{% else %}this box&rsquo;s LAN address &mdash;
+<code>adquit lan</code> prints it, because the address a box sends traffic out on is not always one a
+neighbour can reach &mdash; then watch <code>/logs</code> fill up.{% endif %}
+<code>sudo adquit protect</code> does it for this machine alone.
+{% endif %}
+</div></div>{% endif %}
 <div style="display:grid;grid-template-columns:2fr 1fr;gap:20px;margin-bottom:20px">
 <div class="card" style="margin-bottom:0"><div class="ch">
 <div class="ct"><i class="fa-solid fa-shield-virus" style="color:var(--pri)"></i> Threat Category Distribution</div></div>
@@ -4060,6 +5228,11 @@ PAGE_SEC = """
 <div class="ct"><i class="fa-solid fa-network-wired"></i> Client Inspection</div></div>
 <table class="tbl"><thead><tr>
 <th>IP</th><th>Total</th><th>Threats</th><th>Block Ratio</th><th>Last Seen</th></tr></thead><tbody>
+<div style="padding:0 16px 10px;font-size:12px;color:var(--mut)">A client is an address that has asked
+this resolver a question since it started &mdash; a DNS query carries no hostname, so a device that has not
+queried yet is simply not here, and one that asks another resolver is invisible to every DNS filter.
+<code>adquit lan</code> prints this box&rsquo;s addresses; <code>adquit site list</code> and
+<code>adquit lan-zone</code> show the names it answers for.</div>
 {% for ip, d in clients.items() %}<tr>
 <td><code>{{ ip }}</code></td><td>{{ "{:,}".format(d.total) }}</td>
 <td>{% if d.threats > 0 %}<span class="bdg" style="background:rgba(239,68,68,.2);color:var(--red)">{{ d.threats }}</span>
@@ -4569,7 +5742,17 @@ def page_dashboard():
                       "pct": int(b * 100.0 / peak) if peak else 0,
                       "rest": int((q - b) * 100.0 / peak) if peak else 0})
     hits_total = max(1, TOTAL_QUERIES)
+    # "point your router at this" is only worth saying with an address a device can reach: the
+    # outbound-socket trick answers 169.254.x on a box with no default route, and a link-local
+    # address in a router's DNS field is a support ticket, not a configuration.
+    box_ip = ""
+    try:
+        _a = ipaddress.ip_address(fortress_ip())
+        box_ip = "" if (_a.is_loopback or _a.is_link_local or _a.is_unspecified) else str(_a)
+    except ValueError:
+        pass
     return render_page(PAGE_DASH, "dash", "Network Overview",
+        box_ip=box_ip,
         total_queries=TOTAL_QUERIES, blocked_queries=BLOCKED_QUERIES, block_rate=br,
         bandwidth_saved=human_bytes(bw), time_saved=human_duration(ts),
         client_count=len(CLIENT_ACTIVITY), rule_count=total_rules,
@@ -5014,6 +6197,12 @@ def api_stats():
 @app.route("/health")
 def api_health_alias():
     return api_health()
+
+
+@app.route("/api/net")
+def api_net():
+    """The kernel layer exactly as `adquit net status` reads it - live, never a stale copy."""
+    return jsonify(net_status())
 
 
 @app.route("/api/health")
@@ -5473,6 +6662,35 @@ def cmd_doctor():
                            "nameservers: %s" % ", ".join(names) or "none"))
         except Exception:
             pass
+    # The kernel layer gets its own line, because "we meant to program the packet filter and did not"
+    # is a claim worth checking rather than a detail. Nothing names a domain less than a running
+    # resolver, so a refusal here is never a reason to doubt the blocking that is in fact happening.
+    try:
+        if not NET_META.get("n_nets"):
+            load_nets()
+        nst = net_status()
+        if nst["mode"] == "live":
+            checks.append(("kernel layer (IP ranges)", True, "%s ranges, gen %s, %s drops" % (
+                "{:,}".format(nst["n_nets"]), nst["generation"] or "-",
+                "{:,}".format(nst["drops"]))))
+        elif nst["mode"] == "off":
+            checks.append(("kernel layer (IP ranges)", True, "net_enforce is off - names only"))
+        elif not nst["n_nets"]:
+            checks.append(("kernel layer (IP ranges)", True,
+                           "no IP feeds compiled yet (run: adquit gravity)"))
+        elif not nst["nft"]:
+            checks.append(("kernel layer (IP ranges)", False,
+                           "%s ranges compiled, no nft binary (apt install nftables)" % nst["n_nets"]))
+        elif not nst["root"]:
+            checks.append(("kernel layer (IP ranges)", False,
+                           "%s ranges compiled but not installed (sudo adquit net sync)"
+                           % nst["n_nets"]))
+        else:
+            checks.append(("kernel layer (IP ranges)", False,
+                           nst["detail"] or "%s != live %s" % (nst["generation"],
+                                                                nst["live_generation"])))
+    except Exception as exc:
+        checks.append(("kernel layer (IP ranges)", False, str(exc)[:60]))
     for label, ok, detail in checks:
         if not ok:
             problems += 1
@@ -5582,7 +6800,8 @@ def cli(argv):
               "  --update-lists | --rebuild | --verify-lists | --mode <name>\n"
               "  --block <domain...> | --allow <domain...> | --unblock <domain>\n"
               "  --set-auth <user> <pass> | --set <key> <value> | --get <key>\n"
-              "  --top | --health | --version | --export ublock [file] | --intel <domain>")
+              "  --top | --health | --version | --export ublock [file] | --intel <domain>\n"
+              "  --net status|sync|explain <ip>|allow <cidr>|deny <cidr>|off|sources")
         return 0
     if cmd in ("--stats", "stats"):
         return cmd_stats()
@@ -5733,6 +6952,14 @@ def cli(argv):
         print("[+] removed %s custom rules" % sum(1 for r in removed if r))
         _notify_service()
         return 0
+    if cmd in ("--net", "net"):
+        return cmd_net(rest)
+    if cmd in ("--net-sync",):
+        return cmd_net(["sync"] + [a for a in rest if a in ("--force", "--dry-run")])
+    if cmd in ("--net-rollback",):
+        # the rollback timer's target. The guard against a stale timer acting on a fresh install
+        # lives in net_rollback(), which is why this can stay a one-liner.
+        return 0 if net_rollback(rest[0] if rest else "") else 1
     if cmd in ("--set-auth",):
         if len(rest) < 2:
             print("[!] usage: --set-auth <username> <password>")
@@ -5857,6 +7084,19 @@ def main():
         rebuild_master_blocklist()
     _sync_legacy_views(custom_blocked)
     _write_banners()
+    # The compiled ranges are a text file and a few thousand of them, so this costs milliseconds and
+    # buys `net status`/`doctor` an answer before any sync happens. The kernel table, by contrast, is
+    # gone the moment the box reboots: without this the enforcement would quietly vanish the morning
+    # after an update, and only a `doctor` nobody runs would say so.
+    load_nets()
+    if cfg_bool("net_enforce", True):
+        try:
+            _ns = net_sync(reason="boot")
+            if _ns.get("mode") not in ("live", "off", "empty", "no-nft", "needs-root"):
+                LOG.warning("kernel layer did not come up at boot: %s (%s) - names are unaffected",
+                            _ns.get("mode"), _ns.get("detail") or "no detail")
+        except Exception as exc:
+            LOG.warning("kernel layer could not load at boot: %s - names are unaffected", exc)
     start_engine_threads()
     port = int(CFG.get("web_port", 8080))
     LOG.info("dashboard on http://0.0.0.0:%s (user: %s) - rules: %s, ready in %.1fs", port,

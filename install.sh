@@ -12,6 +12,7 @@
 #   ADQUIT_WEB_PORT=8080                         dashboard port
 #   ADQUIT_DNS_PORT=53                            DNS port
 #   ADQUIT_UPSTREAM=1.1.1.1                       upstream resolver
+#   ADQUIT_NO_HARDEN=1                            leave the kernel sysctls as they are
 #   ADQUIT_SKIP_LISTS=1                          do not download blocklists now
 #   ADQUIT_NO_CLI=1                              do not link /usr/local/bin/adquit
 #   ADQUIT_REPO / ADQUIT_REF                     fork + branch to install from
@@ -23,7 +24,7 @@ REF="${ADQUIT_REF:-main}"
 RAW="https://raw.githubusercontent.com/$REPO/$REF"
 TARBALL="https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF"
 SERVICE="adquit"
-INSTALLER_VERSION="19.3"          # this script
+INSTALLER_VERSION="19.4"          # this script
 MIN_APP_VERSION="${ADQUIT_MIN_APP:-19.0}"   # refuse to install an older engine beside a newer CLI
 HOME_DIR="${ADQUIT_HOME:-/opt/adquit}"
 PROFILE="${ADQUIT_MODE:-strict}"
@@ -245,6 +246,24 @@ ExecStart=$VPY $HOME_DIR/app.py --serve
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
+# Sandboxing. The service writes only under $HOME_DIR, so /usr, /boot and /etc are mounted
+# read-only for it: if a future version reaches for /etc/hosts by mistake it fails here, loudly,
+# instead of quietly editing the host it is supposed to be protecting. It can still read
+# /etc/resolv.conf, which is all doctor asks of /etc. No setuid helpers are used, so no new
+# privileges are allowed; AF_NETLINK stays open because doctor asks "ss" who owns port 53.
+# Deliberately NOT enabled: ProtectSystem=strict (the app must write $HOME_DIR/lib/native, and a
+# ReadOnlyPaths list there would be a bigger footgun than the gain) and MemoryDenyWriteExecute
+# (it buys nothing here and breaks wheels that mmap executable memory).
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGEN=yes
+LockPersonality=yes
+RestrictRealtime=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
@@ -321,6 +340,18 @@ elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 
 else
     note "no active host firewall - nothing to open (a cloud box still needs its security group)"
 fi
+# Kernel defaults. This is not ad blocking: rp_filter, SYN cookies, martian logging and a
+# refusal to accept redirects are the boring settings a box that everyone on the LAN points at
+# should have. It calls the same code as "adquit harden on" rather than duplicating the list, and
+# that command restores what was here before - so the installer is not a one-way door.
+if [ "$IS_ROOT" = "1" ] && [ "$(uname)" = "Linux" ] && [ "${ADQUIT_NO_HARDEN:-0}" != "1" ] \
+        && command -v sysctl >/dev/null 2>&1 && [ -x "$HOME_DIR/bin/adquit" ]; then
+    if "$HOME_DIR/bin/adquit" harden on >/dev/null 2>&1; then
+        note "kernel sysctls hardened (undo: sudo adquit harden off)"
+    else
+        note "sysctl hardening skipped - sudo adquit harden on does it by hand"
+    fi
+fi
 if [ "$NO_CLI" != "1" ]; then
     CLI_TARGET="/usr/local/bin/adquit"
     if [ "$IS_ROOT" = "0" ]; then
@@ -348,14 +379,14 @@ _adquit_completions() {
     local cmds
     cmds="start stop restart status logs watch run install update upgrade gravity mode"
     cmds="$cmds block allow unblock blocklist test doctor verify-lists stats json top rules"
-    cmds="$cmds passwd protect uninstall help version"
+    cmds="$cmds passwd protect harden net uninstall help version"
     COMPREPLY=( $(compgen -W "$cmds" -- "${COMP_WORDS[COMP_CWORD]}") )
 }
 complete -F _adquit_completions adquit
 CMP
     cat > "$HOME_DIR/completions/_adquit" 2>/dev/null <<'CMP' || true
 #compdef adquit
-_adquit() { _arguments '*:command:(start stop restart status logs watch run install update gravity mode block allow unblock blocklist test doctor verify-lists stats json top rules passwd protect uninstall help version)' ; }
+_adquit() { _arguments '*:command:(start stop restart status logs watch run install update gravity mode block allow unblock blocklist test doctor verify-lists stats json top rules passwd protect harden net uninstall help version)' ; }
 _adquit "$@"
 CMP
 fi
@@ -424,6 +455,7 @@ printf "   login         ${B}admin${N} / ${B}%s${N}%s\n" "$PW" \
     "${RANDOM_PW:+   (kept in $STATE, root-only, until you set your own: sudo adquit passwd --show)}"
 printf "   dns server    ${B}%s:%s${N}\n" "$IP" "$DNS_PORT"
 printf "   rules         see 'adquit stats' after the first gravity pull\n"
+printf "   kernel layer    ${D}IP ranges in nftables - sudo adquit net status${N}\n"
 LAN_HOST="$(hostname 2>/dev/null || echo host)"
 case "$LAN_HOST" in *.local) : ;; *) LAN_HOST="$LAN_HOST.local";; esac
 printf "   from any device on this network: http://%s:$WEB_PORT\n" "$LAN_HOST"

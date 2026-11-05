@@ -12,14 +12,16 @@ Then, on that machine, forever:
 adquit            # start (auto-installs itself if you skipped the one-liner)
 ```
 
-**v19.2 “Omni-Shield”** — 131 blocklist feeds, 21 categories, 16 ad vectors, a wildcard +
+**v19.4 “Omni-Shield”** — 133 blocklist feeds, 21 categories, 16 ad vectors, a wildcard +
 pattern engine for ad infrastructure that no list has seen yet, a zero-pixel creative sinkhole,
+**and a kernel layer for the feeds a name filter cannot express at all** (Spamhaus netblocks and
+the IP half of Surge/Shadowrocket rule sets, as one atomic nftables table behind three guards),
 and a `adquit` CLI that does everything: start, stop, block, allow, modes, gravity, self-test,
-doctor, stats — plus LAN self-hosting, so the box that kills your ads also answers
+doctor, stats, net, harden — plus LAN self-hosting, so the box that kills your ads also answers
 `media.lan`, `nas.lan` and `dashboard.lan` and can front all of them on port 80.
 Single Python file, three PyPI dependencies, no database, no Docker required.
 
-![version](https://img.shields.io/badge/version-19.2-brightgreen)
+![version](https://img.shields.io/badge/version-19.4-brightgreen)
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![deps](https://img.shields.io/badge/dependencies-3-informational)
 ![license](https://img.shields.io/badge/license-MIT-yellow)
@@ -31,18 +33,19 @@ Single Python file, three PyPI dependencies, no database, no Docker required.
 
 | | |
 |---|---|
-| 🎯 **131 feeds / 21 categories** | Ad networks, in-app SDKs, CTV, native, push, exchanges, mail pixels, fingerprinting, telemetry, malware, phishing, spam, cryptojacking, regional filters |
+| 🎯 **133 feeds / 21 categories** | Ad networks, in-app SDKs, CTV, native, push, exchanges, mail pixels, fingerprinting, telemetry, malware, phishing, spam, cryptojacking, regional filters |
 | 🐜 **Micro-ad blocking** | Impression beacons, 1×1 pixels, SDK handshakes, RTB bidding calls, audience-sync, device fingerprinting, session replay, email open tracking |
 | 📢 **Macro-ad blocking** | Display banners, pre/mid-roll video endpoints, pop-unders, interstitials, native “sponsored” units, smart-TV ads, push-notification ads, shopping/affiliate units |
 | 🧠 **Pattern + wildcard engine** | `*.adnetwork.com` zones, ad-infrastructure host labels (`ads.`, `prebid.`, `banner.`…) and 100+ ad-tech keywords — catches brand-new hosts that no list knows yet |
 | 🕳️ **Zero-pixel creative sinkhole** | Optional: sinkhole the ad host to the fortress and answer with an empty GIF/JS/CSS so ad slots collapse instead of hanging on a spinner |
+| 🧱 **IP ranges, in the kernel** | the feeds a DNS answer cannot use — Spamhaus DROP/EDROP, ET compromised, blocklist.de, the `IP-CIDR` half of SAA — become one nftables table: prefix floor, never-block set for reserved space *and this host*, `ct state established` first, and a rollback if the box stops reaching its own upstream |
 | ⚡ **Fast by design** | the 4M-rule blocklist lives in a **memory-mapped C index** instead of Python dicts, TTL decision cache + upstream response cache, bounded DNS thread pool, UDP **and** TCP DNS, pickled gravity cache (instant restart), conditional-GET feed pulls |
 | 📊 **Dashboard** | Brave-Shield style analytics, 24 h sparkline, top blocked hosts, per-client inspection, security events, live query log |
 | 🧪 **Coverage matrix** | A page that shows exactly which ad vectors are armed, how many rules back each one, and lets you flip macro/micro/CTV/push/exchange/email coverage with one click |
 | 🔬 **Domain lab** | Type any hostname and watch the 8-layer decision trace: whitelist → feed → wildcard → unbreak → in-video → keyword pattern → label pattern → heuristics |
 | 🤖 **Optional AI triage** | Free-tier OpenRouter classification of unknown domains (off by default) |
 | 🔐 **Hardened** | Random session/API tokens, no more “admin works even after rename”, rate limiting, DNS-rebinding guard, DGA + homograph detection, ANY-query refusal |
-| 🧰 **`adquit` CLI** | `start stop restart status logs watch mode block allow unblock gravity test doctor stats json top rules passwd protect uninstall` |
+| 🧰 **`adquit` CLI** | `start stop restart status logs watch mode block allow unblock gravity test doctor stats json top rules passwd protect net harden uninstall` |
 
 ---
 
@@ -121,6 +124,7 @@ curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/main/
 | `ADQUIT_UPSTREAM` | upstream resolver | `1.1.1.1` |
 | `ADQUIT_SKIP_LISTS` | `1` = don’t download feeds during install | `0` |
 | `ADQUIT_USER` | `1` = rootless install | `0` |
+| `ADQUIT_NO_HARDEN` | `1` = leave the kernel sysctls alone during install | `0` |
 | `ADQUIT_REPO` / `ADQUIT_REF` | install from a fork/branch | this repo / `main` |
 
 ---
@@ -138,7 +142,7 @@ adquit blocklist add https://example.com/list.txt "My feed"
 adquit gravity              re-download every enabled feed and recompile
 adquit test                 prove it works: engine self-test + live DNS probe
 adquit doctor               port/resolver/dependency/feed diagnostics
-adquit verify-lists         check that all 131 feed URLs are reachable
+adquit verify-lists         check that all 133 feed URLs are reachable
 adquit rules google.com     ask the engine about any hostname
 adquit intel scam-ads.biz   who owns that landing page (RDAP age/registrar) + verdict
 adquit export ublock         publish the same rules as a browser filter list
@@ -157,6 +161,12 @@ adquit passwd --show        the login for this box: username, link, and the pass
                             it is still the one in use (a password you set yourself is stored as a
                             SHA-256 and cannot be read back - only rotated)
 adquit protect on|off       repoint THIS machine's DNS at the fortress
+adquit net status           the IP ranges in the kernel: compiled count, live generation, drops
+adquit net dry-run          the exact nftables script, with nothing installed and nobody root
+sudo adquit net sync        program it now (atomic, verified, rolled back if the probe fails)
+adquit net explain 8.20.0.9     what the kernel would do with that packet, and which feed said so
+adquit net allow 1.2.3.4 | deny 5.6.7.8 | sources | off
+adquit harden on|off|status     rp_filter, SYN cookies, martians, redirects (previous values kept)
 adquit update               pull the newest fortress, rebuild, refresh, restart
                             (follows the install's channel; "already up to date" when the
                              engine is byte-identical, refuses only a real downgrade)
@@ -213,11 +223,105 @@ see what would have broken before you arm it.
 
 ---
 
+## The kernel layer: what an IP range can do that an NXDOMAIN cannot
+
+A DNS sinkhole is a **name** filter, and some feeds are not names. Spamhaus DROP, Emerging Threats
+compromised hosts, blocklist.de and the `IP-CIDR` half of a Surge/Shadowrocket rule set are lists of
+*addresses*. Those files were already being downloaded and counted on the dashboard, and every line
+of them was then discarded by `norm_domain()` — which was quite right to refuse `192.0.2.0/24` as a
+domain, and was also the only thing that ever looked at them. Measured on the real SAA rule set: the
+old parser found **0 rules in 53,100 lines**; the current one finds **52,911 names, 4,253 zones and
+125 IP ranges in 0.24 s**, and spends the ranges on the layer that can use them.
+
+```bash
+adquit net dry-run          # the exact nftables script; installs nothing, needs no root
+sudo adquit net sync        # program it (atomic, verified, rolled back if the probe fails)
+adquit net status           # compiled generation vs the one the kernel holds, counts, drops
+adquit net explain 8.20.0.9 # what would happen to that packet, and which feed said so
+adquit net allow 1.2.3.4    # your exception, as an accept rule in front of the drops
+adquit net deny 5.6.7.8     # your own range, folded in on the next rebuild
+adquit net sources          # how many ranges each feed contributed
+```
+
+Gravity compiles the ranges on the same pass that compiles the names, writes `data/net/nets.txt`, and
+— when `net_enforce` is on and this box has `nft` and the privileges to use it — programs one table,
+`inet adquit`, hooked on `forward` and `output`. Three guards are what makes that safe to enable by
+default rather than a flag only a brave operator would pull:
+
+| guard | what it refuses |
+|---|---|
+| **prefix floor** | anything broader than `/12` (v4) or `/32` (v6): a feed that wakes up claiming `1.0.0.0/8` cannot blackhole a fifth of the internet. `net_min_prefix4` moves the floor if you truly want it moved |
+| **never-block set** | reserved, private, link-local, anycast and documentation space, **plus this box**: its interface addresses, its default gateway, its configured upstream and whatever `/etc/resolv.conf` still names. A range that merely *contains* one of those is refused rather than narrowed |
+| **probe and rollback** | after the install, the table has to report the generation it was handed *and* the box has to still reach its upstream. Either way round, failure means the table is deleted again — and while a sync is in flight a `systemd-run` timer holds that delete-order, so a machine that dies mid-sync does not come back half-filtered |
+
+Order inside the table is part of the design: `ct state established,related accept` runs before any
+drop, so **no list update cuts a live flow**, and ICMP/ICMPv6 is accepted so path-MTU discovery never
+depends on a blocklist. The whole replacement is a single `nft -f` transaction — that, and not a
+"graceful reload" flag, is what "reload without dropping existing connections" means at this layer.
+`nft` itself checks the script: the suite hands the generated file to nftables' own parser in CI,
+after proving that same parser rejects a script that really is broken.
+
+And, in plain words, **what this layer is not**:
+
+* **not a proxy.** No TLS is terminated, no CA is installed on your phones, TVs and consoles, no
+  client is configured at all. A gateway on the path sees a ClientHello's SNI and nothing else, so
+  HTTPS *paths* (`/pagead/…`, `adformat=`, `get_video_info`) are invisible to it by construction —
+  not by laziness. Those are handled at the name and endpoint layer, where they are actually visible.
+  A rule set's `URL-Regex` lines are therefore read and deliberately dropped, so no client config can
+  make this box look like it filters paths when it cannot see them.
+* **not a gateway.** Nothing here turns on `ip_forward`, NAT or a default route. This box stays a
+  resolver that also happens to hold a packet filter, so it cannot become the reason the house has no
+  internet — the one failure mode a transparent-inline design has to be talked into.
+* **not an inbound firewall.** `input` is deliberately not hooked: a third party's blocklist must
+  never stand between you and your own SSH session, and small ISPs do end up in abuse feeds.
+* **not a promise about QUIC.** Much Google ad traffic now rides UDP/443, where SNI is encrypted and
+  even the destination is often a shared CDN address. The name is still blocked at DNS; the ranges
+  are what catch a client that had the address cached already. That asymmetry is the argument for
+  this layer existing, not evidence that it finishes the job.
+
+`adquit set net_enforce false` (or `sudo adquit net off`, and `uninstall.sh` does it too) leaves the
+box exactly as it was: names only, nothing in the kernel. The two feeds nobody should be handed by
+default — `spamhaus_edrop`, which includes some small ISPs, and any you add yourself — are toggles in
+`adquit mode` / the dashboard's feed list, never a surprise.
+
+### Kernel defaults: `adquit harden`
+
+A box the whole LAN points at should not be trusting source routes or accepting redirects.
+`sudo adquit harden on` writes `/etc/sysctl.d/99-adquit.conf` — strict `rp_filter`, SYN cookies,
+martian logging, no redirects, no source routes — applies it live, and keeps the values it found so
+`adquit harden off` restores *those*, not its own idea of a default. `adquit harden status` prints the
+table with what is set and what is wanted. `install.sh` runs it (decline with `ADQUIT_NO_HARDEN=1`) and
+`uninstall.sh` undoes it. This is not ad blocking: it is why the box is a harder thing to own, and the
+same `rp_filter` that is right for one path in and out is wrong for asymmetric routing, which is why
+it is a command with an `off` rather than a line in a hardening script nobody can find.
+
+The systemd unit is sandboxed on the same principle rather than by fashion: `ProtectSystem=full`
+(`/usr`, `/boot`, `/etc` read-only — the service writes only under its own home, and reads
+`/etc/resolv.conf`), `ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`,
+`RestrictSUIDSGEN`, `LockPersonality`, `RestrictRealtime`, `ProtectKernelModules`,
+`ProtectControlGroups`, and `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` — netlink
+stays open because `doctor` asks `ss` who owns port 53. `ProtectSystem=strict` is deliberately *not*
+set: the native index is written under the install directory, and a `ReadOnlyPaths` list long enough
+to work around that is a bigger footgun than the gain. `MemoryDenyWriteExecute` is off for the same
+kind of reason: it buys nothing here and it breaks wheels that mmap executable memory.
+
+---
+
 ## Using it
 
 **Dashboard** — `http://<box-ip>:8080`, login `admin` / the password printed at install
 (`adquit passwd --show` while that one is still current, `adquit passwd` to set a new one). Pages: Dashboard · Security Center · Blocklists · **Ad Coverage
-Matrix** · **Domain Lab** · Protection Modes · Live Query Logs · Custom Rules · Settings.
+Matrix** · **Domain Lab** · Protection Modes · Live Query Logs · Custom Rules · Settings. A box with no
+clients on it yet opens on a card that says so and prints the address to point at — the instructions
+live next to the state that makes them true, rather than in a page nobody opens.
+
+**Which devices are behind it** — *Security Center → Client Inspection*: every address that has asked
+this resolver a question since it started, with its totals, block ratio, last sighting and the five names
+it asked about most. That is what a DNS filter can honestly know: a query carries no hostname and no
+device identity, so a device that has not queried yet is not in the list, one pointed at another resolver
+is invisible to *every* DNS filter, and a laptop that roams off the Wi-Fi keeps its old row until it ages
+out. Nothing here scans the LAN — `adquit lan` prints the addresses this box answers on, and
+`adquit site list` / `adquit lan-zone` the names it resolves for it.
 
 **Protect your network** — set your router’s DNS (IPv4) to the fortress IP. Every device —
 phones, TVs, consoles, laptops — is covered with zero per-device setup, including apps where
@@ -398,7 +502,7 @@ blocker and the web server are the same box on purpose.
 * **Packaging** — the `adquit` CLI, a real one-command installer (idempotent, sudo-aware,
   rootless mode, logrotate, firewall, systemd-resolved handoff, v18 migration), Dockerfile +
   compose, CI (tests on 3.8/3.11/3.12 + a containerised install smoke test), release workflow,
-  MIT licence, 101-test offline suite (engine, API, UI, exports, dependency gate,
+  MIT licence, 131-test offline suite (engine, API, UI, exports, dependency gate,
   source hygiene).
 * **Ops** — `adquit doctor`, `adquit test`, `adquit verify-lists`, JSON stats snapshot so
   `adquit stats` answers even when the web layer is down.
@@ -419,13 +523,14 @@ blocker and the web server are the same box on purpose.
 | `refusing to install app.py v18.0 …` / `no version stamp` | The installer noticed the ref is behind itself and stopped rather than half-installing. Pass `ADQUIT_REF=<branch>` or merge. |
 | `service did not become healthy`, or `state down` while `journalctl` shows the unit running | Almost always a **warm-up**, not a crash: loading a 5M-rule gravity cache takes tens of seconds on a small box, and the health probe used to give up at 15s and stop the service mid-boot. v19.1 sizes the wait from the cache and reports `warming up`. Raise it with `ADQUIT_START_WAIT=<seconds>` (e.g. `sudo env ADQUIT_START_WAIT=300 adquit restart`). |
 | Restart takes as long as a first install | It shouldn't any more: a boot with a valid gravity cache used to rebuild every feed from disk before binding the port. `adquit logs` now says `gravity cache restored ... ready in Ns` instead of `building gravity from 99 enabled feeds`. With the native index built (`make native`, or an install/update on a box with a compiler) it says `gravity restored from the native index ... no rows held in python` and the load is a mmap, not an unpickle. |
+| `adquit net status` says `needs-root` or `no nft binary` | Both are honest, not broken: the ranges are compiled and the script is written to `data/net/adquit.nft`, but nothing was installed. `sudo adquit net sync`, or `apt install nftables` first. DNS blocking does not depend on either. |
 | `adquit doctor` says `the index on disk was refused` | The stamps that guard it did not match the feeds (a refresh died mid-write, or the files were edited by hand). It is a rebuild away: `sudo adquit gravity`. |
 | `already up to date - engine vX is byte-identical` | Not an error: your channel has no newer commit. Blocklists are updated separately with `adquit gravity`. |
 | `refusing to downgrade vA -> vB` | The channel genuinely holds an **older** engine than you run (v19.1+ compares content, not just the stamp, so same-version commits update normally). Point `ADQUIT_REF` at the right branch, or `sudo adquit update --force` to allow it. `ADQUIT_FORCE=1` alone does nothing through `sudo` - the environment is reset. |
 | `adquit update` refuses, and the refusal makes no sense | If the CLI on your box predates v19.1 it has no escape hatch of its own: the guard that is misfiring is the one you are running. Re-install in place instead - it refreshes `app.py` **and** the CLI and leaves `data/` (config, custom blocks, allows, lists) alone: `curl -fsSL https://raw.githubusercontent.com/AfzalAshraf/NetBlock-Fortress/<your-ref>/install.sh \| sudo env ADQUIT_REF=<your-ref> bash` |
 | `port 53 is already in use` | `adquit doctor` names the squatter (usually `systemd-resolved`); the installer writes a `DNSStubListener=no` drop-in for exactly that, or use `ADQUIT_DNS_PORT=5353`. |
 | something you need got blocked | `adquit allow <domain>` — the whitelist is layer 0 and beats every other rule; `adquit rules <domain>` shows which layer decided. |
-| feeds look dead | `adquit verify-lists` reports which of the 131 sources your box can reach; a dead feed is an error badge, never a breakage. |
+| feeds look dead | `adquit verify-lists` reports which of the 133 sources your box can reach; a dead feed is an error badge, never a breakage. |
 
 ## Notes, limits and honesty
 
@@ -475,7 +580,7 @@ plane is live rather than letting a performance feature quietly become a rumour,
 
 ```bash
 make lint      # python + shell syntax and shellcheck
-make test      # offline suite (101 engine/API/UI/gate/boot/hygiene tests) + CLI contract
+make test      # offline suite (131 engine/API/UI/gate/boot/hygiene/kernel tests) + CLI contract
 make run       # foreground dev instance (dns :5353, web :8080)
 ```
 

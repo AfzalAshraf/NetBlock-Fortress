@@ -16,7 +16,7 @@ set -o pipefail
 # must replay *every* argument (`adquit block a.com b.com`), not just the verb.
 ORIG_ARGS=("$@")
 
-VERSION_TAG="19.3"
+VERSION_TAG="19.4"
 REPO="${ADQUIT_REPO:-AfzalAshraf/NetBlock-Fortress}"
 REF="${ADQUIT_REF:-main}"
 RAW_BASE="${ADQUIT_RAW:-https://raw.githubusercontent.com/$REPO/$REF}"
@@ -1922,6 +1922,108 @@ cmd_protect() {
     esac
 }
 
+cmd_net() {
+    # The kernel layer: IP ranges a DNS answer cannot express, held as one nftables table.
+    # Reads stay unprivileged; only what touches the packet filter elevates, because `adquit net
+    # status` is something people run to look and it must not start a password prompt.
+    local sub="${1:-status}"
+    case "$sub" in
+        sync|off|allow|deny)
+            is_root || { [ -n "$SUDO" ] && exec $SUDO bash "$0" net "$@" || die "needs root"; } ;;
+    esac
+    run_as_engine --net "$@"
+}
+
+# ── sysctl hardening: the boring kernel switches every network box should have ─────────
+HARDEN_SYSCTL="/etc/sysctl.d/99-adquit.conf"
+HARDEN_KEYS="net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.tcp_syncookies=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.all.log_martians=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0"
+
+_harden_apply() {  # read KEY=VALUE pairs on stdin, echo a status line for each
+    local key want have bad=0
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        key="${line%%=*}"; want="${line#*=}"
+        have="$(sysctl -qn "$key" 2>/dev/null || printf 'n/a')"
+        if [ "$have" = "$want" ]; then
+            printf '  %sok%s   %-46s %s\n' "$G" "$N" "$key" "$have"
+        else
+            printf '  %s--%s   %-46s %s (want %s)\n' "$Y" "$N" "$key" "$have" "$want"
+            bad=$((bad + 1))
+        fi
+    done
+    return "$bad"
+}
+
+cmd_harden() {
+    local action="${1:-status}" prev="$HOME_DIR/data/meta/sysctl.prev" line key
+    case "$action" in
+        on)
+            is_root || { [ -n "$SUDO" ] && exec $SUDO bash "$0" harden on || die "needs root"; }
+            mkdir -p "$(dirname "$prev")" 2>/dev/null
+            : > "$prev.tmp" || die "cannot write $prev"
+            printf '# saved by `adquit harden on`, before it changed anything\n' >> "$prev.tmp"
+            while IFS= read -r line; do
+                key="${line%%=*}"
+                local have; have="$(sysctl -qn "$key" 2>/dev/null || true)"
+                [ -n "$have" ] && printf '%s=%s\n' "$key" "$have" >> "$prev.tmp"
+            done <<EOF5
+$HARDEN_KEYS
+EOF5
+            mv -f "$prev.tmp" "$prev" 2>/dev/null || true
+            {
+                printf '# NetBlock Fortress - kernel hardening (adquit harden on)\n'
+                printf '# rp_filter drops packets arriving on a route they would not have been sent\n'
+                printf '# out on: right for one path in and out, wrong for asymmetric routing. If this\n'
+                printf '# box ever grows a second uplink, set net.ipv4.conf.all.rp_filter=2 instead.\n'
+                printf '# `adquit harden off` restores exactly what was here before it ran.\n'
+                printf '%s\n' "$HARDEN_KEYS"
+            } > "$HARDEN_SYSCTL"
+            sysctl -e -p "$HARDEN_SYSCTL" >/dev/null 2>&1 \
+                || warn "the file is written and will apply on boot, but applying it live failed"
+            say "wrote $HARDEN_SYSCTL (previous values kept in $prev)"
+            printf "$HARDEN_KEYS" | _harden_apply || true
+            ;;
+        off)
+            is_root || { [ -n "$SUDO" ] && exec $SUDO bash "$0" harden off || die "needs root"; }
+            [ -f "$HARDEN_SYSCTL" ] || { say "nothing to undo: $HARDEN_SYSCTL is not ours"; return 0; }
+            rm -f "$HARDEN_SYSCTL"
+            if [ -f "$prev" ]; then
+                while IFS= read -r line; do
+                    case "$line" in ''|\#*) continue ;; esac
+                    sysctl -w "$line" >/dev/null 2>&1 || true
+                done < "$prev"
+                say "removed $HARDEN_SYSCTL and restored the values that were set before"
+            else
+                say "removed $HARDEN_SYSCTL - live values stay until a reboot reloads them"
+            fi
+            ;;
+        status)
+            printf '\n%sKernel hardening%s  (sysctls; nothing here is ad blocking)\n\n' "$B" "$N"
+            if printf "$HARDEN_KEYS" | _harden_apply; then
+                say "every checked kernel default is the hardened one"
+            fi
+            if [ -f "$HARDEN_SYSCTL" ]; then
+                printf '  %spersistent%s  %s\n' "$G" "" "$HARDEN_SYSCTL"
+            else
+                printf '  %stransient%s   no %s - sudo adquit harden on writes it\n' "$Y" "$N" "$HARDEN_SYSCTL"
+            fi
+            printf '\n'
+            return 0
+            ;;
+        *) die "usage: adquit harden on|off|status" ;;
+    esac
+}
+
 cmd_uninstall() {
     is_root || { [ -n "$SUDO" ] && exec $SUDO bash "$0" uninstall || die "needs root"; }
     if using_systemd; then
@@ -1973,6 +2075,8 @@ ${B}MAINTENANCE${N}
   adquit set <key> <value>  change any config key, live (adquit get shows them all)
   adquit passwd [new]       change the dashboard password (adquit passwd --show: the login)
   adquit protect on|off     point THIS machine's DNS at the fortress
+  adquit net status|sync    the IP ranges in the kernel (one nftables table); also allow/deny/explain
+  adquit harden on|status   kernel sysctls: rp_filter, syncookies, martians, redirects
   adquit uninstall [--keep-data]
 
 ${B}AFTER INSTALLING${N}
@@ -1996,7 +2100,7 @@ cmd_run() {
 # that writes state or controls the service. Reads stay unprivileged.
 case "${1:-}" in
     start|stop|restart|run|install|update|upgrade|gravity|pull|update-lists|mode|block|\
-    allow|unblock|blocklist|feed|passwd|password|protect|uninstall|remove|export|lan|reach|site|lan-zone|proxy|portal|set|get|--set|--get)
+    allow|unblock|blocklist|feed|passwd|password|protect|harden|net|kernel|uninstall|remove|export|lan|reach|site|lan-zone|proxy|portal|set|get|--set|--get)
         elevate_for "${1:-}" ;;
 esac
 
@@ -2034,6 +2138,8 @@ case "${1:-}" in
     rules)         shift; cmd_rules "$@" ;;
     passwd|password) shift; cmd_passwd "$@" ;;
     protect)       shift; cmd_protect "$@" ;;
+    net|kernel)    shift; cmd_net "$@" ;;
+    harden)        shift; cmd_harden "$@" ;;
     uninstall|remove) shift; cmd_uninstall "$@" ;;
     version|-v|--version) printf 'adquit %s (NetBlock Fortress %s)\n' "$VERSION_TAG" "$VERSION_TAG" ;;
     help|-h|--help) usage ;;

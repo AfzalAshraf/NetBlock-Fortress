@@ -492,6 +492,72 @@ class TestWebSurface(unittest.TestCase):
             res = self.client.get(path)
             self.assertEqual(res.status_code, 200, "%s -> %s" % (path, res.status_code))
 
+    def test_no_placeholder_escapes_the_template(self):
+        """A Jinja variable written with one pair of braces renders as its own name.
+
+        `DNS Active (:{ dns_port })` sat in the sidebar like that for a release: harmless-looking,
+        permanently unfilled, and a lie on top - the green dot next to it never moved whether the
+        resolver had bound its port or not. Both halves are pinned here, because a template that
+        quietly prints its own source is a bug no API test can see.
+        """
+        self.login()
+        leaked = re.compile(r"(?<!\{)\{ ?[a-z_][a-z0-9_]* ?\}(?!\})")
+        for path in ("/", "/security", "/coverage", "/blocklists", "/modes", "/logs",
+                     "/custom", "/settings", "/lab"):
+            body = self.client.get(path).data.decode("utf-8", "replace")
+            hit = leaked.search(body)
+            self.assertIsNone(hit, "%s printed a raw placeholder: %r" % (path, hit and hit.group(0)))
+            self.assertNotIn("{{", body, "%s has an unrendered Jinja expression" % path)
+            self.assertNotIn("{%", body, "%s has an unrendered Jinja tag" % path)
+
+    def test_the_shell_reports_the_resolver_as_it_is(self):
+        """`DNS Active` while the port is held by something else is worse than no indicator."""
+        self.login()
+        self.assertNotIn("DNS NOT answering", self.client.get("/").data.decode())
+        saved = nb.CFG.get("dns_bind_error")
+        nb.CFG["dns_bind_error"] = "Address already in use"
+        try:
+            body = self.client.get("/").data.decode()
+            self.assertIn("DNS NOT answering", body)
+            self.assertIn("The resolver is not listening", body)
+            self.assertIn("Address already in use", body)
+            self.assertIn("adquit doctor", body, "it has to say what to do, not just that it is bad")
+        finally:
+            if saved is None:
+                nb.CFG.pop("dns_bind_error", None)
+            else:
+                nb.CFG["dns_bind_error"] = saved
+        self.assertNotIn("DNS NOT answering", self.client.get("/").data.decode())
+
+    def test_an_idle_box_says_how_to_make_it_not_idle(self):
+        """Zero clients is the state a fresh install is actually in, and the page used to be silent
+        about it - the numbers all read 0 and nothing told the operator the first thing to do."""
+        self.login()
+        saved = dict(nb.CLIENT_ACTIVITY)
+        nb.CLIENT_ACTIVITY.clear()
+        try:
+            body = self.client.get("/").data.decode()
+            self.assertIn("Nothing is asking this box yet", body)
+            self.assertIn("adquit lan", body)
+            # an address is only worth printing if a neighbour could reach it
+            nb.CFG["sinkhole_ip"] = "10.20.30.40"
+            body = self.client.get("/").data.decode()
+            self.assertIn("10.20.30.40:%s" % nb.CFG.get("dns_port", 53), body,
+                          "the address and port to point a device at have to be on the page")
+            nb.CFG["sinkhole_ip"] = "169.254.7.7"
+            body = self.client.get("/").data.decode()
+            self.assertNotIn("169.254.7.7", body,
+                             "a link-local address must not be offered as something to type into a router")
+            self.assertIn("adquit lan", body)
+            nb.CFG.pop("sinkhole_ip", None)
+            nb.CLIENT_ACTIVITY["10.0.0.9"] = {"total": 4, "blocked": 1, "last_seen": 0.0,
+                                             "threats": 0, "ads": 1, "names": {}}
+            self.assertNotIn("Nothing is asking this box yet", self.client.get("/").data.decode(),
+                             "the hint is a first-run card, not a permanent banner")
+        finally:
+            nb.CLIENT_ACTIVITY.clear()
+            nb.CLIENT_ACTIVITY.update(saved)
+
     def test_unauth_api_rejected(self):
         res = nb.app.test_client().get("/api/stats")
         self.assertIn(res.status_code, (401, 302))
@@ -1659,6 +1725,34 @@ class TestNativePlane(unittest.TestCase):
         self.assertFalse(nb.NativeGravity.restore(),
                          "an index that no longer matches the feeds must be refused")
 
+    def test_a_throwaway_rebuild_publishes_nothing(self):
+        """`persist=False` means "for me only", and the index is not "for me only".
+
+        `NativeGravity.build` ends in `os.replace`, so a dry rebuild used to publish its tables as the
+        plane the next boot maps - half-saved, because `save_gravity_cache` was skipped - and close the
+        mapping the running process was still reading through `BLOCKED`. A rebuild with `persist=True`
+        is exactly what does write it, which is why this asserts both halves: a comparison of two
+        identical files proves nothing on its own.
+        """
+        self._go_native()
+        idx = nb.GRAVITY_INDEX.read_bytes()
+        cache = nb.GRAVITY_CACHE.read_bytes() if nb.GRAVITY_CACHE.exists() else None
+
+        self.assertGreater(nb.rebuild_master_blocklist(persist=False), 0)
+        self.assertEqual(nb.GRAVITY_INDEX.read_bytes(), idx,
+                         "a non-persisting rebuild rewrote the index other processes map")
+        self.assertEqual(nb.GRAVITY_CACHE.read_bytes() if nb.GRAVITY_CACHE.exists() else None, cache,
+                         "a non-persisting rebuild wrote the cache it was told not to write")
+        self.assertFalse(nb.plane_is_index(),
+                         "a throwaway rebuild leaves plain dicts; claiming the index is live is how "
+                         "a stale mapping starts answering queries for tables it never saw")
+        self.assertIsInstance(nb.BLOCKED, dict)
+
+        self.assertGreater(nb.rebuild_master_blocklist(), 0)        # persist=True: publish
+        self.assertNotEqual(nb.GRAVITY_INDEX.read_bytes(), idx,
+                            "a real rebuild must replace the index, or the guard above is vacuous")
+        self.assertTrue(nb.plane_is_index())
+
     def test_a_damaged_index_is_rejected(self):
         self._go_native()
         raw = nb.GRAVITY_INDEX.read_bytes()
@@ -1668,6 +1762,580 @@ class TestNativePlane(unittest.TestCase):
         self.assertIsNone(nb.NativeGravity.open(), "a short file must not map as an index")
         nb.GRAVITY_INDEX.write_bytes(b"ADQJ" + b"\0" * 200)
         self.assertIsNone(nb.NativeGravity.open(), "a header that lies about its size must not map")
+
+
+class TestKernelLayer(unittest.TestCase):
+    """The IP ranges a DNS answer cannot express, and the guards that keep them from biting back.
+
+    Two things are being proven here. First, that a feed written in CIDRs now blocks something
+    instead of merely being counted: `parse_source_bytes` returning zero names for `192.0.2.0/24` is
+    correct behaviour for a name filter and was the whole bug. Second, that the machine which programs
+    the packet filter refuses the ranges that would take a site offline, orders its rules so a live
+    flow and this host's own addresses survive, and rolls itself back if the box stops reaching its
+    upstream. The nft script is asserted as text - it is a pure function - and, where `nft` exists, it
+    is handed to nftables' own parser.
+    """
+
+    CFG_KEYS = ("net_enforce", "net_log_drops", "net_watchdog_s", "net_min_prefix4",
+                "net_min_prefix6", "enabled_lists", "dns_upstream", "sinkhole_ip",
+                "native_gravity")
+    TABLES = ("BLOCKED", "WILDCARDS", "UNBREAK", "NATIVE", "GRAVITY_CUSTOM")
+
+    SAA = (b"[General]\n"
+           b"skip-proxy = 10.0.0.0/8, 192.168.0.0/16\n"
+           b"dns-server = 1.2.4.8\n"
+           b"[Rule]\n"
+           b"# a comment\n"
+           b"DOMAIN-SUFFIX,ad.12306.cn,Reject\n"
+           b"DOMAIN-SUFFIX,eclick.baidu.com,Reject\n"
+           b"DOMAIN-SUFFIX,t.me,Direct\n"
+           b"DOMAIN-SUFFIX,tedcdn.com,Proxy\n"
+           b"DOMAIN,plain-ad.example,Reject\n"
+           b"DOMAIN-KEYWORD,amazon,Reject\n"
+           b"URL-Regex,.*/adformat=.*,Reject\n"
+           b"IP-CIDR,45.61.55.0/24,Reject,no-resolve\n"
+           b"IP-CIDR,203.0.113.0/24,Reject\n"
+           b"IP-CIDR,198.7.65.0/24,Reject\n"      # the /24 this box's own upstream lives in
+
+           b"IP-CIDR,2001:678:1c1c::/46,Reject\n"
+           b"IP-CIDR,119.188.13.32/29,Reject\n"
+           b"GEOIP,CN,DIRECT\n"
+           b"FINAL,DIRECT\n"
+           b"[MITM]\n"
+           b"hostname = *.googlevideo.com\n")
+
+    # Two of these four are meant to be refused, and not for the reason a reader might guess:
+    # 192.0.2.0/24 is documentation space and 1.0.0.0/8 is a fifth of the internet.
+    SPAMHAUS = (b";;; Spamhaus DROP list - 2026-01-01\n"
+                b";;\n"
+                b"45.61.55.0/24 ; DROP;AS65540;2026-01-01\n"
+                b"192.0.2.0/24 ; DROP;AS65541;2026-01-01\n"
+                b"1.0.0.0/8 ; OVERBROAD\n"
+                b"8.20.0.0/14 ; SDROP;AS65542\n")
+
+    def setUp(self):
+        self.cfg = {k: nb.CFG.get(k) for k in self.CFG_KEYS}
+        self.tables = {n: getattr(nb, n) for n in self.TABLES}
+        self.meta = dict(nb.NET_META)
+        self.view = dict(nb.NET_VIEW)
+        self.counts = (dict(nb.VECTOR_COUNTS), dict(nb.CAT_COUNTS))
+        # the fixtures are feeds, so they have to be in the registry for `collect_feed_nets` and
+        # for a rebuild to look at them at all - which is exactly the gate a real feed passes by
+        # being registered in app.py
+        nb.ALL_LISTS["kern_spamhaus"] = {"name": "kern_spamhaus", "cat": "spam",
+                                         "vec": "shortlink", "url": "file://local"}
+        nb.ALL_LISTS["kern_saa"] = {"name": "kern_saa", "cat": "ads", "vec": "banner",
+                                    "url": "file://local"}
+        self._registered = ("kern_spamhaus", "kern_saa")
+        # no watchdog, no pip, no kernel: a test must never arm a real timer. And the C index is not
+        # what this class is about - a rebuild that installed one would replace the mapped plane that
+        # every later class reads through, so the data plane stays in Python here.
+        nb.CFG["native_gravity"] = False
+        nb.CFG["net_watchdog_s"] = 0
+        nb.CFG["net_enforce"] = True
+        nb.CFG["net_log_drops"] = True
+        nb.CFG["net_min_prefix4"] = 12
+        nb.CFG["net_min_prefix6"] = 32
+        nb.CFG["dns_upstream"] = "198.7.65.201"   # inside a range the fixture feeds claim
+        self.feed = nb.LIST_DIR / "kern_saa.txt"
+        self.ips = nb.LIST_DIR / "kern_spamhaus.txt"
+        self._nft_bin = os.environ.get("ADQUIT_NFT_BIN")
+        self._reach = nb.reachability_ok
+        for path in (self.feed, self.ips, nb.NET_FILE, nb.NET_ALLOW, nb.NET_CUSTOM,
+                     nb.NET_NFT_SCRIPT, nb.NET_LIVE_FILE):
+            path.unlink(missing_ok=True)
+        for meta in nb.META_DIR.glob("kern_*.parse*"):
+            meta.unlink(missing_ok=True)
+        nb._NFT_LIST["t"] = 0.0
+        nb._NFT_LIST["text"] = ""
+        nb._OWN["t"] = 0.0        # the guard list has to see this test's upstream, not a past one
+
+    def tearDown(self):
+        for lid in self._registered:
+            nb.ALL_LISTS.pop(lid, None)
+        nb._OWN["t"] = 0.0
+        for k, v in self.cfg.items():
+            if v is None:
+                nb.CFG.pop(k, None)
+            else:
+                nb.CFG[k] = v
+        for n, v in self.tables.items():
+            setattr(nb, n, v)
+        nb.NET_META.clear(); nb.NET_META.update(self.meta)
+        nb.NET_VIEW.clear(); nb.NET_VIEW.update(self.view)
+        nb.VECTOR_COUNTS.clear(); nb.CAT_COUNTS.clear()
+        nb.VECTOR_COUNTS.update(self.counts[0]); nb.CAT_COUNTS.update(self.counts[1])
+        if self._nft_bin is None:
+            os.environ.pop("ADQUIT_NFT_BIN", None)
+        else:
+            os.environ["ADQUIT_NFT_BIN"] = self._nft_bin
+        nb.reachability_ok = self._reach
+        for path in (self.feed, self.ips, nb.NET_FILE, nb.NET_ALLOW, nb.NET_CUSTOM,
+                     nb.NET_NFT_SCRIPT, nb.NET_LIVE_FILE):
+            path.unlink(missing_ok=True)
+        for meta in nb.META_DIR.glob("kern_*.parse*"):
+            meta.unlink(missing_ok=True)
+        nb._NFT_LIST["t"] = 0.0
+
+    # ── the parsers ────────────────────────────────────────────────────────────────────
+
+    def test_a_cidr_feed_reaches_the_kernel_and_not_the_names(self):
+        """The bug this whole layer exists for, pinned from both ends.
+
+        Zero names out of a DROP file is *correct* - and was also the sound of nothing happening.
+        """
+        self.ips.write_bytes(self.SPAMHAUS)
+        exact, wild, unb, nets = nb.parse_feed(self.ips)
+        self.assertEqual((len(exact), len(wild)), (0, 0),
+                         "an IP feed must not be allowed to invent names out of a CIDR")
+        self.assertIn("45.61.55.0/24", nets)
+        self.assertIn("8.20.0.0/14", nets)
+        self.assertEqual(unb, frozenset())
+        # the `; AS65540` tail of a Spamhaus line is annotation, never an address of its own
+        self.assertFalse([n for n in nets if "AS" in n], "annotations leaked into the ranges")
+
+    def test_a_surge_rule_set_reads_only_what_a_gateway_can_honour(self):
+        self.feed.write_bytes(self.SAA)
+        exact, wild, _unb, nets = nb.parse_feed(self.feed)
+        self.assertIn("ad.12306.cn", exact)
+        self.assertIn("eclick.baidu.com", exact)
+        self.assertIn("plain-ad.example", exact)
+        self.assertIn("ad.12306.cn", wild, "DOMAIN-SUFFIX is a zone: the subtree has to go with it")
+        # 203.0.113.0/24 is documentation space: parsed here, refused by the guard later
+        self.assertIn("203.0.113.0/24", nets)
+        self.assertIn("45.61.55.0/24", nets)
+        self.assertIn("2001:678:1c1c::/46", nets, "IP-CIDR with no family flag still carries v6")
+        self.assertNotIn("t.me", exact, "a Direct/Proxy target is routing policy, not an exception")
+        self.assertNotIn("tedcdn.com", exact)
+        self.assertNotIn("amazon", " ".join(exact), "DOMAIN-KEYWORD must not become a name")
+        self.assertNotIn("googlevideo.com", exact, "[MITM] hostnames are not a blocklist")
+        self.assertNotIn("10.0.0.0/8", nets, "the [General] section is not rules")
+        self.assertNotIn("1.2.4.8/32", nets, "[General]'s dns-server is not a range to drop")
+
+    def test_the_host_line_stub_is_never_treated_as_a_target(self):
+        """`0.0.0.0 host.example` is the one format hosts files and IP lists share, so the stub
+        address has to be refused and the name kept - otherwise every hosts feed becomes a
+        recommendation to blackhole 0.0.0.0/8."""
+        self.feed.write_text("0.0.0.0 ads.example\n127.0.0.1 stats.example\n255.255.255.255 x.example\n")
+        self.feed.write_text("0.0.0.0 ads.example\n127.0.0.1 stats.example\n"
+                             "255.255.255.255 x.example\n")
+        exact, _w, _u, nets = nb.parse_feed(self.feed)
+        self.assertEqual({"ads.example", "stats.example", "x.example"}, exact)
+        # the parser stays dumb and fast on purpose - `0.0.0.0` is a token that looks like an
+        # address, and the guard is what refuses it. Both halves of that have to hold: the name
+        # path keeps working for every hosts file, and no stub address reaches the kernel.
+        self.assertTrue(nets, "the parse layer does not second-guess tokens")
+        for stub in nets:
+            self.assertFalse(nb.net_guard(stub)[0], "%s must never be installed" % stub)
+        self.assertIn("0.0.0.0/32", set(nets))
+
+    def test_a_host_address_inside_a_prefix_is_folded_onto_the_network(self):
+        """SAA really ships `119.188.13.32/29`: a host address in a /29. Taking the network is what
+        the list means; the alternative is an element nftables rejects or a silent narrowing."""
+        self.assertEqual(str(nb.ipaddress.ip_network("119.188.13.32/29", strict=False)),
+                         "119.188.13.32/29")
+        self.assertEqual(nb._ip_token("119.188.13.32/29"), "119.188.13.32/29")
+        self.assertEqual(nb._ip_token("198.51.100.7"), "198.51.100.7/32")
+        self.assertIsNone(nb._ip_token("ad.12306.cn"))
+        self.assertIsNone(nb._ip_token(""))
+
+    # ── the guards ───────────────────────────────────────────────────────────────────────
+
+    def test_the_guards_refuse_the_ranges_nobody_should_drop(self):
+        # 10.0.0.0/8 trips the prefix floor before the never-set is even consulted, so the
+        # reserved path gets a /17 of the same network: which guard fires first is a fact worth
+        # pinning, because a refusal has to name the reason the operator can act on.
+        for bad, why in (("10.0.128.0/17", "reserved"), ("10.0.0.0/8", "broader than"),
+                         ("127.0.0.1/32", "reserved"), ("169.254.0.0/16", "reserved"),
+                         ("203.0.113.0/24", "reserved"), ("2001:db8::/32", "reserved"),
+                         ("fe80::1/128", "reserved"), ("fe80::/10", "broader than"),
+                         ("1.0.0.0/8", "broader than"),
+                         ("8.0.0.0/6", "broader than")):
+            ok, reason = nb.net_guard(bad)
+            self.assertFalse(ok, "%s must never be installed (%s)" % (bad, reason))
+            self.assertIn(why, reason)
+        for good in ("8.20.0.0/14", "45.61.55.201/32", "2001:678:1c1c::/46"):
+            self.assertTrue(nb.net_guard(good)[0], "%s is a legitimate range: %s"
+                            % (good, nb.net_guard(good)[1]))
+
+    def test_the_floor_is_a_setting_and_not_a_constant(self):
+        """An operator who trusts a feed can widen it; the default is what protects everyone else."""
+        self.assertFalse(nb.net_guard("1.0.0.0/8")[0])
+        nb.CFG["net_min_prefix4"] = 8
+        self.assertTrue(nb.net_guard("1.0.0.0/8")[0],
+                        "the whole point of the setting is that an operator can widen it")
+        nb.CFG["net_min_prefix4"] = 0
+        self.assertFalse(nb.net_guard("10.0.0.0/8")[0],
+                         "the floor is one guard; the never-set has to keep working with it off")
+        self.assertFalse(nb.net_guard("127.0.0.1/32")[0])
+
+    def test_this_host_cannot_be_blocked_by_its_own_lists(self):
+        """The addresses the box depends on are refused even when a feed names them: this is the
+        difference between an aggressive filter and a self-inflicted outage."""
+        guarded = set(nb._own_addresses())
+        self.assertIn("198.7.65.201/32", guarded,
+                      "the configured upstream has to be in the never set")
+        ok, why = nb.net_guard("198.7.65.0/24")
+        self.assertFalse(ok, "a /24 that contains our upstream must be refused outright")
+        self.assertIn("198.7.65.201/32", why,
+                      "the refusal has to name what it was protecting: %s" % why)
+        ok, why = nb.net_guard("198.7.65.201/32")
+        self.assertFalse(ok, "even the bare address itself: %s" % why)
+
+    def test_the_ranges_that_survive_are_the_ones_written_down(self):
+        self.ips.write_bytes(self.SPAMHAUS)
+        self.feed.write_bytes(self.SAA)
+        nb.CFG["enabled_lists"] = ["kern_spamhaus", "kern_saa"]
+        nb.build_net_tables(nb.collect_feed_nets())
+        written = [l.split("\t")[0] for l in nb.NET_FILE.read_text().splitlines()
+                   if not l.startswith("#")]
+        self.assertIn("45.61.55.0/24", written)
+        self.assertIn("8.20.0.0/14", written)
+        self.assertNotIn("1.0.0.0/8", written, "a refused range must not reach the file either")
+        self.assertNotIn("192.0.2.0/24", written)
+        self.assertEqual(nb.NET_META["n_nets"], len(written),
+                         "the tally in the dashboard is the same number as the lines on disk")
+        self.assertGreaterEqual(nb.NET_META["n_refused"], 3)
+
+    # ── the merged table ───────────────────────────────────────────────────────────────
+
+    def test_overlapping_elements_are_merged_because_nftables_refuses_them(self):
+        merged = nb.merge_ranges([("198.51.100.0/24", "a"), ("198.51.100.0/25", "b"),
+                                  ("198.51.100.128/25", "c")])
+        self.assertEqual([r[2] for r in merged[4]], ["198.51.100.0/24"])
+        merged = nb.merge_ranges([("198.51.100.0/25", "a"), ("198.51.100.64/26", "b")])
+        self.assertEqual([r[2] for r in merged[4]], ["198.51.100.0/25"],
+                         "an overlap has to come back as one element, in the widest spelling")
+        merged = nb.merge_ranges([("198.51.100.0/25", "a"), ("198.51.101.0/25", "b")])
+        self.assertEqual(len(merged[4]), 2)
+        # adjacency is not overlap: nftables is happy with two touching elements and refuses only
+        # overlapping ones, so merging further would be an optimisation nobody asked for
+        merged = nb.merge_ranges([("198.51.100.16/28", "a"), ("198.51.100.32/28", "b")])
+        self.assertEqual([r[2] for r in merged[4]],
+                         ["198.51.100.16/28", "198.51.100.32/28"])
+        # 198.51.100.24/27 is really 198.51.100.0/27 (`strict=False` folds it onto its network),
+        # which contains the /28 - so one element comes out, in the wider spelling. That folding is
+        # also why a merge of CIDRs can never produce a ragged interval: two aligned blocks that
+        # overlap always nest, so the range spelling below is a fallback, tested on its own.
+        merged = nb.merge_ranges([("198.51.100.16/28", "a"), ("198.51.100.24/27", "b")])
+        self.assertEqual([r[2] for r in merged[4]], ["198.51.100.0/27"])
+        self.assertEqual(nb._element_text(int(merged[4][0][0]), int(merged[4][0][1]) + 16, 4),
+                         "198.51.100.0-198.51.100.47",
+                         "an interval that is not a CIDR has to be written as a range, which is "
+                         "exactly the spelling nftables asks for")
+
+    def test_a_verdict_is_one_bisect_over_the_merged_table(self):
+        nb.build_net_tables({"45.61.55.0/25": "kern_spamhaus", "2001:678:1c1c::/46": "kern_saa"})
+        for addr, action in (("45.61.55.0", "block"), ("45.61.55.127", "block"),
+                             ("45.61.55.128", "allow"), ("45.61.55.200", "allow"),
+                             ("45.61.54.255", "allow"),
+                             # a /46 is four /24s wide, so 1c1d is inside it and 1c20 is not
+                             ("2001:678:1c1c:ffff::9", "block"), ("2001:678:1c20::1", "allow")):
+            self.assertEqual(nb.net_verdict(addr)["action"], action, addr)
+        self.assertEqual(nb.net_verdict("not-an-ip")["action"], "error")
+        self.assertEqual(nb.net_verdict("45.61.55.7")["source"], "kern_spamhaus")
+
+    # ── the generated script ───────────────────────────────────────────────────────────
+
+    def test_the_script_is_ordered_so_that_nothing_live_dies(self):
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus", "2001:678:1c1c::/46": "kern_saa"})
+        script = nb.nft_script()
+        lines = [l.strip() for l in script.splitlines()]
+        self.assertEqual(lines[0], "#!/usr/sbin/nft -f")
+        # the table is created before it is deleted, or the first sync on a fresh box fails
+        self.assertLess(lines.index("table inet adquit"), lines.index("delete table inet adquit"))
+        self.assertLess(lines.index("delete table inet adquit"), lines.index("table inet adquit {"))
+        first_drop = min(i for i, l in enumerate(lines) if l.endswith("counter drop"))
+        for must_precede in ("ct state established,related accept",
+                             "meta l4proto { icmp, icmpv6 } accept"):
+            self.assertLess(lines.index(must_precede), first_drop,
+                            "%s has to be evaluated before the first drop" % must_precede)
+        # and the never-block accept rules come before the drops in *each* chain, not just once
+        for chain in ("protect", "local"):
+            body = script.split("chain " + chain + " {")[1].split("\t}")[0]
+            b = [l.strip() for l in body.splitlines()]
+            drop = min(i for i, l in enumerate(b) if l.endswith("counter drop"))
+            self.assertLess(next(i for i, l in enumerate(b)
+                                 if "daddr {" in l and "10.0.0.0/8" in l), drop)
+            self.assertIn("45.61.55.0/24", script)
+        self.assertLess(next(i for i, l in enumerate(b) if "198.7.65.201/32" in l), drop,
+                            "this host's own upstream must be accepted ahead of any drop")
+        self.assertNotIn("hook input", script,
+                         "input would put a third party's list between an operator and their SSH")
+        self.assertIn("type filter hook forward priority filter", script)
+        self.assertIn("type filter hook output priority filter", script)
+        self.assertEqual(script.count("{"), script.count("}"), "unbalanced braces are a syntax error")
+        self.assertNotIn("elements = { }", script, "an empty set must be declared without elements")
+        self.assertIn('comment "gen=' + nb.net_view()[1]["generation"] + '"', script)
+        for line in script.splitlines():
+            if "daddr { " in line:
+                for tok in line.split("{", 1)[1].rsplit("}", 1)[0].split(","):
+                    tok = tok.strip()
+                    if tok:
+                        nb.ipaddress.ip_network(tok)      # raises on anything nft would choke on
+
+    def test_an_empty_family_still_gets_its_set_because_the_chain_references_it(self):
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus"})     # v4 only, as feeds are
+        script = nb.nft_script()
+        self.assertIn("set net6 {", script)
+        self.assertIn("ip6 daddr @net6 counter drop", script)
+        self.assertEqual(len([l for l in script.splitlines() if "set net6" in l]), 1)
+
+    def test_an_exception_is_a_rule_not_a_deletion(self):
+        """`adquit net allow 1.2.3.4` has to survive a feed that claims the whole /14 - deleting
+        elements cannot express that, an accept rule in front of the drops can."""
+        nb.build_net_tables({"8.20.0.0/14": "kern_spamhaus"})
+        self.assertEqual(nb.net_verdict("8.20.0.5")["action"], "block")
+        before = nb.net_view()[1]["generation"]
+        nb.atomic_write(nb.NET_ALLOW, "8.20.0.5/32\n")
+        tables, meta = nb.net_view(force=True)
+        self.assertEqual(meta["n_allowed"], 1)
+        self.assertNotEqual(meta["generation"], before,
+                            "an exception that left the generation alone would never be installed")
+        self.assertEqual(nb.net_verdict("8.20.0.5")["action"], "allow")
+        self.assertEqual(nb.net_verdict("8.20.0.5")["source"], "operator exception")
+        self.assertEqual(nb.net_verdict("8.20.0.9")["action"], "block")
+        script = nb.nft_script(tables, meta)
+        self.assertIn("set allow4 {", script)
+        accept = [i for i, l in enumerate(script.splitlines()) if "ip daddr @allow4 accept" in l]
+        drop = [i for i, l in enumerate(script.splitlines()) if "ip daddr @net4 counter drop" in l]
+        self.assertEqual(len(accept), 2, "one accept rule per chain")
+        self.assertTrue(all(a < d for a, d in zip(accept, drop)))
+
+    def test_the_script_survives_nftables_own_parser(self):
+        """Not a hand-wave about grammar: nft parses it, and the check is only trusted once it has
+        been shown to reject a script that really is broken."""
+        nft = None
+        for cand in ("/usr/sbin/nft", "/sbin/nft"):
+            if os.access(cand, os.X_OK):
+                nft = cand
+                break
+        nft = nft or shutil.which("nft")
+        if nft is None:
+            raise unittest.SkipTest("no nft binary on this box")
+        import subprocess as sp
+        broken = HOME / "broken.nft"
+        broken.write_text("table inet adquit {\n\tset net4 {\n\t\ttype ipv4_addr\n\t\t"
+                          "elements = { }\n\t}\n}\n")
+        res = sp.run([nft, "-c", "-f", str(broken)], capture_output=True, text=True, timeout=60)
+        if "syntax error" not in (res.stdout + res.stderr):
+            raise unittest.SkipTest("this nft will not report grammar without a kernel: %s"
+                                    % (res.stderr or "")[:80])
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus", "8.20.0.0/14": "kern_saa",
+                             "2001:678:1c1c::/46": "kern_saa"})
+        ours = HOME / "ours.nft"
+        ours.write_text(nb.nft_script())
+        res = sp.run([nft, "-c", "-f", str(ours)], capture_output=True, text=True, timeout=60)
+        out = res.stdout + res.stderr
+        for bad in ("syntax error", "No such file or directory", "unknown", "Invalid"):
+            self.assertNotIn(bad, out, "nft rejected the script we generate:\n%s" % out[:800])
+
+    # ── the sync, against a stand-in nft ────────────────────────────────────────────────
+
+    def _stub(self, fail=False):
+        binpath = HOME / "stub-nft"
+        state = HOME / "nft.state"
+        log = HOME / "nft.calls"
+        binpath.write_text(
+            "#!/bin/sh\n"
+            'state=%s\nlog=%s\n'
+            'printf "%%s\\n" "$*" >> "$log"\n'
+            'if [ -f "$state.fail" ]; then echo "Error: stub refuses" >&2; exit 1; fi\n'
+            'case "$1" in\n'
+            '  -f) cp "$2" "$state"; exit 0 ;;\n'
+            '  -a) if [ -f "$state" ]; then cat "$state"; else '
+            'echo "Error: No such file or directory." >&2; exit 1; fi; exit 0 ;;\n'
+            '  delete) rm -f "$state"; exit 0 ;;\n'
+            'esac\nexit 0\n' % (state, log))
+        binpath.chmod(0o755)
+        state.unlink(missing_ok=True)
+        log.unlink(missing_ok=True)
+        if fail:
+            (HOME / "nft.state.fail").write_text("1")
+        else:
+            (HOME / "nft.state.fail").unlink(missing_ok=True)
+        os.environ["ADQUIT_NFT_BIN"] = str(binpath)
+        nb._NFT_LIST["t"] = 0.0
+        return log
+
+    def _calls(self, log, verb=None):
+        """What the stub was asked to do. `net_sync` reads the live table before it writes it, so
+        the honest assertion is about how many times it *installed*, not about the first call."""
+        if not log.exists():
+            return []
+        calls = [l.split(" ", 1)[0] for l in log.read_text().splitlines()]
+        return calls if verb is None else [c for c in calls if c == verb]
+
+    def test_a_sync_installs_once_and_the_second_is_a_no_op(self):
+        log = self._stub()
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus"})
+        nb.reachability_ok = lambda timeout=2.0: (True, "198.7.65.201:53")
+        res = nb.net_sync(reason="test")
+        self.assertEqual(res["mode"], "live", res.get("detail"))
+        self.assertEqual(len(self._calls(log, "-f")), 1)
+        self.assertEqual(self._calls(log, "delete"), [], "a healthy sync must not delete anything")
+        second = nb.net_sync(reason="test")
+        self.assertEqual(second["mode"], "live")
+        self.assertTrue(second.get("unchanged"), "an unchanged generation must not touch the kernel")
+        self.assertEqual(len(self._calls(log, "-f")), 1, "the second sync installed anyway")
+        # a real change moves the generation, and only then does anything get written
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus", "8.20.0.0/14": "kern_saa"})
+        third = nb.net_sync(reason="test")
+        self.assertEqual(third["mode"], "live")
+        self.assertFalse(third.get("unchanged"))
+        self.assertEqual(len(self._calls(log, "-f")), 2, "a changed generation has to be written")
+        live = json.loads(nb.NET_LIVE_FILE.read_text())
+        self.assertEqual(live["mode"], "live")
+        self.assertEqual(live["n_nets"], 2)
+
+    def test_a_box_that_cannot_reach_its_upstream_afterwards_loses_the_table(self):
+        """The rollback is the reason this is safe to enable by default: the install is not trusted,
+        it is tested, and a failed test is undone rather than reported."""
+        log = self._stub()
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus"})
+        nb.reachability_ok = lambda timeout=2.0: (False, "198.7.65.201:53")
+        res = nb.net_sync(reason="test")
+        self.assertEqual(res["mode"], "rolled-back")
+        self.assertEqual(len(self._calls(log, "delete")), 1,
+                         "the rollback must delete the table it just made")
+        self.assertIsNone(nb.nft_live_generation())
+        self.assertEqual(nb.net_status()["mode"], "absent")
+
+    def test_a_rejected_script_is_reported_and_leaves_no_state(self):
+        log = self._stub(fail=True)
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus"})
+        res = nb.net_sync(reason="test")
+        self.assertEqual(res["mode"], "error")
+        self.assertIn("stub refuses", res["detail"])
+        self.assertEqual(self._calls(log, "delete"), [],
+                         "nothing was installed, so there is nothing to delete - and a rollback "
+                         "here would wipe a table that was working before we touched it")
+        self.assertEqual(json.loads(nb.NET_LIVE_FILE.read_text())["mode"], "error")
+
+    def test_nothing_is_installed_without_a_binary_or_a_root(self):
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus"})
+        os.environ["ADQUIT_NFT_BIN"] = str(HOME / "no-such-nft")
+        # an explicit binary is the operator's own claim of intent, so only the missing-file path
+        # is exercised here: the preview must still be written, because that is what a report reads
+        res = nb.net_sync(reason="test", dry=True)
+        self.assertEqual(res["mode"], "preview")
+        self.assertTrue(nb.NET_NFT_SCRIPT.exists(), "a dry run has to leave something to look at")
+        os.environ.pop("ADQUIT_NFT_BIN", None)
+        if os.geteuid() == 0:
+            raise unittest.SkipTest("running as root: the needs-root path is not reachable")
+        self.assertEqual(nb.net_sync(reason="test")["mode"], "needs-root")
+
+    def test_switching_the_layer_off_takes_the_table_with_it(self):
+        self._stub()
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus"})
+        nb.reachability_ok = lambda timeout=2.0: (True, "x")
+        self.assertEqual(nb.net_sync(reason="test")["mode"], "live")
+        nb.CFG["net_enforce"] = False
+        res = nb.net_sync(reason="test")
+        self.assertEqual(res["mode"], "off")
+        self.assertIsNone(nb.nft_live_generation(),
+                          "off has to mean off, not 'we left it in the kernel and stopped talking about it'")
+
+    # ── the verbs, and the plumbing that makes them reach a live box ────────────────────
+
+    def _out(self, *args):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = nb.cmd_net(list(args))
+        return rc, buf.getvalue()
+
+    def test_the_verbs_work_without_root_or_a_kernel(self):
+        nb.build_net_tables({"45.61.55.0/24": "kern_spamhaus"})
+        rc, out = self._out("status")
+        self.assertEqual(rc, 0)
+        self.assertIn("Kernel layer", out)
+        self.assertIn("45.61.55.0/24", nb.NET_FILE.read_text())
+        rc, out = self._out("explain", "45.61.55.9", "8.8.8.8")
+        self.assertEqual(rc, 0)
+        self.assertIn("block", out)
+        self.assertIn("allow", out)
+        rc, out = self._out("sources")
+        self.assertEqual(rc, 0)
+        self.assertIn("kern_spamhaus", out)
+        rc, out = self._out("wat")
+        self.assertEqual(rc, 2, "an invented subcommand must not look like a successful status")
+        self.assertIn("usage:", out)
+        rc, out = self._out("explain")
+        self.assertEqual(rc, 2)
+
+    def test_a_deny_of_a_protected_range_says_so(self):
+        """Accepted by the parser, refused by the guard, silent about both - that is how an operator
+        ends up believing they blocked something the kernel was never told."""
+        rc, out = self._out("deny", "203.0.113.9")
+        self.assertEqual(rc, 1)
+        self.assertIn("refused by the guards", out)
+        self.assertNotIn("203.0.113.9/32\t", nb.NET_FILE.read_text() if nb.NET_FILE.exists() else "")
+
+    def test_everything_the_layer_exposes_is_reachable_from_the_cli(self):
+        """`adquit net ...` is what the README tells people to type, so the wrapper has to route it
+        to a gate that exists, and the gate has to reach the engine."""
+        cli = (REPO / "bin" / "adquit").read_text(errors="replace")
+        self.assertRegex(cli, r'net\|kernel\)\s+shift; cmd_net "\$@"')
+        self.assertRegex(cli, r'harden\)\s+shift; cmd_harden "\$@"')
+        self.assertIn("--net", cli, "the wrapper never passes a verb to the engine")
+        app = (REPO / "app.py").read_text(errors="replace")
+        self.assertIn('cmd in ("--net", "net")', app)
+        for verb in ("status", "sync", "dry-run", "off", "explain", "allow", "deny", "sources"):
+            self.assertIn(verb, app, "cmd_net does not handle %s" % verb)
+
+    def test_the_service_is_jailed_without_being_blinded(self):
+        """The unit hardening is only worth having if the service can still do its job: it writes
+        under its own home, reads /etc/resolv.conf, and asks `ss` (netlink) who owns port 53."""
+        unit = (REPO / "install.sh").read_text(errors="replace")
+        for want in ("ProtectSystem=full", "ProtectHome=read-only", "PrivateTmp=yes",
+                     "NoNewPrivileges=yes", "RestrictAddressFamilies=AF_INET AF_INET6 "
+                     "AF_UNIX AF_NETLINK"):
+            self.assertIn(want, unit, "the unit lost %s" % want)
+        engine = (REPO / "app.py").read_text(errors="replace")
+        writes_etc = re.findall(r'(?:open|atomic_write)\(\s*[^\n)]*"/etc/[^"]*",\s*"[wa]', engine)
+        writes_etc += re.findall(r'Path\("/etc/[^"]*"\)\.(?:write_text|write_bytes|unlink)', engine)
+        self.assertFalse(writes_etc,
+                         "the service writes into /etc, so ProtectSystem=full would break it: %s"
+                         % writes_etc[:3])
+        self.assertIn("AF_NETLINK", unit, "`ss` needs netlink or doctor loses its best diagnostic")
+
+    def test_hardening_is_reversible_by_the_same_command_that_applied_it(self):
+        installer = (REPO / "install.sh").read_text(errors="replace")
+        cli = (REPO / "bin" / "adquit").read_text(errors="replace")
+        unst = (REPO / "uninstall.sh").read_text(errors="replace")
+        self.assertIn("harden on", installer,
+                      "the installer must call the one implementation of the sysctls, not copy it")
+        self.assertIn("ADQUIT_NO_HARDEN", installer, "an installer that cannot be declined is a raid")
+        self.assertRegex(cli, r"cmd_harden\(\)")
+        self.assertIn("sysctl.prev", cli, "harden off has to restore what it found, not guess")
+        self.assertIn("/etc/sysctl.d/99-adquit.conf", unst)
+        self.assertIn("nft delete table inet adquit", unst,
+                      "an uninstalled fortress must not still drop packets")
+        self.assertIn("/run/adquit-net-watch", unst)
+
+    def test_the_kernel_layer_does_not_answer_a_dns_query(self):
+        """The per-query path is the one thing in this box that must not get slower or stranger: the
+        IP plane is compiled data plus a rule in the kernel, not another lookup per name."""
+        engine = (REPO / "app.py").read_text(errors="replace")
+        start = engine.index("def _classify_uncached(")
+        body = engine[start:engine.index("\ndef ", start + 20)]
+        for forbidden in ("net_view(", "net_verdict(", "nft_", "NET_FILE"):
+            self.assertNotIn(forbidden, body,
+                             "%s belongs to a sync or a report, not to the resolver's hot path"
+                             % forbidden)
+        self.assertTrue(nb.classify("doubleclick.net")["action"], "the name path still answers")
+
+    def test_a_rebuild_publishes_the_tally_immediately(self):
+        """`adquit stats` reads NET_META, and NET_META that lags a rebuild by one sync is a
+        dashboard reporting zero protection on a box that has plenty."""
+        self.ips.write_bytes(self.SPAMHAUS)
+        nb.CFG["enabled_lists"] = ["kern_spamhaus"]
+        nb.rebuild_master_blocklist(persist=False)
+        self.assertGreater(nb.NET_META["n_nets"], 0)
+        self.assertEqual(nb.stats_payload()["net_ranges"], nb.NET_META["n_nets"])
+
 
 
 if __name__ == "__main__":
